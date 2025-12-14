@@ -3,7 +3,6 @@
 **Cocoa-Way** is a minimal yet functional Wayland Compositor designed specifically for **macOS**.  
 Built with [Rust](https://www.rust-lang.org/) and [Smithay](https://github.com/Smithay/smithay), it allows you to run Linux Wayland applications (like Niri, Sway, or generic clients) seamlessly on your Mac desktop without a virtual machine's GUI overhead.
 
-![Cocoa-Way Banner](assets/icon.png)
 
 ## ✨ Features
 
@@ -17,7 +16,7 @@ Built with [Rust](https://www.rust-lang.org/) and [Smithay](https://github.com/S
 
 ### Prerequisites
 
-*   **macOS** (Tested on Sonoma/Sequoia)
+*   **macOS** 
 *   **Rust Toolchain** (latest stable)
 
 ### Building
@@ -33,7 +32,7 @@ cargo build --release
 Start the compositor:
 
 ```bash
-RUST_LOG=info cargo run --release
+cargo run --release
 ```
 
 Wait for the "Wayland socket created" message.
