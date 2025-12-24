@@ -13,6 +13,15 @@ Built with [Rust](https://www.rust-lang.org/) and [Smithay](https://github.com/S
 *   **Hardware Acceleration**: Efficient OpenGL rendering pipeline.
 *   **Polished Visuals**: server-side decorations with shadows and focus indicators.
 
+## 📚 Research
+
+This project is part of the **"Turbo-Charged Protocol Virtualization"** research initiative. See the [paper folder](../paper/) for:
+- Full manuscript draft
+- SIMD benchmark harness
+- Architecture diagrams
+
+**Key Innovation**: Zero-Cost cross-platform Wayland via Rust trait monomorphization + SIMD-accelerated pixel conversion.
+
 ## 🚀 Getting Started
 
 ### Prerequisites
