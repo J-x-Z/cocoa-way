@@ -70,6 +70,7 @@ This runtime is optional when Cocoa-Way is used only with SSH, Docker, OrbStack,
 
 ```bash
 brew tap J-x-Z/tap
+brew trust --tap J-x-Z/tap
 brew install cocoa-way waypipe-darwin
 ```
 
@@ -102,7 +103,7 @@ Connect to an SSH host with the compatibility script:
 ./run_waypipe.sh ssh user@linux-host firefox
 ```
 
-The script also supports local Waypipe/socket workflows and remains independent of Container Mode. The same connection can be created from **Connections > Connect to Machine...**. Saved entries appear in the Connections menu and are stored in `~/.config/cocoa-way/connections.toml`; passwords are never stored.
+Waypipe must be installed on both the Mac and the remote Linux host. The script checks the local command and prints this remote requirement before connecting. It also supports local Waypipe/socket workflows and remains independent of Container Mode. The same connection can be created from **Connections > Connect to Machine...**. Saved entries appear in the Connections menu and are stored in `~/.config/cocoa-way/connections.toml`; passwords are never stored.
 
 For a local Apple Container application:
 

@@ -152,7 +152,8 @@ fi
 
 waypipe_bin="${COCOA_WAY_WAYPIPE:-$(command -v waypipe || true)}"
 if [ -z "$waypipe_bin" ]; then
-    echo "Error: waypipe is not installed or is not available in PATH." >&2
+    echo "Error: waypipe is not installed on this Mac or is not available in PATH." >&2
+    echo "Install it with: brew install J-x-Z/tap/waypipe-darwin" >&2
     exit 1
 fi
 
@@ -169,6 +170,7 @@ echo "Using waypipe: $waypipe_bin"
 # This fixes "remote port forwarding failed" errors when the socket file already exists on the remote
 if [ "$1" = "ssh" ]; then
     echo "Info: Detected SSH mode. Injecting '-o StreamLocalBindUnlink=yes' to fix socket conflicts."
+    echo "Info: The remote Linux host must also have a compatible 'waypipe' command in PATH."
     shift
     exec "$waypipe_bin" --compress="${COCOA_WAY_COMPRESS:-zstd}" ssh \
         -o StreamLocalBindUnlink=yes "$@"
