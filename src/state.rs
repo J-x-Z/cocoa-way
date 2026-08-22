@@ -73,6 +73,7 @@ pub struct AppState {
     /// performance diagnostics in Container Mode.
     pub commit_counter: u64,
     host_clipboard_text: Option<String>,
+    host_clipboard_image_png: Option<Vec<u8>>,
     pending_guest_clipboard_mime: Option<String>,
     pasteboard_change_count: isize,
     last_pasteboard_poll: std::time::Instant,
@@ -308,6 +309,7 @@ impl AppState {
             rootless_dirty_surfaces: std::collections::HashSet::new(),
             commit_counter: 0,
             host_clipboard_text: None,
+            host_clipboard_image_png: None,
             pending_guest_clipboard_mime: None,
             pasteboard_change_count: -1,
             last_pasteboard_poll: std::time::Instant::now() - std::time::Duration::from_millis(100),
@@ -600,29 +602,42 @@ impl AppState {
         }
         self.last_pasteboard_poll = now;
 
-        let (change_count, text) = pasteboard_snapshot();
+        let (change_count, text, image_png) = pasteboard_snapshot();
         if change_count == self.pasteboard_change_count {
             return;
         }
         self.pasteboard_change_count = change_count;
-        let Some(text) = text else {
-            self.host_clipboard_text = None;
-            crate::diagnostics::record_clipboard_host_change(0);
-            return;
-        };
-        if self.host_clipboard_text.as_deref() == Some(text.as_str()) {
+        if self.host_clipboard_text == text && self.host_clipboard_image_png == image_png {
             return;
         }
 
-        self.host_clipboard_text = Some(text);
-        crate::diagnostics::record_clipboard_host_change(
-            self.host_clipboard_text.as_ref().map_or(0, String::len),
+        let byte_count =
+            text.as_ref().map_or(0, String::len) + image_png.as_ref().map_or(0, Vec::len);
+        self.host_clipboard_text = text;
+        self.host_clipboard_image_png = image_png;
+        crate::diagnostics::record_clipboard_host_change(byte_count);
+
+        let mime_types = clipboard_mime_types(
+            self.host_clipboard_text.is_some(),
+            self.host_clipboard_image_png.is_some(),
         );
-        log::info!("Clipboard: publishing changed macOS text to Wayland clients");
+        if mime_types.is_empty() {
+            log::info!("Clipboard: macOS pasteboard has no supported contents");
+            smithay::wayland::selection::data_device::clear_data_device_selection::<Self>(
+                &self.display_handle,
+                &self.seat,
+            );
+            return;
+        }
+
+        log::info!(
+            "Clipboard: publishing changed macOS contents to Wayland clients as {}",
+            mime_types.join(", ")
+        );
         smithay::wayland::selection::data_device::set_data_device_selection::<Self>(
             &self.display_handle,
             &self.seat,
-            clipboard_text_mime_types(),
+            mime_types,
             (),
         );
     }
@@ -634,6 +649,7 @@ impl AppState {
         self.pasteboard_change_count = write_to_pasteboard(&text);
         crate::diagnostics::record_clipboard_guest_install(text.len());
         self.host_clipboard_text = Some(text);
+        self.host_clipboard_image_png = None;
         log::info!("Clipboard: installed Wayland text on the macOS pasteboard");
         smithay::wayland::selection::data_device::set_data_device_selection::<Self>(
             &self.display_handle,
@@ -1165,16 +1181,21 @@ impl SelectionHandler for AppState {
         if ty != SelectionTarget::Clipboard {
             return;
         }
-        if !is_clipboard_text_mime(&mime_type) {
+        let contents = if mime_type.trim().eq_ignore_ascii_case("image/png") {
+            self.host_clipboard_image_png.clone()
+        } else if is_clipboard_text_mime(&mime_type) {
+            self.host_clipboard_text
+                .as_ref()
+                .map(|text| text.as_bytes().to_vec())
+        } else {
             return;
-        }
-        log::info!("Clipboard: Wayland client requested macOS text as {mime_type}");
-        let text = self.host_clipboard_text.clone();
+        };
+        log::info!("Clipboard: Wayland client requested macOS contents as {mime_type}");
         std::thread::spawn(move || {
             use std::io::Write;
-            if let Some(text) = text {
+            if let Some(contents) = contents {
                 let mut f = std::fs::File::from(fd);
-                let _ = f.write_all(text.as_bytes());
+                let _ = f.write_all(&contents);
             }
         });
     }
@@ -1281,6 +1302,17 @@ fn clipboard_text_mime_types() -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect()
+}
+
+fn clipboard_mime_types(has_text: bool, has_image_png: bool) -> Vec<String> {
+    let mut mime_types = Vec::new();
+    if has_image_png {
+        mime_types.push("image/png".to_owned());
+    }
+    if has_text {
+        mime_types.extend(clipboard_text_mime_types());
+    }
+    mime_types
 }
 
 fn is_clipboard_text_mime(mime: &str) -> bool {
@@ -1397,7 +1429,14 @@ mod pointer_axis_tests {
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{is_clipboard_text_mime, preferred_clipboard_text_mime};
+    use super::{clipboard_mime_types, is_clipboard_text_mime, preferred_clipboard_text_mime};
+
+    #[test]
+    fn advertises_png_before_text_when_both_are_available() {
+        let offered = clipboard_mime_types(true, true);
+        assert_eq!(offered.first().map(String::as_str), Some("image/png"));
+        assert!(offered.iter().any(|mime| mime == "text/plain"));
+    }
 
     #[test]
     fn chooses_the_exact_mime_offered_by_the_client() {
@@ -1440,14 +1479,29 @@ fn write_to_pasteboard(text: &str) -> isize {
     }
 }
 
-fn pasteboard_snapshot() -> (isize, Option<String>) {
-    use objc2_app_kit::NSPasteboard;
+fn pasteboard_snapshot() -> (isize, Option<String>, Option<Vec<u8>>) {
+    use objc2_app_kit::{
+        NSBitmapImageRep, NSPNGFileType, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeTIFF,
+    };
+    use objc2_foundation::NSDictionary;
     unsafe {
         let pb = NSPasteboard::generalPasteboard();
-        let pb_type = objc2_app_kit::NSPasteboardTypeString;
-        (
-            pb.changeCount(),
-            pb.stringForType(pb_type).map(|s| s.to_string()),
-        )
+        let text = pb
+            .stringForType(objc2_app_kit::NSPasteboardTypeString)
+            .map(|s| s.to_string());
+        let image_png = pb
+            .dataForType(NSPasteboardTypePNG)
+            .map(|data| data.bytes().to_vec())
+            .filter(|data| !data.is_empty())
+            .or_else(|| {
+                let tiff = pb.dataForType(NSPasteboardTypeTIFF)?;
+                let image = NSBitmapImageRep::imageRepWithData(&tiff)?;
+                let properties = NSDictionary::new();
+                image
+                    .representationUsingType_properties(NSPNGFileType, &properties)
+                    .map(|data| data.bytes().to_vec())
+                    .filter(|data| !data.is_empty())
+            });
+        (pb.changeCount(), text, image_png)
     }
 }

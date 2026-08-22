@@ -43,7 +43,7 @@ This keeps classic SSH and local-socket workflows available while making Apple C
 | Runtimes | Apple Container, Docker-compatible engines, OrbStack, SSH, and local Waypipe sockets |
 | Displays | Automatic assignment, named displays, and isolated workers for concurrent applications |
 | Transport | Apple Container Transport V2 over `--publish-socket`, with a compatibility relay fallback |
-| Integration | Bidirectional text clipboard, low-latency CoreAudio forwarding, keyboard, pointer, and gestures |
+| Integration | Bidirectional text clipboard, macOS-to-Wayland PNG images, low-latency CoreAudio forwarding, keyboard, pointer, and gestures |
 | Control plane | Native runtime panels, `cocoa-wayctl --json`, diagnostics, tasks, logs, and resource warnings |
 | Automation | Optional read-only MCP server and onboarding skill; launch, stop, and deletion remain explicit user actions |
 
