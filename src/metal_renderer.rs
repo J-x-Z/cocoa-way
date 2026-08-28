@@ -170,9 +170,13 @@ impl MetalRenderer {
                 .ok_or("Missing frag_border")?;
 
             // ── 5. Pipeline states ───────────────────────────────────────────
-            // blit is OPAQUE — tile content always replaces the background completely.
-            // Using blending=false prevents any transparent holes from showing through.
-            let blit_pipeline = make_pipeline(&device, &vert, &frag_blit, false)?;
+            // blit BLENDS. It used to replace the background outright, which is fine
+            // for a toplevel — its alpha=0 regions end up showing the clear colour
+            // either way — but wrong for a popup, which is drawn over the toplevel in
+            // the same drawable: a menu's shadow and rounded corners replaced what was
+            // underneath with transparent black instead of compositing over it, which
+            // is the black outline around every context menu.
+            let blit_pipeline = make_pipeline(&device, &vert, &frag_blit, true)?;
             let border_pipeline = make_pipeline(&device, &vert, &frag_border, true)?;
 
             Ok(Self {
