@@ -1,0 +1,6 @@
+[smithay]
+repository = "https://github.com/J-x-Z/smithay-universal.git"
+revision = "be6b5c477f87bfd234bd5a525306ac9802f0a716"
+upstream_repository = "https://github.com/Smithay/smithay.git"
+upstream_base = "6329f5b21693c53b0370cc7f62523ea4d0a42073"
+features = ["wayland_frontend", "xkbcommon"]

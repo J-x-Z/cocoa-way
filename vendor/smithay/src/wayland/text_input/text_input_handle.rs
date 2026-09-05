@@ -31,7 +31,6 @@ impl TextInput {
                 let instance_id = text_input.instance.id();
                 if instance_id.same_client_as(&surface.id()) {
                     f(&text_input.instance, surface, text_input.serial);
-                    break;
                 }
             }
         };
@@ -142,7 +141,7 @@ impl TextInputHandle {
         });
     }
 
-    /// Access the text-input instance for the currently focused surface.
+    /// Access the text-input instances for the currently focused surface.
     pub fn with_focused_text_input<F>(&self, mut f: F)
     where
         F: FnMut(&ZwpTextInputV3, &WlSurface),
@@ -249,11 +248,15 @@ where
                 pending_state.surrounding_text = Some((text, cursor as u32, anchor as u32));
             }
             zwp_text_input_v3::Request::SetTextChangeCause { cause } => {
-                pending_state.text_change_cause = Some(cause.into_result().unwrap());
+                // Guard against clients sending us unknown values from future versions.
+                let cause = cause.into_result().unwrap_or(ChangeCause::Other);
+                pending_state.text_change_cause = Some(cause);
             }
             zwp_text_input_v3::Request::SetContentType { hint, purpose } => {
-                pending_state.content_type =
-                    Some((hint.into_result().unwrap(), purpose.into_result().unwrap()));
+                // Guard against clients sending us unknown values from future versions.
+                let hint = ContentHint::from_bits_truncate(u32::from(hint));
+                let purpose = purpose.into_result().unwrap_or(ContentPurpose::Normal);
+                pending_state.content_type = Some((hint, purpose));
             }
             zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
                 pending_state.cursor_rectangle = Some(Rectangle::new((x, y).into(), (width, height).into()));
