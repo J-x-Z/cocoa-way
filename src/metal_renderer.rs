@@ -82,10 +82,23 @@ struct FrameState {
 struct CachedTexture {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
     buffer_id: ObjectId,
+    alpha: TextureAlpha,
     tex_w: i32,
     tex_h: i32,
     dest_w: i32,
     dest_h: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextureAlpha {
+    Opaque,
+    Premultiplied,
+}
+
+impl TextureAlpha {
+    fn uses_blending(self) -> bool {
+        self == Self::Premultiplied
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +116,8 @@ pub struct MetalRenderer {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     layer: Retained<CAMetalLayer>,
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    blit_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    opaque_blit_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    alpha_blit_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     border_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     // Set for the duration of one rendered frame
     frame: RefCell<Option<FrameState>>,
@@ -170,9 +184,8 @@ impl MetalRenderer {
                 .ok_or("Missing frag_border")?;
 
             // ── 5. Pipeline states ───────────────────────────────────────────
-            // blit is OPAQUE — tile content always replaces the background completely.
-            // Using blending=false prevents any transparent holes from showing through.
-            let blit_pipeline = make_pipeline(&device, &vert, &frag_blit, false)?;
+            let opaque_blit_pipeline = make_pipeline(&device, &vert, &frag_blit, false)?;
+            let alpha_blit_pipeline = make_pipeline(&device, &vert, &frag_blit, true)?;
             let border_pipeline = make_pipeline(&device, &vert, &frag_border, true)?;
 
             Ok(Self {
@@ -182,7 +195,8 @@ impl MetalRenderer {
                 device,
                 layer,
                 command_queue,
-                blit_pipeline,
+                opaque_blit_pipeline,
+                alpha_blit_pipeline,
                 border_pipeline,
                 frame: RefCell::new(None),
                 texture_cache: RefCell::new(HashMap::new()),
@@ -314,7 +328,12 @@ impl MetalRenderer {
         let rect = self.to_ndc(phys_x, phys_y, dest_w, dest_h);
         unsafe {
             let enc = &frame.encoder;
-            enc.setRenderPipelineState(&self.blit_pipeline);
+            let pipeline = if entry.alpha.uses_blending() {
+                &self.alpha_blit_pipeline
+            } else {
+                &self.opaque_blit_pipeline
+            };
+            enc.setRenderPipelineState(pipeline);
             enc.setVertexBytes_length_atIndex(
                 as_bytes(&rect),
                 std::mem::size_of::<RectUniform>(),
@@ -341,6 +360,7 @@ impl MetalRenderer {
         tex_h: i32,
         bytes_per_row: usize,
         pixels: &[u8],
+        alpha: TextureAlpha,
         damage: &[BufferDamage],
     ) {
         if dest_w <= 0 || dest_h <= 0 {
@@ -360,6 +380,7 @@ impl MetalRenderer {
             tex_h,
             bytes_per_row,
             pixels,
+            alpha,
             damage,
         );
         let Some(texture) = texture else {
@@ -369,7 +390,12 @@ impl MetalRenderer {
         let rect = self.to_ndc(x, y, dest_w, dest_h);
         unsafe {
             let enc = &frame.encoder;
-            enc.setRenderPipelineState(&self.blit_pipeline);
+            let pipeline = if alpha.uses_blending() {
+                &self.alpha_blit_pipeline
+            } else {
+                &self.opaque_blit_pipeline
+            };
+            enc.setRenderPipelineState(pipeline);
             enc.setVertexBytes_length_atIndex(
                 as_bytes(&rect),
                 std::mem::size_of::<RectUniform>(),
@@ -430,6 +456,7 @@ impl MetalRenderer {
         tex_h: i32,
         bytes_per_row: usize,
         pixels: &[u8],
+        alpha: TextureAlpha,
         damage: &[BufferDamage],
     ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
         let mut cache = self.texture_cache.borrow_mut();
@@ -488,6 +515,7 @@ impl MetalRenderer {
                     }
                 }
                 entry.buffer_id = buffer_id;
+                entry.alpha = alpha;
                 entry.dest_w = dest_w;
                 entry.dest_h = dest_h;
                 return Some(entry.texture.clone());
@@ -518,6 +546,7 @@ impl MetalRenderer {
             CachedTexture {
                 texture,
                 buffer_id,
+                alpha,
                 tex_w,
                 tex_h,
                 dest_w,
@@ -555,7 +584,7 @@ fn coalesce_damage(damage: &[BufferDamage], width: i32, height: i32) -> Option<B
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferDamage, coalesce_damage};
+    use super::{BufferDamage, TextureAlpha, coalesce_damage};
 
     #[test]
     fn damage_is_clipped_and_coalesced() {
@@ -588,6 +617,12 @@ mod tests {
     fn empty_damage_skips_texture_upload() {
         assert_eq!(coalesce_damage(&[], 100, 90), None);
     }
+
+    #[test]
+    fn only_premultiplied_textures_use_the_alpha_pipeline() {
+        assert!(!TextureAlpha::Opaque.uses_blending());
+        assert!(TextureAlpha::Premultiplied.uses_blending());
+    }
 }
 
 unsafe fn make_pipeline(
@@ -604,7 +639,9 @@ unsafe fn make_pipeline(
     ca.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
     if blending {
         ca.setBlendingEnabled(true);
-        ca.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+        // wl_shm defines alpha formats as premultiplied, so RGB must not be
+        // multiplied by source alpha a second time during composition.
+        ca.setSourceRGBBlendFactor(MTLBlendFactor::One);
         ca.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
         ca.setSourceAlphaBlendFactor(MTLBlendFactor::One);
         ca.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);

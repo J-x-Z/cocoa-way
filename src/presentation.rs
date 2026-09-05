@@ -388,7 +388,7 @@ fn render_surface_tree(
                     let buffer_id = buffer.id();
                     if crate::render::with_buffer_pixels(
                         &buffer,
-                        |width, height, bytes_per_row, pixels| {
+                        |width, height, bytes_per_row, pixels, alpha| {
                             let buffer_damage = buffer_damage_rects(
                                 &damage,
                                 width,
@@ -424,6 +424,7 @@ fn render_surface_tree(
                                 height,
                                 bytes_per_row,
                                 pixels,
+                                alpha,
                                 &buffer_damage,
                             );
                             rendered += 1;
