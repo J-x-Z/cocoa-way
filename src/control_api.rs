@@ -150,9 +150,12 @@ fn dispatch(
         "launch" | "start" | "stop" | "check" => {
             queue_session_command(&command, request.session.as_deref(), sender)
         }
+        "display-create" | "display-close" => {
+            queue_display_command(&command, request.session.as_deref(), sender)
+        }
         _ => ControlResponse::failure(
             &command,
-            "unsupported command; use status, applications, running, displays, images, volumes, runtimes, tasks, environment, features, diagnostics, logs, check, launch, or stop",
+            "unsupported command; use status, applications, running, displays, images, volumes, runtimes, tasks, environment, features, diagnostics, logs, check, launch, stop, display-create, or display-close",
         ),
     }
 }
@@ -180,6 +183,55 @@ fn queue_session_command(
                 "index": index,
                 "name": session.name,
                 "note": "The command was queued on Cocoa-Way's compositor event loop.",
+            }),
+        ),
+        Err(error) => {
+            ControlResponse::failure(command, format!("event loop is unavailable: {error}"))
+        }
+    }
+}
+
+fn queue_display_command(
+    command: &str,
+    selector: Option<&str>,
+    sender: &Sender<CompositorMessage>,
+) -> ControlResponse {
+    let requested = match selector
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(crate::normalize_managed_display_slot)
+        .transpose()
+    {
+        Ok(requested) => requested,
+        Err(error) => return ControlResponse::failure(command, error),
+    };
+    let (message, slot, note) = match command {
+        "display-create" => (
+            CompositorMessage::CreateManagedDisplay(requested.clone()),
+            requested,
+            "Display creation was queued on Cocoa-Way's compositor event loop.",
+        ),
+        "display-close" => {
+            let Some(slot) = requested else {
+                return ControlResponse::failure(command, "a managed display name is required");
+            };
+            (
+                CompositorMessage::CloseManagedDisplay(slot.clone()),
+                Some(slot),
+                "Display closure was queued on Cocoa-Way's compositor event loop.",
+            )
+        }
+        _ => unreachable!(),
+    };
+    let automatic = slot.is_none();
+    match sender.send(message) {
+        Ok(()) => ControlResponse::success(
+            command,
+            json!({
+                "accepted": true,
+                "slot": slot,
+                "automatic": automatic,
+                "note": note,
             }),
         ),
         Err(error) => {
@@ -620,6 +672,43 @@ mod tests {
             );
             assert!(response.ok, "{command} failed: {:?}", response.error);
             assert!(!response.data.is_null(), "{command} returned no data");
+        }
+    }
+
+    #[test]
+    fn display_control_commands_are_normalized_and_queued() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let create = dispatch(
+            ControlRequest {
+                command: "display-create".into(),
+                session: Some("Research Window".into()),
+                limit: 10,
+            },
+            &sender,
+            Path::new("/tmp/control.sock"),
+        );
+        assert!(create.ok);
+        assert_eq!(create.data["slot"], "research-window");
+        match receiver.recv().unwrap() {
+            CompositorMessage::CreateManagedDisplay(Some(slot)) => {
+                assert_eq!(slot, "research-window")
+            }
+            _ => panic!("unexpected display-create message"),
+        }
+
+        let close = dispatch(
+            ControlRequest {
+                command: "display-close".into(),
+                session: Some("Research Window".into()),
+                limit: 10,
+            },
+            &sender,
+            Path::new("/tmp/control.sock"),
+        );
+        assert!(close.ok);
+        match receiver.recv().unwrap() {
+            CompositorMessage::CloseManagedDisplay(slot) => assert_eq!(slot, "research-window"),
+            _ => panic!("unexpected display-close message"),
         }
     }
 

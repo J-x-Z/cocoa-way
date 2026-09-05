@@ -175,6 +175,8 @@ cocoa-wayctl --json displays
 cocoa-wayctl diagnostics "Niri Desktop"
 cocoa-wayctl launch "Niri Desktop"
 cocoa-wayctl stop "Niri Desktop"
+cocoa-wayctl display-create "Research Window"
+cocoa-wayctl display-close "Research Window"
 ```
 
 `cocoa-way-mcp` is an optional local stdio adapter. Its tools can inspect the environment, suggest trusted image paths, generate reviewable application/connection templates, collect diagnostics, and prepare issue reports. MCP tools are read-only by design; they cannot silently launch applications or delete containers, images, or volumes.

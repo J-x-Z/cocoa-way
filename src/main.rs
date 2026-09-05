@@ -116,6 +116,7 @@ const DISPLAY_WORKER_RUNTIME_ENV: &str = "COCOA_WAY_DISPLAY_RUNTIME_DIR";
 const DISPLAY_WORKER_READY_ENV: &str = "COCOA_WAY_DISPLAY_READY_FILE";
 const DISPLAY_WORKER_PARENT_ENV: &str = "COCOA_WAY_DISPLAY_PARENT_PID";
 const DISPLAY_WORKER_PANIC_LOG: &str = "worker-panic.log";
+const DISPLAY_WORKER_PID_FILE: &str = "display.worker";
 static DISPLAY_WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static APPLICATION_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -167,6 +168,23 @@ fn display_slot_slug(value: &str) -> String {
     } else {
         slug
     }
+}
+
+fn normalize_managed_display_slot(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("display name cannot be empty".into());
+    }
+    if value.chars().count() > 64 {
+        return Err("display name cannot be longer than 64 characters".into());
+    }
+    let slot = display_slot_slug(value);
+    if matches!(slot.as_str(), "auto" | "default" | "dedicated") {
+        return Err(format!(
+            "'{slot}' is a display policy keyword; choose a distinct managed display name"
+        ));
+    }
+    Ok(slot)
 }
 
 fn choose_display_assignment(
@@ -344,6 +362,18 @@ fn spawn_display_worker(
         .stderr(std::process::Stdio::from(stderr))
         .spawn()
         .map_err(|error| format!("failed to start dedicated display '{}': {}", slot, error))?;
+    if let Err(error) = std::fs::write(
+        runtime_dir.join(DISPLAY_WORKER_PID_FILE),
+        child.id().to_string(),
+    ) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        return Err(format!(
+            "failed to publish dedicated display worker for '{}': {}",
+            slot, error
+        ));
+    }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     while std::time::Instant::now() < deadline {
@@ -2877,6 +2907,17 @@ mod display_slot_tests {
     }
 
     #[test]
+    fn managed_display_names_are_stable_and_reserve_policy_keywords() {
+        assert_eq!(
+            normalize_managed_display_slot("Research Window").as_deref(),
+            Ok("research-window")
+        );
+        for reserved in ["auto", "default", "dedicated"] {
+            assert!(normalize_managed_display_slot(reserved).is_err());
+        }
+    }
+
+    #[test]
     fn rootless_sessions_always_use_an_isolated_worker() {
         let mut rootless = session("Browser Window", Some("auto"));
         rootless.presentation = Some("rootless".into());
@@ -3949,16 +3990,32 @@ fn create_event_handler(
                         state.needs_redraw = true;
                     }
                 }
-                CompositorMessage::CreateManagedDisplay => {
+                CompositorMessage::CreateManagedDisplay(requested_slot) => {
                     reap_exited_managed_displays(
                         &mut managed_displays,
                         &mut active_container_sessions,
                     );
-                    let slot = next_managed_display_slot(
-                        &managed_displays,
-                        &pending_managed_displays,
-                        &active_container_sessions,
-                    );
+                    let slot = if let Some(requested_slot) = requested_slot {
+                        requested_slot
+                    } else {
+                        next_managed_display_slot(
+                            &managed_displays,
+                            &pending_managed_displays,
+                            &active_container_sessions,
+                        )
+                    };
+                    if pending_managed_displays.contains(&slot)
+                        || managed_displays.iter().any(|display| display.slot == slot)
+                        || active_container_sessions
+                            .iter()
+                            .any(|session| session.display_slot == slot)
+                    {
+                        container_mode::record_managed_display_failure(
+                            &slot,
+                            "This display slot is already starting or in use.",
+                        );
+                        continue;
+                    }
                     pending_managed_displays.insert(slot.clone());
                     container_mode::record_managed_display_starting(&slot);
                     spawn_managed_display_worker_async(slot, container_event_signal.clone());

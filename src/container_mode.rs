@@ -3731,6 +3731,58 @@ fn field_string(field: &NSTextField) -> String {
     value.to_string().trim().to_string()
 }
 
+unsafe fn show_create_managed_display_dialog() {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
+    unsafe {
+        let _: () = msg_send![&*alert, setMessageText:
+            &*NSString::from_str("Create Managed Display")];
+        let _: () = msg_send![&*alert, setInformativeText:
+            &*NSString::from_str("Leave the name empty for automatic numbering. A stable name can be selected by application profiles and run_waypipe.sh connections.")];
+    }
+    let view: Retained<NSView> =
+        unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 380.0, 54.0)] };
+    add_label(
+        &view,
+        "Display name",
+        rect(0.0, 30.0, 110.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    let name_field = add_text_field(
+        &view,
+        rect(0.0, 0.0, 380.0, 26.0),
+        "Automatic (display-1, display-2, ...)",
+        "",
+        mtm,
+    );
+    unsafe {
+        let _: () = msg_send![&*alert, setAccessoryView: &*view];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Create")];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Cancel")];
+        let _: () = msg_send![&*alert, layout];
+    }
+    let response: isize = unsafe { msg_send![&*alert, runModal] };
+    if response != 1000 {
+        return;
+    }
+    let requested = field_string(&name_field);
+    let requested = if requested.is_empty() {
+        None
+    } else {
+        match crate::normalize_managed_display_slot(&requested) {
+            Ok(slot) => Some(slot),
+            Err(error) => {
+                show_error_alert(&error);
+                return;
+            }
+        }
+    };
+    send(CompositorMessage::CreateManagedDisplay(requested));
+}
+
 fn popup_index(popup: &NSPopUpButton) -> isize {
     unsafe { msg_send![popup, indexOfSelectedItem] }
 }
@@ -3970,7 +4022,7 @@ declare_class!(
 
         #[method(createManagedDisplay:)]
         fn create_managed_display(&self, _sender: &AnyObject) {
-            send(CompositorMessage::CreateManagedDisplay);
+            unsafe { show_create_managed_display_dialog() };
         }
 
         #[method(copyManagedDisplayEnvironment:)]

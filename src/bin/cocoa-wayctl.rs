@@ -89,8 +89,8 @@ fn run() -> Result<ControlResponse, String> {
 fn print_help() {
     println!(
         "cocoa-wayctl [--json] [--socket PATH] [--limit N] COMMAND [SESSION]\n\n\
-         Commands:\n  status\n  applications\n  sessions (compatibility alias)\n  running\n  displays\n  images\n  volumes\n  runtimes\n  tasks\n  environment\n  features\n  diagnostics [APPLICATION]\n  logs APPLICATION\n  check APPLICATION\n  launch APPLICATION\n  stop APPLICATION\n\n\
-         APPLICATION is an exact profile name or the zero-based index shown by `applications`."
+         Commands:\n  status\n  applications\n  sessions (compatibility alias)\n  running\n  displays\n  images\n  volumes\n  runtimes\n  tasks\n  environment\n  features\n  diagnostics [APPLICATION]\n  logs APPLICATION\n  check APPLICATION\n  launch APPLICATION\n  stop APPLICATION\n  display-create [NAME]\n  display-close NAME\n\n\
+         APPLICATION is an exact profile name or the zero-based index shown by `applications`. Display names are normalized to stable lowercase slots."
     );
 }
 

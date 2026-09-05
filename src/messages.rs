@@ -56,7 +56,7 @@ pub enum CompositorMessage {
         display_slot: String,
         error: String,
     },
-    CreateManagedDisplay,
+    CreateManagedDisplay(Option<String>),
     CloseManagedDisplay(String),
     ManagedDisplayStarted {
         display_slot: String,

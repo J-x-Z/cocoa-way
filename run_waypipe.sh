@@ -93,7 +93,7 @@ find_managed_display() {
 
 managed_display_is_live() {
     local marker="$1"
-    local directory base parent_pid command
+    local directory base parent_pid worker_pid command
     directory=$(dirname "$marker")
     if [ -f "$directory/display.parent" ]; then
         parent_pid=$(cat "$directory/display.parent" 2>/dev/null || true)
@@ -105,6 +105,14 @@ managed_display_is_live() {
     [[ "$parent_pid" =~ ^[0-9]+$ ]] || return 1
     kill -0 "$parent_pid" 2>/dev/null || return 1
     command=$(ps -p "$parent_pid" -o command= 2>/dev/null || true)
+    [[ "$command" == *cocoa-way* ]] || return 1
+    # Workers created before the PID marker was introduced remain discoverable
+    # until Cocoa-Way restarts; new workers receive the stricter liveness check.
+    [ -f "$directory/display.worker" ] || return 0
+    worker_pid=$(cat "$directory/display.worker" 2>/dev/null || true)
+    [[ "$worker_pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$worker_pid" 2>/dev/null || return 1
+    command=$(ps -p "$worker_pid" -o command= 2>/dev/null || true)
     [[ "$command" == *cocoa-way* ]]
 }
 
