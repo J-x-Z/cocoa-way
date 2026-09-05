@@ -16,6 +16,33 @@ use smithay::wayland::shell::xdg::{XdgShellHandler, XdgShellState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationState, XdgDecorationHandler};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use crate::layout::Layout;
+use std::sync::Arc;
+
+const CLIPBOARD_IMAGE_MIME: &str = "image/png";
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CLIPBOARD_IMAGE_SOURCE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_CLIPBOARD_IMAGE_PIXELS: usize = 32 * 1024 * 1024;
+
+struct HostPasteboardSnapshot {
+    change_count: isize,
+    text: Option<Arc<str>>,
+    image_png: Option<Arc<[u8]>>,
+    image_error: Option<String>,
+}
+
+enum HostClipboardPayload {
+    Text(Arc<str>),
+    Image(Arc<[u8]>),
+}
+
+impl HostClipboardPayload {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Text(text) => text.as_bytes(),
+            Self::Image(image) => image,
+        }
+    }
+}
 
 pub struct PendingFrameCallback {
     pub root_surface: Option<smithay::reexports::wayland_server::backend::ObjectId>,
@@ -72,7 +99,8 @@ pub struct AppState {
     /// Total Wayland surface commits observed since startup. Used for lightweight
     /// performance diagnostics in Container Mode.
     pub commit_counter: u64,
-    host_clipboard_text: Option<String>,
+    host_clipboard_text: Option<Arc<str>>,
+    host_clipboard_image_png: Option<Arc<[u8]>>,
     pending_guest_clipboard_mime: Option<String>,
     pasteboard_change_count: isize,
     last_pasteboard_poll: std::time::Instant,
@@ -308,6 +336,7 @@ impl AppState {
             rootless_dirty_surfaces: std::collections::HashSet::new(),
             commit_counter: 0,
             host_clipboard_text: None,
+            host_clipboard_image_png: None,
             pending_guest_clipboard_mime: None,
             pasteboard_change_count: -1,
             last_pasteboard_poll: std::time::Instant::now() - std::time::Duration::from_millis(100),
@@ -600,40 +629,66 @@ impl AppState {
         }
         self.last_pasteboard_poll = now;
 
-        let (change_count, text) = pasteboard_snapshot();
-        if change_count == self.pasteboard_change_count {
-            return;
-        }
-        self.pasteboard_change_count = change_count;
-        let Some(text) = text else {
-            self.host_clipboard_text = None;
-            crate::diagnostics::record_clipboard_host_change(0);
+        let Some(snapshot) = pasteboard_snapshot_if_changed(self.pasteboard_change_count) else {
             return;
         };
-        if self.host_clipboard_text.as_deref() == Some(text.as_str()) {
+        self.pasteboard_change_count = snapshot.change_count;
+        self.host_clipboard_text = snapshot.text;
+        self.host_clipboard_image_png = snapshot.image_png;
+
+        let byte_count = self
+            .host_clipboard_text
+            .as_ref()
+            .map_or(0, |text| text.len())
+            + self
+                .host_clipboard_image_png
+                .as_ref()
+                .map_or(0, |image| image.len());
+        let mime_types = clipboard_mime_types(
+            self.host_clipboard_text.is_some(),
+            self.host_clipboard_image_png.is_some(),
+        );
+        crate::diagnostics::record_clipboard_host_change(
+            byte_count,
+            mime_types.first().map(String::as_str),
+        );
+
+        if let Some(error) = snapshot.image_error {
+            log::warn!("Clipboard: {error}");
+            crate::diagnostics::record_clipboard_host_failure(error);
+        }
+
+        if mime_types.is_empty() {
+            log::info!("Clipboard: macOS pasteboard has no supported contents");
+            smithay::wayland::selection::data_device::clear_data_device_selection::<Self>(
+                &self.display_handle,
+                &self.seat,
+            );
             return;
         }
 
-        self.host_clipboard_text = Some(text);
-        crate::diagnostics::record_clipboard_host_change(
-            self.host_clipboard_text.as_ref().map_or(0, String::len),
+        log::info!(
+            "Clipboard: publishing changed macOS contents to Wayland clients as {}",
+            mime_types.join(", ")
         );
-        log::info!("Clipboard: publishing changed macOS text to Wayland clients");
         smithay::wayland::selection::data_device::set_data_device_selection::<Self>(
             &self.display_handle,
             &self.seat,
-            clipboard_text_mime_types(),
+            mime_types,
             (),
         );
     }
 
     pub fn install_guest_clipboard(&mut self, text: String) {
-        if self.host_clipboard_text.as_deref() == Some(text.as_str()) {
+        if self.host_clipboard_text.as_deref() == Some(text.as_str())
+            && self.host_clipboard_image_png.is_none()
+        {
             return;
         }
         self.pasteboard_change_count = write_to_pasteboard(&text);
         crate::diagnostics::record_clipboard_guest_install(text.len());
-        self.host_clipboard_text = Some(text);
+        self.host_clipboard_text = Some(Arc::from(text));
+        self.host_clipboard_image_png = None;
         log::info!("Clipboard: installed Wayland text on the macOS pasteboard");
         smithay::wayland::selection::data_device::set_data_device_selection::<Self>(
             &self.display_handle,
@@ -1165,16 +1220,27 @@ impl SelectionHandler for AppState {
         if ty != SelectionTarget::Clipboard {
             return;
         }
-        if !is_clipboard_text_mime(&mime_type) {
+        let payload = if is_clipboard_image_mime(&mime_type) {
+            self.host_clipboard_image_png
+                .clone()
+                .map(HostClipboardPayload::Image)
+        } else if is_clipboard_text_mime(&mime_type) {
+            self.host_clipboard_text
+                .clone()
+                .map(HostClipboardPayload::Text)
+        } else {
             return;
-        }
-        log::info!("Clipboard: Wayland client requested macOS text as {mime_type}");
-        let text = self.host_clipboard_text.clone();
+        };
+        log::info!("Clipboard: Wayland client requested macOS contents as {mime_type}");
         std::thread::spawn(move || {
             use std::io::Write;
-            if let Some(text) = text {
+            if let Some(payload) = payload {
                 let mut f = std::fs::File::from(fd);
-                let _ = f.write_all(text.as_bytes());
+                if let Err(error) = f.write_all(payload.as_bytes()) {
+                    crate::diagnostics::record_clipboard_host_failure(format!(
+                        "Failed to send macOS clipboard contents to Wayland: {error}"
+                    ));
+                }
             }
         });
     }
@@ -1281,6 +1347,21 @@ fn clipboard_text_mime_types() -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect()
+}
+
+fn clipboard_mime_types(has_text: bool, has_image_png: bool) -> Vec<String> {
+    let mut mime_types = Vec::new();
+    if has_image_png {
+        mime_types.push(CLIPBOARD_IMAGE_MIME.to_owned());
+    }
+    if has_text {
+        mime_types.extend(clipboard_text_mime_types());
+    }
+    mime_types
+}
+
+fn is_clipboard_image_mime(mime: &str) -> bool {
+    mime.trim().eq_ignore_ascii_case(CLIPBOARD_IMAGE_MIME)
 }
 
 fn is_clipboard_text_mime(mime: &str) -> bool {
@@ -1397,7 +1478,56 @@ mod pointer_axis_tests {
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{is_clipboard_text_mime, preferred_clipboard_text_mime};
+    use super::{
+        CLIPBOARD_IMAGE_MIME, MAX_CLIPBOARD_IMAGE_BYTES, clipboard_mime_types,
+        is_clipboard_image_mime, is_clipboard_text_mime, png_dimensions,
+        preferred_clipboard_text_mime, shared_png_bytes,
+    };
+
+    fn sample_png(width: u32, height: u32) -> Vec<u8> {
+        let mut png = vec![0; 24];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[12..16].copy_from_slice(b"IHDR");
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&height.to_be_bytes());
+        png
+    }
+
+    #[test]
+    fn advertises_png_before_text_when_both_are_available() {
+        let offered = clipboard_mime_types(true, true);
+        assert_eq!(
+            offered.first().map(String::as_str),
+            Some(CLIPBOARD_IMAGE_MIME)
+        );
+        assert!(offered.iter().any(|mime| mime == "text/plain"));
+    }
+
+    #[test]
+    fn clears_all_mime_types_when_the_host_clipboard_is_empty() {
+        assert!(clipboard_mime_types(false, false).is_empty());
+    }
+
+    #[test]
+    fn accepts_png_without_treating_it_as_text() {
+        assert!(is_clipboard_image_mime("IMAGE/PNG"));
+        assert!(!is_clipboard_text_mime(CLIPBOARD_IMAGE_MIME));
+    }
+
+    #[test]
+    fn validates_screenshot_dimensions_and_shares_the_encoded_bytes() {
+        let png = sample_png(6016, 3384);
+        assert_eq!(png_dimensions(&png), Some((6016, 3384)));
+        let shared = shared_png_bytes(png.clone()).unwrap().unwrap();
+        assert_eq!(&*shared, png.as_slice());
+    }
+
+    #[test]
+    fn rejects_oversized_png_clipboards() {
+        let mut png = sample_png(1, 1);
+        png.resize(MAX_CLIPBOARD_IMAGE_BYTES + 1, 0);
+        assert!(shared_png_bytes(png).unwrap_err().contains("64 MiB"));
+    }
 
     #[test]
     fn chooses_the_exact_mime_offered_by_the_client() {
@@ -1440,14 +1570,117 @@ fn write_to_pasteboard(text: &str) -> isize {
     }
 }
 
-fn pasteboard_snapshot() -> (isize, Option<String>) {
+fn pasteboard_snapshot_if_changed(previous_change_count: isize) -> Option<HostPasteboardSnapshot> {
     use objc2_app_kit::NSPasteboard;
     unsafe {
         let pb = NSPasteboard::generalPasteboard();
-        let pb_type = objc2_app_kit::NSPasteboardTypeString;
-        (
-            pb.changeCount(),
-            pb.stringForType(pb_type).map(|s| s.to_string()),
-        )
+        let change_count = pb.changeCount();
+        if change_count == previous_change_count {
+            return None;
+        }
+        let text = pb
+            .stringForType(objc2_app_kit::NSPasteboardTypeString)
+            .map(|text| Arc::<str>::from(text.to_string()));
+        let (image_png, image_error) = match pasteboard_png(&pb) {
+            Ok(image) => (image, None),
+            Err(error) => (None, Some(error)),
+        };
+        Some(HostPasteboardSnapshot {
+            change_count,
+            text,
+            image_png,
+            image_error,
+        })
     }
+}
+
+fn pasteboard_png(pb: &objc2_app_kit::NSPasteboard) -> Result<Option<Arc<[u8]>>, String> {
+    use objc2_app_kit::{
+        NSBitmapImageRep, NSPNGFileType, NSPasteboardTypePNG, NSPasteboardTypeTIFF,
+    };
+    use objc2_foundation::NSDictionary;
+
+    unsafe {
+        if let Some(data) = pb.dataForType(NSPasteboardTypePNG) {
+            return shared_png_data(&data);
+        }
+
+        let Some(tiff) = pb.dataForType(NSPasteboardTypeTIFF) else {
+            return Ok(None);
+        };
+        validate_clipboard_source_size(tiff.len())?;
+        let image = NSBitmapImageRep::imageRepWithData(&tiff)
+            .ok_or_else(|| "macOS clipboard TIFF image could not be decoded".to_string())?;
+        validate_clipboard_image_dimensions(image.pixelsWide(), image.pixelsHigh())?;
+        let properties = NSDictionary::new();
+        let png = image
+            .representationUsingType_properties(NSPNGFileType, &properties)
+            .ok_or_else(|| {
+                "macOS clipboard TIFF image could not be converted to PNG".to_string()
+            })?;
+        shared_png_data(&png)
+    }
+}
+
+fn shared_png_data(data: &objc2_foundation::NSData) -> Result<Option<Arc<[u8]>>, String> {
+    if data.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(format!(
+            "macOS clipboard image is larger than the 64 MiB transfer limit ({} MiB)",
+            data.len().div_ceil(1024 * 1024)
+        ));
+    }
+    shared_png_bytes(data.bytes().to_vec())
+}
+
+fn shared_png_bytes(bytes: Vec<u8>) -> Result<Option<Arc<[u8]>>, String> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(format!(
+            "macOS clipboard image is larger than the 64 MiB transfer limit ({} MiB)",
+            bytes.len().div_ceil(1024 * 1024)
+        ));
+    }
+    let (width, height) = png_dimensions(&bytes)
+        .ok_or_else(|| "macOS clipboard advertised malformed PNG data".to_string())?;
+    validate_clipboard_image_dimensions(width as isize, height as isize)?;
+    Ok(Some(Arc::from(bytes)))
+}
+
+fn validate_clipboard_source_size(bytes: usize) -> Result<(), String> {
+    if bytes > MAX_CLIPBOARD_IMAGE_SOURCE_BYTES {
+        return Err(format!(
+            "macOS clipboard source image is larger than the 128 MiB decode limit ({} MiB)",
+            bytes.div_ceil(1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+fn validate_clipboard_image_dimensions(width: isize, height: isize) -> Result<(), String> {
+    if width <= 0 || height <= 0 {
+        return Err(format!(
+            "macOS clipboard image has invalid dimensions {width}x{height}"
+        ));
+    }
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| "macOS clipboard image dimensions overflow".to_string())?;
+    if pixels > MAX_CLIPBOARD_IMAGE_PIXELS {
+        return Err(format!(
+            "macOS clipboard image exceeds the 32-megapixel safety limit ({width}x{height})"
+        ));
+    }
+    Ok(())
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((width, height))
 }

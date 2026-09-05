@@ -102,12 +102,13 @@ pub fn clipboard_snapshot() -> ClipboardSnapshot {
     CLIPBOARD_SNAPSHOT.lock().unwrap().clone()
 }
 
-pub fn record_clipboard_host_change(bytes: usize) {
-    update_clipboard("Ready", "macOS -> Wayland", None, |snapshot| {
+pub fn record_clipboard_host_change(bytes: usize, mime: Option<&str>) {
+    update_clipboard("Ready", "macOS -> Wayland", mime, |snapshot| {
         snapshot.host_to_guest_events = snapshot.host_to_guest_events.saturating_add(1);
         snapshot.last_error = None;
         if bytes == 0 {
             snapshot.state = "macOS clipboard cleared".into();
+            snapshot.last_mime = None;
         }
     });
 }
@@ -129,8 +130,16 @@ pub fn record_clipboard_guest_install(bytes: usize) {
 }
 
 pub fn record_clipboard_failure(error: impl Into<String>) {
+    record_clipboard_failure_for("Wayland -> macOS", error);
+}
+
+pub fn record_clipboard_host_failure(error: impl Into<String>) {
+    record_clipboard_failure_for("macOS -> Wayland", error);
+}
+
+fn record_clipboard_failure_for(direction: &str, error: impl Into<String>) {
     let error = error.into();
-    update_clipboard("Error", "Wayland -> macOS", None, |snapshot| {
+    update_clipboard("Error", direction, None, |snapshot| {
         snapshot.failures = snapshot.failures.saturating_add(1);
         snapshot.last_error = Some(error);
     });

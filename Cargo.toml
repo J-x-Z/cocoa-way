@@ -29,6 +29,7 @@ objc2-app-kit = { version = "0.2.2", default-features = false, features = [
     "NSButton", "NSPopUpButton", "NSScrollView", "NSTextView", "NSFont", "NSBox", "NSColor",
     "NSOpenPanel", "NSSavePanel", "NSPanel",
     "NSPasteboard",
+    "NSBitmapImageRep", "NSImageRep",
     "NSCursor",
     "NSImage",
     "NSEvent", "NSRunningApplication", "block2", "libc",
