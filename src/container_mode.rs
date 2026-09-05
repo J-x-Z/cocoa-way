@@ -223,6 +223,9 @@ struct AppleContainerCompatibility {
     detail: String,
 }
 
+const APPLE_CONTAINER_TRANSPORT_V2_MINIMUM: (u64, u64, u64) = (1, 1, 0);
+const APPLE_CONTAINER_SECURITY_BASELINE: (u64, u64, u64) = (1, 3, 1);
+
 #[derive(Clone)]
 struct UiCommandCacheEntry {
     completed_at: Instant,
@@ -2998,7 +3001,7 @@ unsafe fn show_pull_image_dialog() {
     let scheme_popup = add_popup(
         &view,
         rect(116.0, 56.0, 304.0, 28.0),
-        &["Automatic", "HTTPS", "HTTP (insecure)"],
+        &["Runtime default", "HTTPS", "HTTP (insecure)"],
         0,
         mtm,
     );
@@ -3128,7 +3131,7 @@ unsafe fn show_registry_login_dialog() {
     let scheme_popup = add_popup(
         &view,
         rect(116.0, 18.0, 304.0, 28.0),
-        &["Automatic", "HTTPS", "HTTP (insecure)"],
+        &["Runtime default", "HTTPS", "HTTP (insecure)"],
         0,
         mtm,
     );
@@ -8290,9 +8293,12 @@ fn apple_container_compatibility(
 
     let versions_match =
         cli_version == "unknown" || api_version == "unknown" || cli_version == api_version;
-    let at_least_1_1 = version_at_least(&cli_version, (1, 1, 0));
+    let transport_v2_version = version_at_least(&cli_version, APPLE_CONTAINER_TRANSPORT_V2_MINIMUM);
+    let security_current = version_at_least(&cli_version, APPLE_CONTAINER_SECURITY_BASELINE);
     let summary = if !versions_match {
         "Client/API version mismatch".into()
+    } else if cli_version != "unknown" && !security_current {
+        "Compatible; security update strongly recommended".into()
     } else if !publish_socket {
         "Legacy transport fallback required".into()
     } else if system_status != "running" {
@@ -8303,14 +8309,19 @@ fn apple_container_compatibility(
     let detail = if !versions_match {
         "The CLI and API server differ. Restart or reinstall Apple Container before launching applications."
             .into()
+    } else if cli_version != "unknown" && !security_current {
+        format!(
+            "Apple Container {} can run through Cocoa-Way, but 1.3.1 fixes multiple security vulnerabilities. Stop the service and run `/usr/local/bin/update-container.sh` before normal use.",
+            cli_version
+        )
     } else if !publish_socket {
         "Cocoa-Way can use its compatibility relay, but Transport V2 requires `container run --publish-socket`."
             .into()
-    } else if at_least_1_1 {
-        "Apple Container 1.1+ includes the non-root Unix-socket permission fix used by Transport V2."
+    } else if transport_v2_version {
+        "Apple Container 1.3.1+ satisfies Cocoa-Way's current security and Transport V2 compatibility baseline."
             .into()
     } else {
-        "Apple Container 1.0 is supported. Version 1.1+ is recommended for non-root published sockets."
+        "This CLI predates reliable non-root published sockets. Cocoa-Way will use its compatibility relay."
             .into()
     };
 
@@ -12379,13 +12390,24 @@ mod tests {
             extract_version("container-apiserver version 1.0.0 (build: release)"),
             Some("1.0.0".into())
         );
+        assert_eq!(
+            extract_version("container CLI version 1.3.1 (build: release)"),
+            Some("1.3.1".into())
+        );
     }
 
     #[test]
     fn apple_container_version_comparison_handles_minor_updates() {
-        assert!(version_at_least("1.1.0", (1, 1, 0)));
-        assert!(version_at_least("2.0.0", (1, 1, 0)));
-        assert!(!version_at_least("1.0.9", (1, 1, 0)));
+        assert!(version_at_least(
+            "1.1.0",
+            APPLE_CONTAINER_TRANSPORT_V2_MINIMUM
+        ));
+        assert!(version_at_least("1.3.1", APPLE_CONTAINER_SECURITY_BASELINE));
+        assert!(version_at_least("2.0.0", APPLE_CONTAINER_SECURITY_BASELINE));
+        assert!(!version_at_least(
+            "1.3.0",
+            APPLE_CONTAINER_SECURITY_BASELINE
+        ));
         assert!(!version_at_least("unknown", (1, 0, 0)));
     }
 

@@ -2742,6 +2742,18 @@ mod display_slot_tests {
     }
 
     #[test]
+    fn apple_image_pull_leaves_registry_scheme_to_the_runtime_by_default() {
+        let (_, args) = image_pull_command(
+            "container",
+            "docker.io/library/ubuntu:24.04".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!args.iter().any(|argument| argument == "--scheme"));
+    }
+
+    #[test]
     fn docker_image_pull_uses_docker_platform_syntax() {
         let (command, args) = image_pull_command(
             "docker",

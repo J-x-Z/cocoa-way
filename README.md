@@ -57,9 +57,12 @@ Apple Container is a separate Apple runtime and is not bundled with Cocoa-Way. A
 2. Open Cocoa-Way and select **Container > Apple Container**.
 3. Use **Start System**, then confirm that the Compatibility card reports a running service.
 
-Apple Container 1.0 is supported through a compatibility fallback, but version 1.1 or newer is recommended for the non-root published Unix sockets used by Transport V2. You can verify the runtime manually with:
+Apple Container 1.3.1 or newer is strongly recommended. Cocoa-Way retains a compatibility relay for older releases, but 1.3.1 includes important upstream security fixes and satisfies the current Transport V2 baseline. You can verify or update the runtime manually with:
 
 ```bash
+container --version
+container system stop
+/usr/local/bin/update-container.sh
 container system start
 container system status
 ```
