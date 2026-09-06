@@ -2344,7 +2344,9 @@ fn apple_remote_gui_command(command: &str, bridge_nested_clipboard: bool) -> Str
     let launch = if bridge_nested_clipboard {
         format!(
             "if command -v wl-paste >/dev/null 2>&1 && command -v wl-copy >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then helper=$(mktemp \"${{XDG_RUNTIME_DIR:-/tmp}}/cocoa-way-clipboard-relay.XXXXXX\") && printf '%s' {} > \"$helper\" && chmod 700 \"$helper\" && exec \"$helper\" sh -lc {}; exit 1; else printf '%s\\n' 'cocoa-way: nested clipboard needs wl-clipboard and coreutils timeout' >&2; exec {}; fi",
-            shell_single_quote(include_str!("../examples/container-images/cocoa-way-clipboard-relay")),
+            shell_single_quote(include_str!(
+                "../examples/container-images/cocoa-way-clipboard-relay"
+            )),
             shell_single_quote(command),
             command,
         )

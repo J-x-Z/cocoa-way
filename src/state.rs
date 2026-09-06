@@ -635,7 +635,8 @@ impl AppState {
         let Some(snapshot) = pasteboard_snapshot_if_changed(self.pasteboard_change_count) else {
             return;
         };
-        self.guest_clipboard_generation.fetch_add(1, Ordering::Relaxed);
+        self.guest_clipboard_generation
+            .fetch_add(1, Ordering::Relaxed);
         self.pending_guest_clipboard_mime = None;
         self.pasteboard_change_count = snapshot.change_count;
         self.host_clipboard_text = snapshot.text;
@@ -733,7 +734,9 @@ impl AppState {
             }
         }
         crate::diagnostics::record_clipboard_guest_install(byte_count);
-        log::info!("Clipboard: installed Wayland contents on the macOS pasteboard ({byte_count} bytes)");
+        log::info!(
+            "Clipboard: installed Wayland contents on the macOS pasteboard ({byte_count} bytes)"
+        );
         smithay::wayland::selection::data_device::set_data_device_selection::<Self>(
             &self.display_handle,
             &self.seat,
@@ -777,9 +780,8 @@ impl AppState {
         let loop_signal = self.loop_signal.clone();
         let generation_counter = self.guest_clipboard_generation.clone();
         let generation = generation_counter.load(Ordering::Relaxed);
-        let pasteboard_change_count = unsafe {
-            objc2_app_kit::NSPasteboard::generalPasteboard().changeCount()
-        };
+        let pasteboard_change_count =
+            unsafe { objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() };
         std::thread::spawn(move || {
             let result = read_guest_clipboard(read_fd, &mime, &generation_counter, generation);
             match result {
@@ -1241,7 +1243,8 @@ impl SelectionHandler for AppState {
         if ty != SelectionTarget::Clipboard {
             return;
         }
-        self.guest_clipboard_generation.fetch_add(1, Ordering::Relaxed);
+        self.guest_clipboard_generation
+            .fetch_add(1, Ordering::Relaxed);
         let source = match source {
             Some(s) => s,
             None => {
@@ -1278,9 +1281,7 @@ impl SelectionHandler for AppState {
                 .clone()
                 .map(ClipboardPayload::Image)
         } else if is_clipboard_text_mime(&mime_type) {
-            self.host_clipboard_text
-                .clone()
-                .map(ClipboardPayload::Text)
+            self.host_clipboard_text.clone().map(ClipboardPayload::Text)
         } else {
             return;
         };
@@ -1504,7 +1505,10 @@ fn write_clipboard_payload(fd: std::os::fd::OwnedFd, mut bytes: &[u8]) -> std::i
         }
         match file.write(bytes) {
             Ok(0) => {
-                return Err(Error::new(ErrorKind::WriteZero, "clipboard receiver stopped reading"));
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "clipboard receiver stopped reading",
+                ));
             }
             Ok(n) => bytes = &bytes[n..],
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -1528,7 +1532,8 @@ fn write_clipboard_payload(fd: std::os::fd::OwnedFd, mut bytes: &[u8]) -> std::i
 }
 
 fn preferred_clipboard_mime(mime_types: &[String]) -> Option<String> {
-    mime_types.iter()
+    mime_types
+        .iter()
         .find(|mime| is_clipboard_image_mime(mime))
         .cloned()
         .or_else(|| preferred_clipboard_text_mime(mime_types))
@@ -1664,10 +1669,9 @@ mod pointer_axis_tests {
 #[cfg(test)]
 mod clipboard_tests {
     use super::{
-        CLIPBOARD_IMAGE_MIME, MAX_CLIPBOARD_IMAGE_BYTES, clipboard_mime_types,
-        is_clipboard_image_mime, is_clipboard_text_mime, png_dimensions,
-        preferred_clipboard_text_mime, shared_png_bytes,
-        preferred_clipboard_mime, read_guest_clipboard, ClipboardPayload,
+        CLIPBOARD_IMAGE_MIME, ClipboardPayload, MAX_CLIPBOARD_IMAGE_BYTES, clipboard_mime_types,
+        is_clipboard_image_mime, is_clipboard_text_mime, png_dimensions, preferred_clipboard_mime,
+        preferred_clipboard_text_mime, read_guest_clipboard, shared_png_bytes,
     };
 
     fn sample_png(width: u32, height: u32) -> Vec<u8> {
@@ -1731,14 +1735,19 @@ mod clipboard_tests {
     #[test]
     fn guest_image_offer_beats_browser_html_and_text() {
         let offered = vec!["text/html".into(), "text/plain".into(), "image/png".into()];
-        assert_eq!(preferred_clipboard_mime(&offered).as_deref(), Some("image/png"));
+        assert_eq!(
+            preferred_clipboard_mime(&offered).as_deref(),
+            Some("image/png")
+        );
         assert!(preferred_clipboard_mime(&["text/html".into()]).is_none());
     }
 
     fn read_test_offer(bytes: Vec<u8>, mime: &str) -> Result<Option<ClipboardPayload>, String> {
         use std::io::Write;
         let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let producer = std::thread::spawn(move || { let _ = writer.write_all(&bytes); });
+        let producer = std::thread::spawn(move || {
+            let _ = writer.write_all(&bytes);
+        });
         let result = read_guest_clipboard(reader.into(), mime, &super::AtomicU64::new(1), 1);
         producer.join().unwrap();
         result
@@ -1747,7 +1756,9 @@ mod clipboard_tests {
     #[test]
     fn guest_png_transfer_preserves_binary_bytes() {
         let png = include_bytes!("../assets/icon.png");
-        let Some(ClipboardPayload::Image(received)) = read_test_offer(png.to_vec(), "image/png").unwrap() else {
+        let Some(ClipboardPayload::Image(received)) =
+            read_test_offer(png.to_vec(), "image/png").unwrap()
+        else {
             panic!("PNG was not received as an image");
         };
         assert_eq!(&*received, png);
@@ -1756,7 +1767,9 @@ mod clipboard_tests {
     #[test]
     fn guest_text_transfer_preserves_unicode_and_newlines() {
         let text = "clipboard \u{4f60}\u{597d}\n";
-        let Some(ClipboardPayload::Text(received)) = read_test_offer(text.as_bytes().to_vec(), "text/plain").unwrap() else {
+        let Some(ClipboardPayload::Text(received)) =
+            read_test_offer(text.as_bytes().to_vec(), "text/plain").unwrap()
+        else {
             panic!("Text was not received");
         };
         assert_eq!(&*received, text);
@@ -1765,16 +1778,26 @@ mod clipboard_tests {
     #[test]
     fn guest_transfer_rejects_invalid_png_and_unbounded_text() {
         assert!(read_test_offer(b"<img src='example'>".to_vec(), "image/png").is_err());
-        assert!(read_test_offer(vec![b'x'; 8 * 1024 * 1024 + 1], "text/plain").err().unwrap().contains("transfer limit"));
+        assert!(
+            read_test_offer(vec![b'x'; 8 * 1024 * 1024 + 1], "text/plain")
+                .err()
+                .unwrap()
+                .contains("transfer limit")
+        );
     }
 
     #[test]
     fn new_selection_cancels_a_blocked_clipboard_reader() {
-        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
         let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
         let counter = Arc::new(AtomicU64::new(1));
         let worker_counter = counter.clone();
-        let reader = std::thread::spawn(move || read_guest_clipboard(reader.into(), "text/plain", &worker_counter, 1));
+        let reader = std::thread::spawn(move || {
+            read_guest_clipboard(reader.into(), "text/plain", &worker_counter, 1)
+        });
         counter.store(2, Ordering::Relaxed);
         assert!(reader.join().unwrap().unwrap().is_none());
     }
@@ -1786,7 +1809,8 @@ mod clipboard_tests {
         writer.set_nonblocking(true).unwrap();
         let bytes = vec![0xA5; 2 * 1024 * 1024];
         let expected = bytes.clone();
-        let producer = std::thread::spawn(move || super::write_clipboard_payload(writer.into(), &bytes));
+        let producer =
+            std::thread::spawn(move || super::write_clipboard_payload(writer.into(), &bytes));
         // Let the sender fill the socket before beginning to consume it.
         std::thread::sleep(std::time::Duration::from_millis(30));
         let mut received = Vec::new();
