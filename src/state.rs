@@ -17,6 +17,7 @@ use smithay::wayland::shell::xdg::decoration::{XdgDecorationState, XdgDecoration
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use crate::layout::Layout;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const CLIPBOARD_IMAGE_MIME: &str = "image/png";
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -30,12 +31,12 @@ struct HostPasteboardSnapshot {
     image_error: Option<String>,
 }
 
-enum HostClipboardPayload {
+pub enum ClipboardPayload {
     Text(Arc<str>),
     Image(Arc<[u8]>),
 }
 
-impl HostClipboardPayload {
+impl ClipboardPayload {
     fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Text(text) => text.as_bytes(),
@@ -102,6 +103,7 @@ pub struct AppState {
     host_clipboard_text: Option<Arc<str>>,
     host_clipboard_image_png: Option<Arc<[u8]>>,
     pending_guest_clipboard_mime: Option<String>,
+    guest_clipboard_generation: Arc<AtomicU64>,
     pasteboard_change_count: isize,
     last_pasteboard_poll: std::time::Instant,
     pointer_gesture: PointerGestureTracker,
@@ -338,6 +340,7 @@ impl AppState {
             host_clipboard_text: None,
             host_clipboard_image_png: None,
             pending_guest_clipboard_mime: None,
+            guest_clipboard_generation: Arc::new(AtomicU64::new(0)),
             pasteboard_change_count: -1,
             last_pasteboard_poll: std::time::Instant::now() - std::time::Duration::from_millis(100),
             pointer_gesture: PointerGestureTracker::default(),
@@ -632,6 +635,8 @@ impl AppState {
         let Some(snapshot) = pasteboard_snapshot_if_changed(self.pasteboard_change_count) else {
             return;
         };
+        self.guest_clipboard_generation.fetch_add(1, Ordering::Relaxed);
+        self.pending_guest_clipboard_mime = None;
         self.pasteboard_change_count = snapshot.change_count;
         self.host_clipboard_text = snapshot.text;
         self.host_clipboard_image_png = snapshot.image_png;
@@ -679,21 +684,63 @@ impl AppState {
         );
     }
 
-    pub fn install_guest_clipboard(&mut self, text: String) {
-        if self.host_clipboard_text.as_deref() == Some(text.as_str())
-            && self.host_clipboard_image_png.is_none()
+    pub fn install_guest_clipboard(
+        &mut self,
+        generation: u64,
+        pasteboard_change_count: isize,
+        payload: ClipboardPayload,
+    ) {
+        // A slow source must not replace a newer guest selection or host copy.
+        if self.guest_clipboard_generation.load(Ordering::Relaxed) != generation
+            || unsafe { objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() }
+                != pasteboard_change_count
         {
             return;
         }
-        self.pasteboard_change_count = write_to_pasteboard(&text);
-        crate::diagnostics::record_clipboard_guest_install(text.len());
-        self.host_clipboard_text = Some(Arc::from(text));
-        self.host_clipboard_image_png = None;
-        log::info!("Clipboard: installed Wayland text on the macOS pasteboard");
+        let byte_count = payload.as_bytes().len();
+        match payload {
+            ClipboardPayload::Text(text) => {
+                if self.host_clipboard_text.as_deref() == Some(&*text)
+                    && self.host_clipboard_image_png.is_none()
+                {
+                    return;
+                }
+                self.pasteboard_change_count = write_to_pasteboard(&text);
+                self.host_clipboard_text = Some(text);
+                self.host_clipboard_image_png = None;
+            }
+            ClipboardPayload::Image(image) => {
+                if self.host_clipboard_image_png.as_deref() == Some(&*image)
+                    && self.host_clipboard_text.is_none()
+                {
+                    return;
+                }
+                use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+                use objc2_foundation::NSData;
+                unsafe {
+                    let pb = NSPasteboard::generalPasteboard();
+                    pb.clearContents();
+                    if !pb.setData_forType(Some(&NSData::with_bytes(&image)), NSPasteboardTypePNG) {
+                        crate::diagnostics::record_clipboard_failure(
+                            "Failed to install Wayland PNG on macOS",
+                        );
+                        return;
+                    }
+                    self.pasteboard_change_count = pb.changeCount();
+                }
+                self.host_clipboard_text = None;
+                self.host_clipboard_image_png = Some(image);
+            }
+        }
+        crate::diagnostics::record_clipboard_guest_install(byte_count);
+        log::info!("Clipboard: installed Wayland contents on the macOS pasteboard ({byte_count} bytes)");
         smithay::wayland::selection::data_device::set_data_device_selection::<Self>(
             &self.display_handle,
             &self.seat,
-            clipboard_text_mime_types(),
+            clipboard_mime_types(
+                self.host_clipboard_text.is_some(),
+                self.host_clipboard_image_png.is_some(),
+            ),
             (),
         );
     }
@@ -728,21 +775,23 @@ impl AppState {
         }
 
         let loop_signal = self.loop_signal.clone();
+        let generation_counter = self.guest_clipboard_generation.clone();
+        let generation = generation_counter.load(Ordering::Relaxed);
+        let pasteboard_change_count = unsafe {
+            objc2_app_kit::NSPasteboard::generalPasteboard().changeCount()
+        };
         std::thread::spawn(move || {
-            use std::io::Read;
-            let mut file = std::fs::File::from(read_fd);
-            let mut text = String::new();
-            match file.read_to_string(&mut text) {
-                Ok(_) if !text.is_empty() => {
-                    let _ = loop_signal
-                        .send(crate::messages::CompositorMessage::GuestClipboardText(text));
+            let result = read_guest_clipboard(read_fd, &mime, &generation_counter, generation);
+            match result {
+                Ok(Some(payload)) => {
+                    let _ = loop_signal.send(crate::messages::CompositorMessage::GuestClipboard {
+                        generation,
+                        pasteboard_change_count,
+                        payload,
+                    });
                 }
-                Ok(_) => crate::diagnostics::record_clipboard_failure(
-                    "Wayland clipboard offer returned no text",
-                ),
-                Err(error) => crate::diagnostics::record_clipboard_failure(format!(
-                    "Failed to read the Wayland clipboard offer: {error}"
-                )),
+                Ok(None) => {}
+                Err(error) => crate::diagnostics::record_clipboard_failure(error),
             }
         });
     }
@@ -1192,6 +1241,7 @@ impl SelectionHandler for AppState {
         if ty != SelectionTarget::Clipboard {
             return;
         }
+        self.guest_clipboard_generation.fetch_add(1, Ordering::Relaxed);
         let source = match source {
             Some(s) => s,
             None => {
@@ -1200,11 +1250,14 @@ impl SelectionHandler for AppState {
             }
         };
         let mime_types = source.mime_types();
-        let Some(mime) = preferred_clipboard_text_mime(&mime_types) else {
+        let Some(mime) = preferred_clipboard_mime(&mime_types) else {
             self.pending_guest_clipboard_mime = None;
             return;
         };
-        log::info!("Clipboard: Wayland client published text as {mime}");
+        log::info!(
+            "Clipboard: Wayland client published {mime}; offered {}",
+            mime_types.join(", "),
+        );
         crate::diagnostics::record_clipboard_guest_offer(&mime);
         self.pending_guest_clipboard_mime = Some(mime);
     }
@@ -1223,20 +1276,18 @@ impl SelectionHandler for AppState {
         let payload = if is_clipboard_image_mime(&mime_type) {
             self.host_clipboard_image_png
                 .clone()
-                .map(HostClipboardPayload::Image)
+                .map(ClipboardPayload::Image)
         } else if is_clipboard_text_mime(&mime_type) {
             self.host_clipboard_text
                 .clone()
-                .map(HostClipboardPayload::Text)
+                .map(ClipboardPayload::Text)
         } else {
             return;
         };
         log::info!("Clipboard: Wayland client requested macOS contents as {mime_type}");
         std::thread::spawn(move || {
-            use std::io::Write;
             if let Some(payload) = payload {
-                let mut f = std::fs::File::from(fd);
-                if let Err(error) = f.write_all(payload.as_bytes()) {
+                if let Err(error) = write_clipboard_payload(fd, payload.as_bytes()) {
                     crate::diagnostics::record_clipboard_host_failure(format!(
                         "Failed to send macOS clipboard contents to Wayland: {error}"
                     ));
@@ -1333,6 +1384,11 @@ fn nix_pipe() -> Option<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd)
     }
     let read = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fds[0]) };
     let write = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fds[1]) };
+    for fd in fds {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return None;
+        }
+    }
     Some((read, write))
 }
 
@@ -1347,6 +1403,135 @@ fn clipboard_text_mime_types() -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect()
+}
+
+fn read_guest_clipboard(
+    fd: std::os::fd::OwnedFd,
+    mime: &str,
+    generation_counter: &AtomicU64,
+    generation: u64,
+) -> Result<Option<ClipboardPayload>, String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let mut file = std::fs::File::from(fd);
+    let raw = file.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err("Could not configure clipboard pipe".to_string());
+        }
+    }
+    let limit = if is_clipboard_image_mime(mime) {
+        MAX_CLIPBOARD_IMAGE_BYTES
+    } else {
+        8 * 1024 * 1024
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 16384];
+    loop {
+        if generation_counter.load(Ordering::Relaxed) != generation {
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Wayland clipboard transfer timed out after 10 seconds".to_string());
+        }
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if bytes.len() + n > limit {
+                    return Err(format!(
+                        "Wayland clipboard exceeds the {} MiB transfer limit",
+                        limit / 1024 / 1024,
+                    ));
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut poll = libc::pollfd {
+                    fd: raw,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut poll, 1, 50) } < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(format!("Clipboard pipe poll failed: {error}"));
+                    }
+                }
+            }
+            Err(error) => return Err(format!("Failed to read Wayland clipboard: {error}")),
+        }
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if is_clipboard_image_mime(mime) {
+        let image = shared_png_bytes(bytes)?.ok_or("Empty Wayland PNG")?;
+        // Validate the complete image on the worker, not the AppKit event loop.
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let data = objc2_foundation::NSData::with_bytes(&image);
+            let decoded = objc2_app_kit::NSBitmapImageRep::imageRepWithData(&data)
+                .ok_or("Wayland clipboard PNG could not be decoded")?;
+            validate_clipboard_image_dimensions(decoded.pixelsWide(), decoded.pixelsHigh())
+        })?;
+        Ok(Some(ClipboardPayload::Image(image)))
+    } else {
+        let text = String::from_utf8(bytes).map_err(|_| "Wayland clipboard text is not UTF-8")?;
+        Ok(Some(ClipboardPayload::Text(Arc::from(text))))
+    }
+}
+
+fn write_clipboard_payload(fd: std::os::fd::OwnedFd, mut bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::fd::AsRawFd;
+    let mut file = std::fs::File::from(fd);
+    let raw = file.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(Error::last_os_error());
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !bytes.is_empty() {
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                "clipboard transfer exceeded 10 seconds",
+            ));
+        }
+        match file.write(bytes) {
+            Ok(0) => {
+                return Err(Error::new(ErrorKind::WriteZero, "clipboard receiver stopped reading"));
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let mut poll = libc::pollfd {
+                    fd: raw,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut poll, 1, 50) } < 0 {
+                    let error = Error::last_os_error();
+                    if error.kind() != ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn preferred_clipboard_mime(mime_types: &[String]) -> Option<String> {
+    mime_types.iter()
+        .find(|mime| is_clipboard_image_mime(mime))
+        .cloned()
+        .or_else(|| preferred_clipboard_text_mime(mime_types))
 }
 
 fn clipboard_mime_types(has_text: bool, has_image_png: bool) -> Vec<String> {
@@ -1482,6 +1667,7 @@ mod clipboard_tests {
         CLIPBOARD_IMAGE_MIME, MAX_CLIPBOARD_IMAGE_BYTES, clipboard_mime_types,
         is_clipboard_image_mime, is_clipboard_text_mime, png_dimensions,
         preferred_clipboard_text_mime, shared_png_bytes,
+        preferred_clipboard_mime, read_guest_clipboard, ClipboardPayload,
     };
 
     fn sample_png(width: u32, height: u32) -> Vec<u8> {
@@ -1540,6 +1726,73 @@ mod clipboard_tests {
             preferred_clipboard_text_mime(&offered).as_deref(),
             Some("text/plain;charset=UTF-8")
         );
+    }
+
+    #[test]
+    fn guest_image_offer_beats_browser_html_and_text() {
+        let offered = vec!["text/html".into(), "text/plain".into(), "image/png".into()];
+        assert_eq!(preferred_clipboard_mime(&offered).as_deref(), Some("image/png"));
+        assert!(preferred_clipboard_mime(&["text/html".into()]).is_none());
+    }
+
+    fn read_test_offer(bytes: Vec<u8>, mime: &str) -> Result<Option<ClipboardPayload>, String> {
+        use std::io::Write;
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let producer = std::thread::spawn(move || { let _ = writer.write_all(&bytes); });
+        let result = read_guest_clipboard(reader.into(), mime, &super::AtomicU64::new(1), 1);
+        producer.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn guest_png_transfer_preserves_binary_bytes() {
+        let png = include_bytes!("../assets/icon.png");
+        let Some(ClipboardPayload::Image(received)) = read_test_offer(png.to_vec(), "image/png").unwrap() else {
+            panic!("PNG was not received as an image");
+        };
+        assert_eq!(&*received, png);
+    }
+
+    #[test]
+    fn guest_text_transfer_preserves_unicode_and_newlines() {
+        let text = "clipboard \u{4f60}\u{597d}\n";
+        let Some(ClipboardPayload::Text(received)) = read_test_offer(text.as_bytes().to_vec(), "text/plain").unwrap() else {
+            panic!("Text was not received");
+        };
+        assert_eq!(&*received, text);
+    }
+
+    #[test]
+    fn guest_transfer_rejects_invalid_png_and_unbounded_text() {
+        assert!(read_test_offer(b"<img src='example'>".to_vec(), "image/png").is_err());
+        assert!(read_test_offer(vec![b'x'; 8 * 1024 * 1024 + 1], "text/plain").err().unwrap().contains("transfer limit"));
+    }
+
+    #[test]
+    fn new_selection_cancels_a_blocked_clipboard_reader() {
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let counter = Arc::new(AtomicU64::new(1));
+        let worker_counter = counter.clone();
+        let reader = std::thread::spawn(move || read_guest_clipboard(reader.into(), "text/plain", &worker_counter, 1));
+        counter.store(2, Ordering::Relaxed);
+        assert!(reader.join().unwrap().unwrap().is_none());
+    }
+
+    #[test]
+    fn clipboard_writer_handles_backpressure_without_truncating() {
+        use std::io::Read;
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let bytes = vec![0xA5; 2 * 1024 * 1024];
+        let expected = bytes.clone();
+        let producer = std::thread::spawn(move || super::write_clipboard_payload(writer.into(), &bytes));
+        // Let the sender fill the socket before beginning to consume it.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        producer.join().unwrap().unwrap();
+        assert_eq!(received, expected);
     }
 
     #[test]

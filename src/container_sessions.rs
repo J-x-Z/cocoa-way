@@ -2343,7 +2343,8 @@ fn uses_nested_wayland_compositor(session: &ContainerSession) -> bool {
 fn apple_remote_gui_command(command: &str, bridge_nested_clipboard: bool) -> String {
     let launch = if bridge_nested_clipboard {
         format!(
-            "if command -v cocoa-way-clipboard-relay >/dev/null 2>&1; then exec cocoa-way-clipboard-relay sh -lc {}; else exec {}; fi",
+            "if command -v wl-paste >/dev/null 2>&1 && command -v wl-copy >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then helper=$(mktemp \"${{XDG_RUNTIME_DIR:-/tmp}}/cocoa-way-clipboard-relay.XXXXXX\") && printf '%s' {} > \"$helper\" && chmod 700 \"$helper\" && exec \"$helper\" sh -lc {}; exit 1; else printf '%s\\n' 'cocoa-way: nested clipboard needs wl-clipboard and coreutils timeout' >&2; exec {}; fi",
+            shell_single_quote(include_str!("../examples/container-images/cocoa-way-clipboard-relay")),
             shell_single_quote(command),
             command,
         )
@@ -2546,9 +2547,11 @@ old-session             localhost/example:latest         linux  arm64  stopped  
         assert!(command.contains("cocoa-way-audio.ready"));
         assert!(command.contains("PULSE_SINK=cocoa_way"));
         assert!(command.contains("MOZ_ENABLE_WAYLAND"));
-        assert!(command.contains("command -v cocoa-way-clipboard-relay"));
-        assert!(command.contains("cocoa-way-clipboard-relay sh -lc 'niri --session'"));
-        assert!(command.contains("else exec niri --session"));
+        assert!(command.contains("command -v wl-paste"));
+        assert!(command.contains("command -v timeout"));
+        assert!(command.contains("exec \"$helper\" sh -lc 'niri --session'"));
+        assert!(command.contains("exec niri --session; fi"));
+        assert!(command.contains("image/png"));
     }
 
     #[test]

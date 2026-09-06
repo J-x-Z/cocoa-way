@@ -1,5 +1,9 @@
 pub enum CompositorMessage {
-    GuestClipboardText(String),
+    GuestClipboard {
+        generation: u64,
+        pasteboard_change_count: isize,
+        payload: crate::state::ClipboardPayload,
+    },
     Maximize(bool),
     Fullscreen(bool),
     RootlessToplevelCreated(smithay::reexports::wayland_server::backend::ObjectId),

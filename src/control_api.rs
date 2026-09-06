@@ -494,7 +494,7 @@ fn feature_matrix_snapshot() -> Value {
             "apple_container_socket_v2": { "status": "supported", "fallback": "stdio relay" },
             "classic_waypipe": { "status": "supported", "targets": ["SSH", "Docker", "OrbStack"] },
             "clipboard_text": { "status": "supported", "scope": "text MIME types" },
-            "clipboard_image": { "status": "supported", "scope": "macOS to Wayland as image/png", "max_encoded_bytes": 67108864 },
+            "clipboard_image": { "status": "supported", "scope": "bidirectional image/png", "max_encoded_bytes": 67108864 },
             "audio": { "status": "supported_default_on", "format": "s16le/48000/2", "note": "Apple Container playback uses an independent published socket and macOS CoreAudio. Profiles can explicitly disable it; Metal rendering is unchanged." },
         },
         "runtime_control": {
@@ -735,11 +735,11 @@ mod tests {
     }
 
     #[test]
-    fn feature_matrix_reports_bounded_host_image_clipboard() {
+    fn feature_matrix_reports_bounded_bidirectional_image_clipboard() {
         let features = feature_matrix_snapshot();
         assert_eq!(
             features["transport"]["clipboard_image"]["scope"],
-            "macOS to Wayland as image/png"
+            "bidirectional image/png"
         );
         assert_eq!(
             features["transport"]["clipboard_image"]["max_encoded_bytes"],

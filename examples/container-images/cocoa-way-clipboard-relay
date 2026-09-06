@@ -6,15 +6,35 @@ log() {
 }
 
 transfer() {
-    destination=$1
-    state_file=$2
+    source=$1
+    destination=$2
+    state_file=$3
     data_file=$(mktemp)
     trap 'rm -f "$data_file"' EXIT
-    cat >"$data_file"
+    # Drain the watch pipe before querying its compositor again. Older wl-paste
+    # versions do not expose CLIPBOARD_TYPE, so query the offered types explicitly.
+    timeout 10 head -c 67108865 >"$data_file" || exit 0
     # Nested compositors often announce an empty selection at startup. Do not
     # let that erase a valid host clipboard before both watchers are ready.
     [ -s "$data_file" ] || exit 0
-    digest=$(cksum <"$data_file" | awk '{ print $1 ":" $2 }')
+    [ "$(wc -c <"$data_file")" -le 67108864 ] || exit 0
+    types=$(WAYLAND_DISPLAY="$source" timeout 3 wl-paste --list-types) || exit 0
+    mime=
+    for candidate in image/png 'text/plain;charset=utf-8' 'text/plain;charset=UTF-8' text/plain UTF8_STRING TEXT STRING; do
+        if printf '%s\n' "$types" | grep -Fxq "$candidate"; then
+            mime=$candidate
+            break
+        fi
+    done
+    # HTML is not plain text. Never copy markup under a text/plain label.
+    [ -n "$mime" ] || exit 0
+    if [ "${CLIPBOARD_TYPE:-}" != "$mime" ]; then
+        # ulimit bounds output even if a misbehaving source never closes its pipe.
+        (ulimit -f 131072; WAYLAND_DISPLAY="$source" timeout 10 wl-paste --no-newline --type "$mime" >"$data_file") || exit 0
+    fi
+    [ -s "$data_file" ] || exit 0
+    [ "$(wc -c <"$data_file")" -le 67108864 ] || exit 0
+    digest="$mime:$(cksum <"$data_file" | awk '{ print $1 ":" $2 }')"
 
     lock_dir="${state_file}.lock"
     attempts=0
@@ -30,9 +50,10 @@ transfer() {
         exit 0
     fi
     printf '%s\n' "$digest" >"$state_file"
-    # wl-copy owns the selection for its lifetime. Detach it so this short-lived
-    # transfer can release the loop-suppression lock immediately.
-    WAYLAND_DISPLAY="$destination" wl-copy --type 'text/plain;charset=utf-8' <"$data_file" &
+    # wl-copy normally forks once it owns the selection; wait for that handshake.
+    if ! WAYLAND_DISPLAY="$destination" timeout 3 wl-copy --type "$mime" <"$data_file"; then
+        printf '%s\n' "$previous" >"$state_file"
+    fi
 }
 
 if [ "${1:-}" = "--transfer" ]; then
@@ -64,18 +85,18 @@ while [ "$attempts" -lt 100 ] && kill -0 "$application_pid" 2>/dev/null; do
 done
 
 if [ -n "$inner_display" ]; then
-    state_file="$XDG_RUNTIME_DIR/cocoa-way-clipboard.digest"
+    state_file=$(mktemp "$XDG_RUNTIME_DIR/cocoa-way-clipboard.XXXXXX")
     log "bridging $outer_display <-> $inner_display"
 
     start_outer_watcher() {
-        WAYLAND_DISPLAY="$outer_display" wl-paste --type text --watch \
-            "$0" --transfer "$inner_display" "$state_file" &
+        WAYLAND_DISPLAY="$outer_display" wl-paste --watch \
+            "$0" --transfer "$outer_display" "$inner_display" "$state_file" &
         outer_watcher=$!
     }
 
     start_inner_watcher() {
-        WAYLAND_DISPLAY="$inner_display" wl-paste --type text --watch \
-            "$0" --transfer "$outer_display" "$state_file" &
+        WAYLAND_DISPLAY="$inner_display" wl-paste --watch \
+            "$0" --transfer "$inner_display" "$outer_display" "$state_file" &
         inner_watcher=$!
     }
 
@@ -109,4 +130,5 @@ wait "$application_pid"
 status=$?
 [ -z "${watcher_supervisor:-}" ] || kill "$watcher_supervisor" 2>/dev/null || true
 [ -z "${watcher_supervisor:-}" ] || wait "$watcher_supervisor" 2>/dev/null || true
+[ -z "${state_file:-}" ] || rm -f "$state_file"
 exit "$status"

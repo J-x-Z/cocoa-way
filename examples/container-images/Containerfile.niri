@@ -6,6 +6,7 @@ RUN dnf --disablerepo='*' \
         --enablerepo=cocoa-way-fedora,cocoa-way-updates \
         install -y \
         ca-certificates \
+        coreutils \
         dbus-daemon \
         firefox \
         foot \

@@ -3393,8 +3393,12 @@ fn create_event_handler(
         }
         while let Ok(msg) = loop_receiver.try_recv() {
             match msg {
-                CompositorMessage::GuestClipboardText(text) => {
-                    state.install_guest_clipboard(text);
+                CompositorMessage::GuestClipboard {
+                    generation,
+                    pasteboard_change_count,
+                    payload,
+                } => {
+                    state.install_guest_clipboard(generation, pasteboard_change_count, payload);
                 }
                 CompositorMessage::Maximize(max) => {
                     log::info!("Handling Maximize: {}", max);
