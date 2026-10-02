@@ -4634,6 +4634,7 @@ fn create_event_handler(
                         rootless.renderer.window.set_cursor_visible(true);
                     }
                     WindowEvent::CursorLeft { .. } => {
+                        crate::state::show_hidden_cursor();
                         if let Some(pointer) = state.seat.get_pointer() {
                             pointer.motion(
                                 &mut state,
@@ -4737,10 +4738,14 @@ fn create_event_handler(
                 }
                 if keep_window {
                     rootless_windows.insert(window_id, rootless);
-                } else if let Some(window_number) =
-                    macos_gestures::window_number(&rootless.renderer.window)
-                {
-                    macos_gestures::uninstall_swipe_recognizer(window_number);
+                } else {
+                    // A closing window produces no CursorLeft for the pointer above it.
+                    crate::state::show_hidden_cursor();
+                    if let Some(window_number) =
+                        macos_gestures::window_number(&rootless.renderer.window)
+                    {
+                        macos_gestures::uninstall_swipe_recognizer(window_number);
+                    }
                 }
             }
             Event::WindowEvent { window_id, event } if window_id == renderer.window.id() => {
@@ -4807,6 +4812,7 @@ fn create_event_handler(
                         }
                     }
                     WindowEvent::CursorLeft { .. } => {
+                        crate::state::show_hidden_cursor();
                         renderer.window.set_cursor_visible(true);
                     }
                     WindowEvent::Focused(false) => {

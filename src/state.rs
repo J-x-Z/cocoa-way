@@ -17,7 +17,7 @@ use smithay::wayland::shell::xdg::decoration::{XdgDecorationState, XdgDecoration
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use crate::layout::Layout;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const CLIPBOARD_IMAGE_MIME: &str = "image/png";
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -1165,9 +1165,10 @@ impl SeatHandler for AppState {
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         use objc2_app_kit::NSCursor;
         use smithay::input::pointer::CursorIcon;
+        set_cursor_hidden(matches!(image, CursorImageStatus::Hidden));
         unsafe {
             match image {
-                CursorImageStatus::Hidden => NSCursor::hide(),
+                CursorImageStatus::Hidden => {}
                 CursorImageStatus::Named(icon) => {
                     let cursor = match icon {
                         CursorIcon::Text | CursorIcon::VerticalText => NSCursor::IBeamCursor(),
@@ -1375,6 +1376,31 @@ impl smithay::wayland::pointer_constraints::PointerConstraintsHandler for AppSta
 smithay::delegate_pointer_constraints!(AppState);
 smithay::delegate_pointer_gestures!(AppState);
 smithay::delegate_relative_pointer!(AppState);
+
+// NSCursor hide/unhide calls are counted and must be balanced. Clients such as Chromium hide the
+// cursor repeatedly (YouTube does on every idle period during playback), so hide only once and
+// unhide as soon as a visible cursor is set again.
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+fn set_cursor_hidden(hidden: bool) {
+    use objc2_app_kit::NSCursor;
+    if CURSOR_HIDDEN.swap(hidden, Ordering::Relaxed) != hidden {
+        unsafe {
+            if hidden {
+                NSCursor::hide()
+            } else {
+                NSCursor::unhide()
+            }
+        }
+    }
+}
+
+/// A client hid the cursor and then lost the pointer without showing it again: the pointer left
+/// its window, or the window closed or left fullscreen underneath it. The client will hide it
+/// again on its next pointer enter if it still wants to.
+pub fn show_hidden_cursor() {
+    set_cursor_hidden(false);
+}
 
 fn nix_pipe() -> Option<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd)> {
     use std::os::unix::io::FromRawFd;
