@@ -224,7 +224,7 @@ struct AppleContainerCompatibility {
 }
 
 const APPLE_CONTAINER_TRANSPORT_V2_MINIMUM: (u64, u64, u64) = (1, 1, 0);
-const APPLE_CONTAINER_SECURITY_BASELINE: (u64, u64, u64) = (1, 3, 1);
+const APPLE_CONTAINER_SECURITY_BASELINE: (u64, u64, u64) = (1, 4, 1);
 
 #[derive(Clone)]
 struct UiCommandCacheEntry {
@@ -8315,7 +8315,7 @@ fn apple_container_compatibility(
         Duration::from_secs(2),
     )
     .ok()
-    .filter(|output| output.status.success())
+    // A stopped or unregistered service returns valid status JSON with exit 1.
     .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
     let system_status = status_json
         .as_ref()
@@ -8325,9 +8325,7 @@ fn apple_container_compatibility(
         .to_string();
     let api_version = status_json
         .as_ref()
-        .and_then(|value| value.get("apiServerVersion"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(extract_version)
+        .and_then(apple_container_api_version)
         .unwrap_or_else(|| "unknown".into());
 
     let publish_socket = container_sessions::apple_publish_socket_supported(command, child_path);
@@ -8363,14 +8361,14 @@ fn apple_container_compatibility(
             .into()
     } else if cli_version != "unknown" && !security_current {
         format!(
-            "Apple Container {} can run through Cocoa-Way, but 1.3.1 fixes multiple security vulnerabilities. Stop the service and run `/usr/local/bin/update-container.sh` before normal use.",
+            "Apple Container {} can run through Cocoa-Way, but 1.4.1 fixes OCI image loading and Unix-socket security vulnerabilities. Update to the latest official release before normal use.",
             cli_version
         )
     } else if !publish_socket {
         "Cocoa-Way can use its compatibility relay, but Transport V2 requires `container run --publish-socket`."
             .into()
     } else if transport_v2_version {
-        "Apple Container 1.3.1+ satisfies Cocoa-Way's current security and Transport V2 compatibility baseline."
+        "Apple Container 1.4.1+ satisfies Cocoa-Way's current security and Transport V2 compatibility baseline."
             .into()
     } else {
         "This CLI predates reliable non-root published sockets. Cocoa-Way will use its compatibility relay."
@@ -8388,6 +8386,20 @@ fn apple_container_compatibility(
     };
     *APPLE_COMPATIBILITY_CACHE.lock().unwrap() = Some((Instant::now(), compatibility.clone()));
     compatibility
+}
+
+fn apple_container_api_version(status: &serde_json::Value) -> Option<String> {
+    // 1.4.1+ nests API metadata under server; older releases use a flat string.
+    status
+        .pointer("/server/version")
+        .and_then(serde_json::Value::as_str)
+        .and_then(extract_version)
+        .or_else(|| {
+            status
+                .get("apiServerVersion")
+                .and_then(serde_json::Value::as_str)
+                .and_then(extract_version)
+        })
 }
 
 fn extract_version(text: &str) -> Option<String> {
@@ -12449,15 +12461,52 @@ mod tests {
     }
 
     #[test]
+    fn apple_container_api_version_supports_both_status_schemas() {
+        let legacy = serde_json::json!({
+            "status": "running",
+            "apiServerVersion": "container-apiserver version 1.3.1 (build: release)"
+        });
+        let current = serde_json::json!({
+            "status": "running",
+            "client": {"version": "1.4.1"},
+            "server": {"version": "1.5.0"}
+        });
+        assert_eq!(
+            apple_container_api_version(&legacy).as_deref(),
+            Some("1.3.1")
+        );
+        assert_eq!(
+            apple_container_api_version(&current).as_deref(),
+            Some("1.5.0")
+        );
+        assert_ne!(
+            apple_container_api_version(&current).as_deref(),
+            current["client"]["version"].as_str()
+        );
+
+        let unavailable = serde_json::json!({"status": "unregistered", "server": null});
+        assert_eq!(apple_container_api_version(&unavailable), None);
+        let fallback = serde_json::json!({
+            "server": {"version": "unknown"},
+            "apiServerVersion": "container-apiserver version 1.3.1"
+        });
+        assert_eq!(
+            apple_container_api_version(&fallback).as_deref(),
+            Some("1.3.1")
+        );
+    }
+
+    #[test]
     fn apple_container_version_comparison_handles_minor_updates() {
         assert!(version_at_least(
             "1.1.0",
             APPLE_CONTAINER_TRANSPORT_V2_MINIMUM
         ));
-        assert!(version_at_least("1.3.1", APPLE_CONTAINER_SECURITY_BASELINE));
+        assert!(version_at_least("1.4.1", APPLE_CONTAINER_SECURITY_BASELINE));
+        assert!(version_at_least("1.5.0", APPLE_CONTAINER_SECURITY_BASELINE));
         assert!(version_at_least("2.0.0", APPLE_CONTAINER_SECURITY_BASELINE));
         assert!(!version_at_least(
-            "1.3.0",
+            "1.3.1",
             APPLE_CONTAINER_SECURITY_BASELINE
         ));
         assert!(!version_at_least("unknown", (1, 0, 0)));
