@@ -906,6 +906,27 @@ impl CompositorHandler for AppState {
             self.start_drag_request = None;
         }
 
+        if let Some(pointer) = self.seat.get_pointer() {
+            if pointer.current_focus().as_ref() == Some(surface) {
+                // Wayland destruction can remove the native window before winit's
+                // CursorLeft/Destroyed events, so release its pointer here.
+                let location = pointer.current_location();
+                let time = self.start_time.elapsed().as_millis() as u32;
+                self.cancel_pointer_gesture(&pointer, time);
+                pointer.motion(
+                    self,
+                    None,
+                    &smithay::input::pointer::MotionEvent {
+                        location,
+                        serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                        time,
+                    },
+                );
+                pointer.frame(self);
+                show_hidden_cursor();
+            }
+        }
+
         if let Some(keyboard) = self.seat.get_keyboard() {
             if keyboard.current_focus().as_ref() == Some(surface) {
                 keyboard.set_focus(self, None, smithay::utils::SERIAL_COUNTER.next_serial());
@@ -1380,11 +1401,19 @@ smithay::delegate_relative_pointer!(AppState);
 // NSCursor hide/unhide calls are counted and must be balanced. Clients such as Chromium hide the
 // cursor repeatedly (YouTube does on every idle period during playback), so hide only once and
 // unhide as soon as a visible cursor is set again.
-static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+struct CursorVisibility(AtomicBool);
+
+impl CursorVisibility {
+    fn update(&self, hidden: bool) -> Option<bool> {
+        (self.0.swap(hidden, Ordering::Relaxed) != hidden).then_some(hidden)
+    }
+}
+
+static CURSOR_VISIBILITY: CursorVisibility = CursorVisibility(AtomicBool::new(false));
 
 fn set_cursor_hidden(hidden: bool) {
     use objc2_app_kit::NSCursor;
-    if CURSOR_HIDDEN.swap(hidden, Ordering::Relaxed) != hidden {
+    if let Some(hidden) = CURSOR_VISIBILITY.update(hidden) {
         unsafe {
             if hidden {
                 NSCursor::hide()
@@ -1400,6 +1429,21 @@ fn set_cursor_hidden(hidden: bool) {
 /// again on its next pointer enter if it still wants to.
 pub fn show_hidden_cursor() {
     set_cursor_hidden(false);
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_cursor_requests_keep_hide_and_unhide_balanced() {
+        let visibility = CursorVisibility(AtomicBool::new(false));
+        let transitions = [false, true, true, true, false, false, true, false, false]
+            .into_iter()
+            .filter_map(|hidden| visibility.update(hidden))
+            .collect::<Vec<_>>();
+        assert_eq!(transitions, [true, false, true, false]);
+    }
 }
 
 fn nix_pipe() -> Option<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd)> {
