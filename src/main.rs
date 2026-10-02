@@ -3436,8 +3436,21 @@ fn create_event_handler(
                     else {
                         continue;
                     };
+                    // Clients that never negotiated xdg-decoration (GTK4: gnome-terminal, Files;
+                    // Firefox) draw their own header bar; a native title bar on top doubles it.
+                    // Hide it but keep the window titled: a borderless NSWindow can't be resized
+                    // from its edges. Move requests already start a native drag.
+                    use winit::platform::macos::WindowAttributesExtMacOS;
+                    let client_side_decorations = !(toplevel.with_committed_state(|state| {
+                        state.is_some_and(|state| state.decoration_mode.is_some())
+                    }) || toplevel
+                        .with_pending_state(|state| state.decoration_mode.is_some()));
                     let attributes = winit::window::Window::default_attributes()
                         .with_title(presentation::toplevel_title(&toplevel))
+                        .with_titlebar_transparent(client_side_decorations)
+                        .with_title_hidden(client_side_decorations)
+                        .with_titlebar_buttons_hidden(client_side_decorations)
+                        .with_fullsize_content_view(client_side_decorations)
                         .with_visible(true)
                         .with_inner_size(winit::dpi::LogicalSize::new(960.0f64, 720.0f64));
                     let rootless_renderer = target
