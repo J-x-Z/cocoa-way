@@ -524,6 +524,68 @@ fn run_publish_socket_relay(
     }
 }
 
+#[derive(Default)]
+struct RelayStreams {
+    sockets: Arc<Mutex<HashMap<u32, Arc<UnixStream>>>>,
+}
+
+impl RelayStreams {
+    fn get(&self, id: u32) -> Option<Arc<UnixStream>> {
+        self.sockets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&id)
+            .cloned()
+    }
+
+    fn insert(&self, id: u32, socket: Arc<UnixStream>) -> Option<Arc<UnixStream>> {
+        self.sockets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, socket)
+    }
+
+    fn remove(&self, id: u32) -> Option<Arc<UnixStream>> {
+        self.sockets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id)
+    }
+}
+
+fn retire_relay_stream(
+    sockets: &Mutex<HashMap<u32, Arc<UnixStream>>>,
+    id: u32,
+    socket: &Arc<UnixStream>,
+) -> bool {
+    let mut sockets = sockets.lock().unwrap_or_else(|error| error.into_inner());
+    // An old reader must not remove or send CLOSE for a replacement stream.
+    if sockets
+        .get(&id)
+        .is_some_and(|current| Arc::ptr_eq(current, socket))
+    {
+        sockets.remove(&id);
+        true
+    } else {
+        false
+    }
+}
+
+impl Drop for RelayStreams {
+    fn drop(&mut self) {
+        // Dropping only the map would leave detached reader clones blocked.
+        let sockets = std::mem::take(
+            &mut *self
+                .sockets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for socket in sockets.values() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 fn bridge_relay_frames<R, W>(
     reader: &mut R,
     writer: Arc<Mutex<W>>,
@@ -533,12 +595,12 @@ where
     R: Read,
     W: Write + Send + 'static,
 {
-    let mut streams = HashMap::<u32, UnixStream>::new();
+    let streams = RelayStreams::default();
     while let Some(frame) = read_relay_frame(reader)? {
         match frame.kind {
             RELAY_FRAME_OPEN => {
                 let socket = match connect_unix_socket(local_socket, Duration::from_secs(8)) {
-                    Ok(socket) => socket,
+                    Ok(socket) => Arc::new(socket),
                     Err(error) => {
                         eprintln!("cocoa-way container relay stream {}: {}", frame.id, error);
                         let _ = write_relay_frame_locked(&writer, RELAY_FRAME_CLOSE, frame.id, &[]);
@@ -547,9 +609,15 @@ where
                 };
                 let mut reader = socket.try_clone().map_err(|error| error.to_string())?;
                 let relay_input = Arc::clone(&writer);
+                let relay_streams = Arc::clone(&streams.sockets);
+                let reader_socket = Arc::clone(&socket);
                 let stream_id = frame.id;
+                if let Some(previous) = streams.insert(frame.id, socket) {
+                    let _ = previous.shutdown(std::net::Shutdown::Both);
+                }
                 thread::spawn(move || {
                     let mut buffer = [0u8; 64 * 1024];
+                    let mut relay_failed = false;
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
@@ -562,7 +630,8 @@ where
                                 )
                                 .is_err()
                                 {
-                                    return;
+                                    relay_failed = true;
+                                    break;
                                 }
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
@@ -571,28 +640,38 @@ where
                             Err(_) => break,
                         }
                     }
-                    let _ =
-                        write_relay_frame_locked(&relay_input, RELAY_FRAME_CLOSE, stream_id, &[]);
+                    let _ = reader.shutdown(std::net::Shutdown::Both);
+                    let retired = retire_relay_stream(&relay_streams, stream_id, &reader_socket);
+                    // Release both descriptors before CLOSE can block on the writer.
+                    drop(reader);
+                    drop(reader_socket);
+                    if retired && !relay_failed {
+                        let _ = write_relay_frame_locked(
+                            &relay_input,
+                            RELAY_FRAME_CLOSE,
+                            stream_id,
+                            &[],
+                        );
+                    }
                 });
-                streams.insert(frame.id, socket);
             }
             RELAY_FRAME_DATA => {
-                if let Some(stream) = streams.get_mut(&frame.id) {
-                    if stream.write_all(&frame.payload).is_err() {
-                        streams.remove(&frame.id);
+                if let Some(stream) = streams.get(frame.id) {
+                    if (&*stream).write_all(&frame.payload).is_err() {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        streams.remove(frame.id);
                         let _ = write_relay_frame_locked(&writer, RELAY_FRAME_CLOSE, frame.id, &[]);
                     }
                 }
             }
             RELAY_FRAME_CLOSE => {
-                if let Some(stream) = streams.remove(&frame.id) {
+                if let Some(stream) = streams.remove(frame.id) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
             }
             _ => return Err(format!("unknown container relay frame type {}", frame.kind)),
         }
     }
-    streams.clear();
     Ok(())
 }
 
@@ -741,11 +820,17 @@ struct RelayFrame {
 
 fn read_relay_frame(reader: &mut impl Read) -> Result<Option<RelayFrame>, String> {
     let mut header = [0u8; RELAY_FRAME_HEADER_LEN];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(format!("failed to read container relay frame: {}", error)),
+    loop {
+        match reader.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("failed to read container relay frame: {}", error)),
+        }
     }
+    reader
+        .read_exact(&mut header[1..])
+        .map_err(|error| format!("failed to read container relay frame header: {}", error))?;
     let id = u32::from_be_bytes(header[1..5].try_into().unwrap());
     let length = u32::from_be_bytes(header[5..9].try_into().unwrap()) as usize;
     if length > RELAY_FRAME_MAX_PAYLOAD {
@@ -986,9 +1071,11 @@ fn guest_publish_socket_relay_perl() -> &'static str {
 use strict;
 use warnings;
 use IO::Socket::UNIX;
-use IO::Select;
+use IO::Poll qw(POLLIN POLLOUT POLLHUP POLLERR POLLNVAL);
 use File::Path qw(make_path);
 use POSIX qw(WNOHANG);
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR);
 my $sock_path = shift @ARGV;
 my $transport_path = shift @ARGV;
 for my $path ($sock_path, $transport_path) {
@@ -1026,101 +1113,307 @@ if ($pid == 0) {
   exec @ARGV;
   die "exec @ARGV: $!\n";
 }
+$SIG{PIPE} = 'IGNORE';
 my $transport = $transport_server->accept() or die "accept transport: $!\n";
 binmode $transport;
 my $hello = '';
 while (length($hello) < 5) {
   my $n = sysread($transport, $hello, 5 - length($hello), length($hello));
+  next if !defined $n && $! == EINTR;
   die "transport handshake ended early\n" unless defined $n && $n > 0;
 }
 die "unsupported transport handshake\n" unless $hello eq "CWV2\x01";
 print STDERR "cocoa-way transport v2: host channel connected\n";
-my $sel = IO::Select->new($transport, $server);
+
+# Limits count pending user-space bytes, not kernel buffers. Outer DATA frames
+# may be 16 MiB, so consume their payload incrementally rather than allocating
+# an entire frame or overflowing a per-peer queue.
+my $chunk_size = 65536;
+my $peer_limit = 256 * 1024;
+my $input_limit = 4 * 1024 * 1024;
+# Keep the return-lane backlog small: prequeueing megabytes of bulk would add
+# avoidable HOL for later replies even though opposite-direction input runs.
+my $output_limit = 256 * 1024;
+my $output_frames_limit = 4096;
+my $max_peers = 128;
 my %peers;
 my %peer_ids;
 my $next_id = 1;
-my $input = '';
+my @output;
+my $output_offset = 0;
+my $output_bytes = 0;
+my $input_bytes = 0;
+my $header = '';
+my ($incoming_kind, $incoming_id, $incoming_left);
+my $transport_eof = 0;
 my $child_exited = 0;
+my $exit_code = 0;
+my $read_cursor = 0;
+my $test_stats = exists $ENV{COCOA_WAY_RELAY_TEST_STATS};
+my %stats = map { $_ => 0 } qw(output_high input_high peer_high peers_high output_frames_high peer_chunks_high
+  transport_partial peer_partial write_eagain read_eagain eintr signals input_pauses output_pauses closed disconnect_checks);
+# Only isolated tests install this handler; production signal dispositions stay unchanged.
+$SIG{USR1} = sub { $stats{signals}++ } if exists $ENV{COCOA_WAY_RELAY_TEST_SIGNALS};
 
-sub write_all {
-  my ($fh, $data) = @_;
-  my $offset = 0;
-  while ($offset < length($data)) {
-    my $written = syswrite($fh, $data, length($data) - $offset, $offset);
-    return 0 unless defined $written && $written > 0;
-    $offset += $written;
-  }
-  return 1;
+sub nonblocking {
+  my ($fh) = @_;
+  my $flags = fcntl($fh, F_GETFL, 0);
+  die "get socket flags: $!\n" unless defined $flags;
+  die "set nonblocking: $!\n" unless defined fcntl($fh, F_SETFL, $flags | O_NONBLOCK);
 }
+nonblocking($transport);
+nonblocking($server);
 
 sub send_frame {
   my ($kind, $id, $data) = @_;
   $data = '' unless defined $data;
-  return write_all($transport, pack('CNN', $kind, $id, length($data)) . $data);
+  my $frame = pack('CNN', $kind, $id, length($data)) . $data;
+  die "transport output limit exceeded\n" if $output_bytes + length($frame) > $output_limit;
+  die "transport frame limit exceeded\n" if @output >= $output_frames_limit;
+  push @output, $frame;
+  $output_bytes += length($frame);
+  $stats{output_high} = $output_bytes if $test_stats && $output_bytes > $stats{output_high};
+  $stats{output_frames_high} = @output if $test_stats && @output > $stats{output_frames_high};
 }
 
-sub close_peer {
-  my ($id, $notify) = @_;
-  my $peer = delete $peers{$id};
-  return unless $peer;
-  delete $peer_ids{fileno($peer)};
-  $sel->remove($peer);
-  close $peer;
-  send_frame(3, $id, '') if $notify;
+sub closing_peer {
+  my ($id, $notify, $discard) = @_;
+  my $p = $peers{$id} or return;
+  $p->{closing} = 1;
+  $p->{notify} ||= $notify;
+  if ($discard) {
+    $input_bytes -= $p->{bytes};
+    $p->{bytes} = 0;
+    $p->{queue} = [];
+    $p->{offset} = 0;
+  }
+}
+
+sub retire_peers {
+  for my $id (sort { $a <=> $b } keys %peers) {
+    my $p = $peers{$id};
+    next unless $p->{closing} && $p->{bytes} == 0;
+    next if $p->{notify} && ($output_bytes + 9 > $output_limit || @output >= $output_frames_limit);
+    send_frame(3, $id, '') if $p->{notify};
+    delete $peer_ids{fileno($p->{fh})};
+    close $p->{fh};
+    delete $peers{$id};
+    $stats{closed}++ if $test_stats;
+  }
+}
+
+sub retry_io {
+  return 0 if defined $_[0];
+  if ($! == EINTR) {
+    $stats{eintr}++ if $test_stats;
+    return 1;
+  }
+  if ($! == EAGAIN || $! == EWOULDBLOCK) {
+    $stats{$_[1]}++ if $test_stats;
+    return 1;
+  }
+  return 0;
+}
+
+sub watch {
+  my ($poll, $fh, $flags) = @_;
+  $poll->mask($fh => ($poll->mask($fh) || 0) | $flags);
 }
 
 RELAY: while (1) {
-  if (waitpid($pid, WNOHANG) == $pid) {
+  if (!$child_exited && waitpid($pid, WNOHANG) == $pid) {
     $child_exited = 1;
+    closing_peer($_, 0, 0) for keys %peers;
+  }
+  retire_peers();
+  last RELAY if ($transport_eof || $child_exited) && !$input_bytes && !$output_bytes;
+
+  my $poll = IO::Poll->new();
+  # Observe full disconnect even while DATA reads are paused by a slow peer.
+  # A write-half EOF still drains completed peer queues; a full HUP cannot.
+  watch($poll, $transport, POLLHUP | POLLERR | POLLNVAL);
+  watch($poll, $transport, POLLOUT) if $output_bytes;
+  if (!$transport_eof && !$child_exited) {
+    my $can_read_transport = 1;
+    if (defined $incoming_kind && $incoming_kind == 2 && exists $peers{$incoming_id}) {
+      my $p = $peers{$incoming_id};
+      $can_read_transport = $p->{closing} || ($p->{bytes} < $peer_limit && $input_bytes < $input_limit);
+    }
+    watch($poll, $transport, POLLIN) if $can_read_transport;
+    $stats{input_pauses}++ if $test_stats && !$can_read_transport;
+    if (!$can_read_transport && !$output_bytes) {
+      # BSD can hide HUP behind unread data. A zero-byte nonblocking send
+      # changes no wire bytes but detects a peer that also closed its read end.
+      # Check only while input is paused; the idle poll bounds recheck latency.
+      $stats{disconnect_checks}++ if $test_stats;
+      my $n = send($transport, '', 0);
+      if (!defined $n && !retry_io($n, 'write_eagain')) {
+        $exit_code = 1;
+        last RELAY;
+      }
+    }
+    watch($poll, $server, POLLIN) if keys(%peers) < $max_peers && $output_bytes + 9 <= $output_limit
+      && @output < $output_frames_limit;
+  }
+  for my $p (values %peers) {
+    watch($poll, $p->{fh}, POLLOUT) if $p->{bytes};
+    if (!$p->{closing} && !$transport_eof && !$child_exited) {
+      if ($output_bytes + $chunk_size + 9 <= $output_limit && @output < $output_frames_limit) {
+        watch($poll, $p->{fh}, POLLIN);
+      } else {
+        $stats{output_pauses}++ if $test_stats;
+      }
+    }
+  }
+  $! = 0;
+  my $ready_count = $poll->poll(0.25);
+  if ($ready_count < 0) {
+    $stats{eintr}++ if $test_stats && $! == EINTR;
+    next RELAY if !$! || $! == EINTR;
+    print STDERR "transport select failed: $!\n";
+    $exit_code = 1;
     last RELAY;
   }
-  my @ready = $sel->can_read(0.25);
+  if ($poll->events($transport) & (POLLHUP | POLLERR | POLLNVAL)) {
+    $exit_code = 1 if $poll->events($transport) & (POLLERR | POLLNVAL);
+    last RELAY;
+  }
+
+  # Each ready socket gets at most one bounded write; retain every short-write
+  # offset. Frames stay FIFO on the transport, and bytes stay FIFO in each peer.
+  for my $fh ($poll->handles(POLLOUT)) {
+    if ($fh == $transport) {
+      my $size = length($output[0]) - $output_offset;
+      $size = $chunk_size if $size > $chunk_size;
+      my $n = syswrite($transport, $output[0], $size, $output_offset);
+      next if retry_io($n, 'write_eagain');
+      if (!defined $n || $n == 0) {
+        $exit_code = 1;
+        last RELAY;
+      }
+      $stats{transport_partial}++ if $test_stats && $n < $size;
+      $output_bytes -= $n;
+      $output_offset += $n;
+      if ($output_offset == length($output[0])) {
+        shift @output;
+        $output_offset = 0;
+      }
+    } else {
+      my $id = $peer_ids{fileno($fh)};
+      my $p = $peers{$id} or next;
+      my $size = length($p->{queue}[0]) - $p->{offset};
+      my $n = syswrite($fh, $p->{queue}[0], $size, $p->{offset});
+      next if retry_io($n, 'write_eagain');
+      if (!defined $n || $n == 0) {
+        closing_peer($id, 1, 1);
+        next;
+      }
+      $stats{peer_partial}++ if $test_stats && $n < $size;
+      $p->{bytes} -= $n;
+      $input_bytes -= $n;
+      $p->{offset} += $n;
+      if ($p->{offset} == length($p->{queue}[0])) {
+        shift @{$p->{queue}};
+        $p->{offset} = 0;
+      }
+    }
+  }
+
+  # Rotate peer reads so a busy low-numbered stream cannot monopolize a newly
+  # available output slot. This does not reorder bytes inside any stream.
+  my @ready = sort {
+    (($peer_ids{fileno($a)} // 0) - $read_cursor) % $next_id
+      <=> (($peer_ids{fileno($b)} // 0) - $read_cursor) % $next_id
+  } $poll->handles(POLLIN | POLLHUP | POLLERR | POLLNVAL);
   for my $fh (@ready) {
     if ($fh == $server) {
+      next if keys(%peers) >= $max_peers || $output_bytes + 9 > $output_limit
+        || @output >= $output_frames_limit;
       my $peer = $server->accept();
       next unless $peer;
       binmode $peer;
+      nonblocking($peer);
       my $id = $next_id++;
-      $peers{$id} = $peer;
+      $peers{$id} = { fh => $peer, queue => [], offset => 0, bytes => 0, closing => 0, notify => 0 };
       $peer_ids{fileno($peer)} = $id;
-      $sel->add($peer);
-      print STDERR "cocoa-way transport v2: opened stream $id\n";
-      last RELAY unless send_frame(1, $id, '');
+      $stats{peers_high} = keys(%peers) if $test_stats && keys(%peers) > $stats{peers_high};
+      send_frame(1, $id, '');
       next;
     }
 
     if ($fh == $transport) {
-      my $chunk = '';
-      my $n = sysread($transport, $chunk, 65536);
-      last RELAY unless defined $n && $n > 0;
-      $input .= $chunk;
-      while (length($input) >= 9) {
-        my ($kind, $id, $length) = unpack('CNN', substr($input, 0, 9));
-        die "relay frame too large\n" if $length > 16 * 1024 * 1024;
-        last if length($input) < 9 + $length;
-        substr($input, 0, 9, '');
-        my $data = substr($input, 0, $length, '');
-        if ($kind == 2 && exists $peers{$id}) {
-          close_peer($id, 1) unless write_all($peers{$id}, $data);
-        } elsif ($kind == 3) {
-          close_peer($id, 0);
-        }
+      my $size = defined $incoming_kind ? $incoming_left : 9 - length($header);
+      $size = $chunk_size if $size > $chunk_size;
+      my $p = defined $incoming_kind && $incoming_kind == 2 ? $peers{$incoming_id} : undef;
+      $p = undef if $p && $p->{closing};
+      if ($p) {
+        my $space = $peer_limit - $p->{bytes};
+        $space = $input_limit - $input_bytes if $input_limit - $input_bytes < $space;
+        $size = $space if $space < $size;
+        next unless $size;
       }
+      my $data = '';
+      my $n = sysread($transport, $data, $size);
+      next if retry_io($n, 'read_eagain');
+      if (!defined $n || $n == 0) {
+        if (!defined $n || length($header) || defined $incoming_kind) {
+          print STDERR "truncated or failed transport frame\n";
+          $exit_code = 1;
+          last RELAY;
+        }
+        $transport_eof = 1;
+        closing_peer($_, 0, 0) for keys %peers;
+        next;
+      }
+      if (!defined $incoming_kind) {
+        $header .= $data;
+        next unless length($header) == 9;
+        ($incoming_kind, $incoming_id, $incoming_left) = unpack('CNN', $header);
+        $header = '';
+        if ($incoming_left > 16 * 1024 * 1024 || ($incoming_kind != 2 && $incoming_kind != 3)
+            || ($incoming_kind == 3 && $incoming_left != 0)) {
+          print STDERR "invalid relay frame header\n";
+          $exit_code = 1;
+          last RELAY;
+        }
+        closing_peer($incoming_id, 0, 0) if $incoming_kind == 3;
+      } else {
+        if ($p) {
+          if (@{$p->{queue}}) {
+            my $space = $chunk_size - length($p->{queue}[-1]);
+            $space = length($data) if length($data) < $space;
+            $p->{queue}[-1] .= substr($data, 0, $space, '') if $space;
+          }
+          push @{$p->{queue}}, $data if length($data);
+          $p->{bytes} += $n;
+          $input_bytes += $n;
+          $stats{peer_high} = $p->{bytes} if $test_stats && $p->{bytes} > $stats{peer_high};
+          $stats{input_high} = $input_bytes if $test_stats && $input_bytes > $stats{input_high};
+          $stats{peer_chunks_high} = @{$p->{queue}} if $test_stats && @{$p->{queue}} > $stats{peer_chunks_high};
+        }
+        $incoming_left -= $n;
+      }
+      ($incoming_kind, $incoming_id, $incoming_left) = (undef, undef, undef) unless $incoming_left;
       next;
     }
 
     my $id = $peer_ids{fileno($fh)};
+    my $p = $peers{$id} or next;
+    next if $p->{closing} || $output_bytes + $chunk_size + 9 > $output_limit
+      || @output >= $output_frames_limit;
+    $read_cursor = $id + 1;
     my $data = '';
-    my $n = sysread($fh, $data, 65536);
+    my $n = sysread($fh, $data, $chunk_size);
+    next if retry_io($n, 'read_eagain');
     if (!defined $n || $n == 0) {
-      close_peer($id, 1);
+      closing_peer($id, 1, 0);
     } else {
-      last RELAY unless send_frame(2, $id, $data);
+      send_frame(2, $id, $data);
     }
   }
 }
 for my $id (keys %peers) {
-  close_peer($id, 0);
+  close $peers{$id}{fh};
 }
 unless ($child_exited) {
   kill 'TERM', $pid;
@@ -1132,6 +1425,8 @@ if (defined $audio_pid) {
 }
 unlink $sock_path;
 unlink $transport_path;
+print STDERR "cocoa-way transport v2 stats: ", join(' ', map { "$_=$stats{$_}" } sort keys %stats), "\n" if $test_stats;
+exit $exit_code;
 "#
 }
 
@@ -2633,6 +2928,133 @@ old-session             localhost/example:latest         linux  arm64  stopped  
         assert_eq!(frame.kind, RELAY_FRAME_DATA);
         assert_eq!(frame.id, 42);
         assert_eq!(frame.payload, b"clipboard");
+    }
+
+    #[test]
+    fn relay_frame_distinguishes_clean_eof_from_truncation() {
+        assert!(read_relay_frame(&mut &b""[..]).unwrap().is_none());
+        let mut encoded = Vec::new();
+        write_relay_frame(&mut encoded, RELAY_FRAME_DATA, 7, b"payload").unwrap();
+        for length in 1..encoded.len() {
+            assert!(read_relay_frame(&mut &encoded[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn relay_frame_retries_interrupted_first_byte() {
+        struct InterruptedOnce {
+            interrupted: bool,
+            data: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for InterruptedOnce {
+            fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.data.read(data)
+            }
+        }
+        let mut encoded = Vec::new();
+        write_relay_frame(&mut encoded, RELAY_FRAME_CLOSE, 7, &[]).unwrap();
+        let mut reader = InterruptedOnce {
+            interrupted: false,
+            data: std::io::Cursor::new(encoded),
+        };
+        let frame = read_relay_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(frame.kind, RELAY_FRAME_CLOSE);
+        assert_eq!(frame.id, 7);
+    }
+
+    #[test]
+    fn relay_stream_teardown_shuts_down_surviving_reader_clone() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut reader = socket.try_clone().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let streams = RelayStreams::default();
+        streams.insert(7, Arc::new(socket));
+        drop(streams);
+        let mut byte = [0u8; 1];
+        assert_eq!(reader.read(&mut byte).unwrap(), 0);
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn relay_stream_host_eof_churn_reclaims_owned_sockets_without_guest_close() {
+        let streams = RelayStreams::default();
+        for id in 1..=256 {
+            let (socket, peer) = UnixStream::pair().unwrap();
+            let socket = Arc::new(socket);
+            let weak = Arc::downgrade(&socket);
+            let mut reader = socket.try_clone().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            streams.insert(id, Arc::clone(&socket));
+            let reader_streams = Arc::clone(&streams.sockets);
+            drop(peer);
+            let retired = thread::spawn(move || {
+                assert_eq!(reader.read(&mut [0u8; 1]).unwrap(), 0);
+                let _ = reader.shutdown(std::net::Shutdown::Both);
+                let retired = retire_relay_stream(&reader_streams, id, &socket);
+                drop(reader);
+                drop(socket);
+                retired
+            })
+            .join()
+            .unwrap();
+            assert!(retired);
+            assert!(streams.get(id).is_none());
+            assert!(weak.upgrade().is_none());
+            assert!(streams.sockets.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn relay_stream_retirement_preserves_replacement_with_same_id() {
+        let streams = RelayStreams::default();
+        let (previous, _previous_peer) = UnixStream::pair().unwrap();
+        let previous = Arc::new(previous);
+        streams.insert(7, Arc::clone(&previous));
+        let (replacement, _replacement_peer) = UnixStream::pair().unwrap();
+        let replacement = Arc::new(replacement);
+        assert!(streams.insert(7, Arc::clone(&replacement)).is_some());
+        assert!(!retire_relay_stream(&streams.sockets, 7, &previous));
+        assert!(Arc::ptr_eq(&streams.get(7).unwrap(), &replacement));
+        assert!(retire_relay_stream(&streams.sockets, 7, &replacement));
+        assert!(streams.get(7).is_none());
+    }
+
+    #[test]
+    fn relay_stream_retirement_does_not_wait_for_transport_writer() {
+        let streams = RelayStreams::default();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let socket = Arc::new(socket);
+        let weak = Arc::downgrade(&socket);
+        streams.insert(7, Arc::clone(&socket));
+        let reader_streams = Arc::clone(&streams.sockets);
+        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_guard = writer.lock().unwrap();
+        let reader_writer = Arc::clone(&writer);
+        let (retired_tx, retired_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            assert!(retire_relay_stream(&reader_streams, 7, &socket));
+            drop(socket);
+            retired_tx.send(()).unwrap();
+            write_relay_frame_locked(&reader_writer, RELAY_FRAME_CLOSE, 7, &[]).unwrap();
+        });
+        let retired = retired_rx.recv_timeout(Duration::from_secs(2));
+        let reclaimed_before_unlock =
+            retired.is_ok() && weak.upgrade().is_none() && streams.get(7).is_none();
+        // Always release the writer and join, including a failed assertion path.
+        drop(writer_guard);
+        reader.join().unwrap();
+        retired.unwrap();
+        assert!(reclaimed_before_unlock);
     }
 
     #[test]
