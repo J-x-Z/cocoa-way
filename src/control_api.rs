@@ -3,7 +3,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -12,6 +11,7 @@ use crate::container_mode;
 use crate::container_sessions::{self, ContainerSession};
 use crate::control_protocol::{ControlRequest, ControlResponse};
 use crate::diagnostics;
+use crate::event_loop_signal::Sender;
 use crate::messages::CompositorMessage;
 use crate::runtime_paths::{build_child_path, find_command_path};
 
@@ -283,6 +283,8 @@ fn status_snapshot(path: &Path) -> Value {
                 "late_redraws_per_second": late_redraws_per_second,
                 "max_redraw_wait_ms": max_redraw_wait_ms,
                 "host_input_to_present_ms": input_to_present_ms,
+                "host_input_to_submit_ms": input_to_present_ms,
+                "latency_measurement": "input-to-CPU-submit estimate; present_ms is a legacy alias, not input-to-photon",
             })
         },
     );
@@ -342,6 +344,7 @@ fn displays_snapshot() -> Value {
             "description": "The compositor window owned by the main Cocoa-Way process."
         },
         "active": active_sessions_json(),
+        "cursor_paths": container_mode::control_cursor_paths(),
         "performance": container_mode::control_display_performance()
             .into_iter()
             .map(|(slot, redraw_fps, commits_per_second, late_redraws_per_second, max_redraw_wait_ms, input_to_present_ms, sampled_at_unix_ms)| json!({
@@ -351,6 +354,8 @@ fn displays_snapshot() -> Value {
                 "late_redraws_per_second": late_redraws_per_second,
                 "max_redraw_wait_ms": max_redraw_wait_ms,
                 "host_input_to_present_ms": input_to_present_ms,
+                "host_input_to_submit_ms": input_to_present_ms,
+                "latency_measurement": "input-to-CPU-submit estimate; present_ms is a legacy alias, not input-to-photon",
                 "sampled_at_unix_ms": sampled_at_unix_ms,
             }))
             .collect::<Vec<_>>(),
@@ -646,6 +651,7 @@ mod tests {
     #[test]
     fn unsupported_control_command_returns_structured_failure() {
         let (sender, _receiver) = std::sync::mpsc::channel();
+        let sender = Sender::with_waker(sender, || {});
         let response = dispatch(
             ControlRequest {
                 command: "delete".into(),
@@ -662,6 +668,7 @@ mod tests {
     #[test]
     fn application_control_queries_are_structured_and_read_only() {
         let (sender, _receiver) = std::sync::mpsc::channel();
+        let sender = Sender::with_waker(sender, || {});
         for command in ["applications", "sessions", "running", "displays", "tasks"] {
             let response = dispatch(
                 ControlRequest {
@@ -680,6 +687,7 @@ mod tests {
     #[test]
     fn display_control_commands_are_normalized_and_queued() {
         let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = Sender::with_waker(sender, || {});
         let create = dispatch(
             ControlRequest {
                 command: "display-create".into(),
@@ -765,6 +773,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("control.sock");
         let (sender, _receiver) = std::sync::mpsc::channel();
+        let sender = Sender::with_waker(sender, || {});
         start_at(socket.clone(), sender).unwrap();
 
         let mut stream = UnixStream::connect(&socket).unwrap();

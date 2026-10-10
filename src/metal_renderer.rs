@@ -123,6 +123,8 @@ pub struct MetalRenderer {
     frame: RefCell<Option<FrameState>>,
     // surface ObjectId → cached GPU texture
     texture_cache: RefCell<HashMap<ObjectId, CachedTexture>>,
+    trace: crate::latency_trace::LatencyTrace,
+    trace_frames: RefCell<Vec<u64>>,
 }
 
 impl MetalRenderer {
@@ -138,6 +140,7 @@ impl MetalRenderer {
             let layer = CAMetalLayer::new();
             layer.setDevice(Some(&device));
             layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            layer.setDisplaySyncEnabled(true);
             layer.setFramebufferOnly(false); // needed for texture reads if required
             let scale = window.scale_factor();
             let () = objc2::msg_send![&layer, setContentsScale: scale as f64];
@@ -200,8 +203,32 @@ impl MetalRenderer {
                 border_pipeline,
                 frame: RefCell::new(None),
                 texture_cache: RefCell::new(HashMap::new()),
+                trace: crate::latency_trace::LatencyTrace::default(),
+                trace_frames: RefCell::new(Vec::new()),
             })
         }
+    }
+
+    pub fn set_trace(&mut self, trace: crate::latency_trace::LatencyTrace) {
+        self.trace = trace;
+    }
+
+    pub fn begin_trace_frame(&self, frames: Vec<u64>) {
+        if !self.trace.enabled() {
+            return;
+        }
+        let window = u64::from(self.window.id());
+        for id in &frames {
+            self.trace.record(
+                crate::latency_trace::Stage::ComposeStarted,
+                crate::latency_trace::Tags {
+                    correlation_id: Some(crate::latency_trace::Tag::U64(*id)),
+                    window_id: Some(crate::latency_trace::Tag::U64(window)),
+                    ..Default::default()
+                },
+            );
+        }
+        *self.trace_frames.borrow_mut() = frames;
     }
 
     pub fn set_scale_factor(&mut self, scale: f64) {
@@ -225,18 +252,18 @@ impl MetalRenderer {
     }
 
     /// Begin a frame: set clear colour, acquire drawable, start the render pass.
-    pub fn clear(&self, r: f32, g: f32, b: f32, a: f32) {
+    pub fn clear(&self, r: f32, g: f32, b: f32, a: f32) -> bool {
         let mut frame_slot = self.frame.borrow_mut();
         // Drop any leftover frame state from a previous incomplete frame.
         *frame_slot = None;
 
         let Some(drawable) = (unsafe { self.layer.nextDrawable() }) else {
             log::warn!("Metal: nextDrawable returned nil");
-            return;
+            return false;
         };
         let Some(cmd_buf) = self.command_queue.commandBuffer() else {
             log::warn!("Metal: commandBuffer returned nil");
-            return;
+            return false;
         };
 
         let rp = unsafe {
@@ -257,7 +284,7 @@ impl MetalRenderer {
 
         let Some(encoder) = cmd_buf.renderCommandEncoderWithDescriptor(&rp) else {
             log::warn!("Metal: renderCommandEncoder returned nil");
-            return;
+            return false;
         };
 
         *frame_slot = Some(FrameState {
@@ -265,20 +292,59 @@ impl MetalRenderer {
             command_buffer: cmd_buf,
             encoder,
         });
+        true
     }
 
-    pub fn swap_buffers(&self) -> Result<(), String> {
+    pub fn swap_buffers(&self) -> Result<bool, String> {
         let mut frame_slot = self.frame.borrow_mut();
         let Some(frame) = frame_slot.take() else {
-            return Ok(());
+            return Ok(false);
         };
         unsafe {
             frame.encoder.endEncoding();
+            let traced_frames = std::mem::take(&mut *self.trace_frames.borrow_mut());
+            if self.trace.enabled() && !traced_frames.is_empty() {
+                let trace = self.trace.clone();
+                let window = u64::from(self.window.id());
+                let callback_frames = traced_frames.clone();
+                let block = block2::RcBlock::new(
+                    move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                        let presented = drawable.as_ref().presentedTime();
+                        for id in &callback_frames {
+                            trace.presented(
+                                presented,
+                                crate::latency_trace::Tags {
+                                    correlation_id: Some(crate::latency_trace::Tag::U64(*id)),
+                                    window_id: Some(crate::latency_trace::Tag::U64(window)),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    },
+                );
+                let () = objc2::msg_send![&*frame.drawable, addPresentedHandler: &*block];
+            }
             // CAMetalDrawable implements MTLDrawable; cast via raw ObjC message send.
             let () = objc2::msg_send![&*frame.command_buffer, presentDrawable: &*frame.drawable];
+            if !traced_frames.is_empty() {
+                let submitted = crate::latency_trace::now_ns();
+                for id in traced_frames {
+                    self.trace.record_at_ns(
+                        crate::latency_trace::Stage::CPUSubmitted,
+                        submitted,
+                        crate::latency_trace::Tags {
+                            correlation_id: Some(crate::latency_trace::Tag::U64(id)),
+                            window_id: Some(crate::latency_trace::Tag::U64(u64::from(
+                                self.window.id(),
+                            ))),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
             frame.command_buffer.commit();
         }
-        Ok(())
+        Ok(true)
     }
 
     pub fn request_redraw(&self) {

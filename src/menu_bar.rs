@@ -9,7 +9,6 @@
 //!   - saved connections from ~/.config/cocoa-way/connections.toml
 
 use std::sync::Mutex;
-use std::sync::mpsc::Sender;
 
 use objc2::declare_class;
 use objc2::mutability::MainThreadOnly;
@@ -21,6 +20,7 @@ use objc2_foundation::{MainThreadMarker, NSData, NSString};
 
 use crate::connections::Connection;
 use crate::container_sessions::ContainerSession;
+use crate::event_loop_signal::Sender;
 use crate::messages::CompositorMessage;
 
 // ── Global channel sender ─────────────────────────────────────────────────────

@@ -105,7 +105,7 @@ pub fn configure_toplevel(
 pub fn render_rootless_window(
     rootless: &mut RootlessWindow,
     popups: &[smithay::wayland::shell::xdg::PopupSurface],
-) -> usize {
+) -> Option<usize> {
     use smithay::reexports::wayland_server::Resource;
 
     let current_scale = rootless.renderer.window.scale_factor();
@@ -129,12 +129,14 @@ pub fn render_rootless_window(
     }
     let size = rootless.renderer.window.inner_size();
     if size.width == 0 || size.height == 0 {
-        return 0;
+        return None;
     }
     if size.width != rootless.renderer.width || size.height != rootless.renderer.height {
         rootless.renderer.resize(size.width, size.height);
     }
-    rootless.renderer.clear(0.08, 0.08, 0.1, 1.0);
+    if !rootless.renderer.clear(0.08, 0.08, 0.1, 1.0) {
+        return None;
+    }
     let scale = rootless.scale_factor;
     let root_surface = rootless.toplevel.wl_surface();
     let geometry = toplevel_window_geometry(&rootless.toplevel);
@@ -161,8 +163,13 @@ pub fn render_rootless_window(
         render_toplevel_tree(&mut rootless.renderer, &rootless.toplevel, (0, 0), scale);
     rendered += render_toplevel_popups(&mut rootless.renderer, root_surface, popups, (0, 0), scale);
 
-    if let Err(error) = rootless.renderer.swap_buffers() {
-        log::error!("Failed to present rootless window: {error}");
+    match rootless.renderer.swap_buffers() {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            log::error!("Failed to present rootless window: {error}");
+            return None;
+        }
     }
     if let Some((buffer_width, buffer_height)) =
         rootless.renderer.cached_surface_size(&root_surface.id())
@@ -204,7 +211,7 @@ pub fn render_rootless_window(
             rootless.last_render_metrics = Some(metrics);
         }
     }
-    rendered
+    Some(rendered)
 }
 
 pub fn render_toplevel_tree(

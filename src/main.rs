@@ -1,3 +1,4 @@
+use crate::event_loop_signal::Sender;
 use log::info;
 use smithay::input::keyboard::FilterResult;
 use smithay::input::pointer::{ButtonEvent, MotionEvent};
@@ -6,9 +7,7 @@ use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use smithay::utils::SERIAL_COUNTER;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
 use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 mod application_model;
@@ -19,7 +18,10 @@ mod container_sessions;
 mod control_api;
 mod control_protocol;
 mod diagnostics;
+mod event_loop_signal;
+mod frame_clock;
 mod keymap;
+mod latency_trace;
 mod layout;
 mod macos_gestures;
 mod menu_bar;
@@ -31,6 +33,7 @@ mod render;
 mod runtime_commands;
 mod runtime_paths;
 mod state;
+mod wayland_source;
 
 use crate::state::AppState;
 use messages::CompositorMessage;
@@ -2720,6 +2723,7 @@ fn main() {
     }
     let event_loop = EventLoop::new().unwrap();
     macos_gestures::set_event_loop_proxy(event_loop.create_proxy());
+    let event_proxy = event_loop.create_proxy();
     let mut event_handler = None;
     event_loop
         .run(move |event, target| {
@@ -2727,7 +2731,7 @@ fn main() {
                 if !matches!(event, Event::Resumed) {
                     return;
                 }
-                match create_event_handler(target) {
+                match create_event_handler(target, event_proxy.clone()) {
                     Ok(handler) => event_handler = Some(handler),
                     Err(error) => {
                         log::error!("Cocoa-Way startup failed: {error}");
@@ -3164,16 +3168,33 @@ fn rootless_pointer_motion(
             },
         );
     }
-    pointer.motion(
-        state,
-        focus,
-        &MotionEvent {
-            location,
-            serial: SERIAL_COUNTER.next_serial(),
-            time,
-        },
-    );
+    let locked = pointer.current_focus().is_some_and(|surface| {
+        smithay::wayland::pointer_constraints::with_pointer_constraint::<AppState, _, _>(
+            &surface,
+            &pointer,
+            |constraint| {
+                constraint.is_some_and(|constraint| {
+                    matches!(
+                        *constraint,
+                        smithay::wayland::pointer_constraints::PointerConstraint::Locked(_)
+                    ) && constraint.is_active()
+                })
+            },
+        )
+    });
+    if !locked {
+        pointer.motion(
+            state,
+            focus,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+    }
     pointer.frame(state);
+    state.refresh_native_cursor();
     rootless.last_pointer = location;
 }
 
@@ -3186,6 +3207,31 @@ fn refresh_rootless_pointer_focus(
         winit::dpi::LogicalPosition::new(rootless.last_pointer.x, rootless.last_pointer.y)
             .to_physical::<f64>(rootless.scale_factor);
     rootless_pointer_motion(state, rootless, physical, time);
+}
+
+fn window_refresh_millihertz(window: &winit::window::Window) -> Option<u32> {
+    window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+}
+
+fn flush_wayland_output(display: &mut Display<AppState>, source: &wayland_source::WaylandSource) {
+    let mut clients = Vec::new();
+    display
+        .handle()
+        .backend_handle()
+        .with_all_clients(|id| clients.push(id));
+    let mut blocked = Vec::new();
+    for client in &clients {
+        if let Err(error) = display.backend().flush(Some(client.clone())) {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                blocked.push(client.clone());
+            } else {
+                log::debug!("Wayland output flush failed: {error}");
+            }
+        }
+    }
+    source.set_output_interest(&clients, &blocked);
 }
 
 fn rootless_pointer_button(
@@ -3227,6 +3273,7 @@ fn rootless_pointer_button(
 
 fn create_event_handler(
     target: &ActiveEventLoop,
+    event_proxy: winit::event_loop::EventLoopProxy<()>,
 ) -> Result<impl FnMut(Event<()>, &ActiveEventLoop) + use<>, String> {
     let presentation_mode = presentation::PresentationMode::from_env();
     let display_worker_slot = std::env::var(DISPLAY_WORKER_SLOT_ENV).ok();
@@ -3252,10 +3299,14 @@ fn create_event_handler(
         log::warn!("Three-finger swipe support is unavailable: {}", error);
     }
     info!("MetalRenderer created with Metal hardware rendering");
+    let (latency_trace, mut trace_writer) = latency_trace::LatencyTrace::from_env()
+        .map_err(|error| format!("could not start latency tracing: {error}"))?;
+    renderer.set_trace(latency_trace.clone());
     let mut display = Display::<AppState>::new()
         .map_err(|error| format!("failed to initialize the Wayland display: {error}"))?;
     let display_handle = display.handle();
-    let (loop_signal, loop_receiver) = std::sync::mpsc::channel::<CompositorMessage>();
+    let (raw_signal, loop_receiver) = std::sync::mpsc::channel::<CompositorMessage>();
+    let loop_signal = Sender::new(raw_signal, event_proxy.clone());
     let control_socket_path = if display_worker_slot.is_none() {
         match control_api::start(loop_signal.clone()) {
             Ok(path) => {
@@ -3285,6 +3336,7 @@ fn create_event_handler(
         renderer.window.inner_size().height,
     )
     .map_err(|error| format!("Cocoa-Way input initialization failed: {error}"))?;
+    state.latency_trace = latency_trace;
     let initial_size = renderer.window.inner_size();
     let (initial_width, initial_height) = layout::sanitize_logical_size(
         f64::from(initial_size.width),
@@ -3292,7 +3344,8 @@ fn create_event_handler(
     );
     let initial_mode = smithay::output::Mode {
         size: (initial_width, initial_height).into(),
-        refresh: 60_000,
+        refresh: frame_clock::FrameClock::new(window_refresh_millihertz(&renderer.window))
+            .refresh_millihertz() as i32,
     };
     state.output.change_current_state(
         Some(initial_mode),
@@ -3345,45 +3398,25 @@ fn create_event_handler(
             log::error!("Failed to publish dedicated display readiness: {}", error);
         }
     }
-    let mut loop_handle = display_handle.clone();
-    std::thread::spawn(move || {
-        loop {
-            match listener.accept() {
-                Ok(Some(stream)) => {
-                    use crate::state::ClientState;
-                    info!("New client connected");
-                    if let Err(error) = loop_handle.insert_client(
-                        stream,
-                        Arc::new(ClientState {
-                            compositor_state: Default::default(),
-                        }),
-                    ) {
-                        log::warn!("Could not register a Wayland client: {error}");
-                    }
-                }
-                Ok(None) => {
-                    // The Wayland listening socket is non-blocking. Without a small
-                    // pause this thread spins at 100% CPU while waiting for clients.
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-        }
-    });
+    use std::os::fd::AsFd;
+    let mut wayland_source = wayland_source::WaylandSource::new(
+        display.as_fd(),
+        listener,
+        display_handle.clone(),
+        event_proxy,
+    )
+    .map_err(|error| format!("failed to monitor Wayland readiness: {error}"))?;
     let mut hidpi_enabled = false;
 
     // Will be installed in Event::Resumed (after winit's applicationDidFinishLaunching)
     let connections_for_menu = connections::load_connections();
     let container_sessions_for_menu = container_sessions::load_sessions();
     let container_event_signal = menu_signal.clone();
-    let mut pending_menu: Option<std::sync::mpsc::Sender<CompositorMessage>> =
-        if display_worker_slot.is_some() {
-            None
-        } else {
-            Some(menu_signal)
-        };
+    let mut pending_menu: Option<Sender<CompositorMessage>> = if display_worker_slot.is_some() {
+        None
+    } else {
+        Some(menu_signal)
+    };
     let mut active_container_sessions: Vec<ActiveContainerSession> = Vec::new();
     let mut active_classic_connections: Vec<ActiveClassicConnection> = Vec::new();
     let mut pending_profile_checks = HashSet::<usize>::new();
@@ -3396,14 +3429,18 @@ fn create_event_handler(
     let mut pending_managed_displays = std::collections::HashSet::<String>::new();
     let mut rootless_windows =
         HashMap::<winit::window::WindowId, presentation::RootlessWindow>::new();
+    let mut rootless_clocks = HashMap::<winit::window::WindowId, frame_clock::FrameClock>::new();
+    let mut pending_native_redraws = HashSet::<winit::window::WindowId>::new();
+    let mut failed_redraw_retries = HashMap::<winit::window::WindowId, std::time::Instant>::new();
+    let mut desktop_clock =
+        frame_clock::FrameClock::new(window_refresh_millihertz(&renderer.window));
+    let mut cursor_clock = frame_clock::FrameClock::new(Some(desktop_clock.refresh_millihertz()));
 
     let mut last_mouse_pos =
         smithay::utils::Point::<f64, smithay::utils::Logical>::from((0.0, 0.0));
     let start_time = std::time::Instant::now();
-    let frame_duration = std::time::Duration::from_millis(16); // ~60fps cap
-    let active_poll_interval = std::time::Duration::from_millis(4);
-    let idle_poll_interval = std::time::Duration::from_millis(16);
-    let mut last_frame = std::time::Instant::now();
+    let maintenance_interval = std::time::Duration::from_secs(1);
+    let mut next_maintenance = start_time;
     let mut last_layout_size: (i32, i32) = (0, 0); // track last logical size sent to layout
     let mut last_render_diagnostic = std::time::Instant::now() - std::time::Duration::from_secs(2);
     let mut blank_render_since: Option<std::time::Instant> = None;
@@ -3417,7 +3454,73 @@ fn create_event_handler(
     let mut pending_input_sample: Option<(std::time::Instant, u64)> = None;
     let mut input_to_present_ms: Option<f64> = None;
     let mut last_parent_check = std::time::Instant::now();
+    let mut traced_input_sequence = 1_u64 << 63;
     Ok(move |event: Event<()>, target: &ActiveEventLoop| {
+        let input_trace = if state.latency_trace.enabled()
+            && matches!(
+                &event,
+                Event::WindowEvent {
+                    event: WindowEvent::KeyboardInput { .. }
+                        | WindowEvent::MouseInput { .. }
+                        | WindowEvent::CursorMoved { .. }
+                        | WindowEvent::MouseWheel { .. },
+                    ..
+                }
+            ) {
+            let id = traced_input_sequence;
+            traced_input_sequence = traced_input_sequence.wrapping_add(1);
+            state.latency_trace.record(
+                latency_trace::Stage::HostNativeInput,
+                latency_trace::Tags {
+                    correlation_id: Some(latency_trace::Tag::U64(id)),
+                    ..Default::default()
+                },
+            );
+            Some(id)
+        } else {
+            None
+        };
+        // Winit delivers pending redraws before AboutToWait. Drain ready commits
+        // before rendering so an already-arrived update is not delayed a frame.
+        if matches!(
+            &event,
+            Event::UserEvent(())
+                | Event::WindowEvent {
+                    event: WindowEvent::RedrawRequested,
+                    ..
+                }
+        ) {
+            if let Err(error) = display.dispatch_clients(&mut state) {
+                log::debug!("Wayland dispatch failed: {error}");
+            }
+            state.request_pending_guest_clipboard();
+            state.refresh_native_cursor();
+            flush_wayland_output(&mut display, &wayland_source);
+            wayland_source.rearm();
+        }
+        let input_event = matches!(
+            &event,
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::PinchGesture { .. }
+                    | WindowEvent::RotationGesture { .. }
+                    | WindowEvent::Focused(_)
+                    | WindowEvent::CursorLeft { .. },
+                ..
+            }
+        );
+        if matches!(
+            &event,
+            Event::WindowEvent {
+                event: WindowEvent::Focused(true) | WindowEvent::KeyboardInput { .. },
+                ..
+            }
+        ) {
+            state.refresh_host_clipboard();
+        }
         for gesture in macos_gestures::drain_swipe_events() {
             let time = start_time.elapsed().as_millis() as u32;
             if macos_gestures::window_number(&renderer.window) == Some(gesture.window_number) {
@@ -3501,7 +3604,8 @@ fn create_event_handler(
                         .map_err(|error| error.to_string())
                         .and_then(metal_renderer::MetalRenderer::new);
                     match rootless_renderer {
-                        Ok(rootless_renderer) => {
+                        Ok(mut rootless_renderer) => {
+                            rootless_renderer.set_trace(state.latency_trace.clone());
                             if let Err(error) =
                                 macos_gestures::install_swipe_recognizer(&rootless_renderer.window)
                             {
@@ -3524,6 +3628,13 @@ fn create_event_handler(
                                 rootless_renderer.window.fullscreen().is_some(),
                             );
                             let window_id = rootless_renderer.window.id();
+                            rootless_clocks.insert(
+                                window_id,
+                                frame_clock::FrameClock::new(window_refresh_millihertz(
+                                    &rootless_renderer.window,
+                                )),
+                            );
+                            pending_native_redraws.insert(window_id);
                             rootless_windows.insert(
                                 window_id,
                                 presentation::RootlessWindow {
@@ -3645,6 +3756,7 @@ fn create_event_handler(
                     let sys_scale = renderer.window.scale_factor();
                     let new_scale = if hidpi_enabled { sys_scale } else { 1.0 };
                     state.scale_factor = new_scale;
+                    state.set_native_cursor_point_scale(new_scale / sys_scale);
                     // Advertise new output scale to clients.
                     state.output.change_current_state(
                         None,
@@ -4623,6 +4735,12 @@ fn create_event_handler(
                 let event_time = start_time.elapsed().as_millis() as u32;
                 match event {
                     WindowEvent::Resized(size) => {
+                        rootless_clocks
+                            .entry(window_id)
+                            .or_default()
+                            .set_refresh_millihertz(window_refresh_millihertz(
+                                &rootless.renderer.window,
+                            ));
                         log::debug!(
                             "Rootless native resize {:?}: physical={}x{} logical={}x{} scale={}",
                             rootless.surface_id(),
@@ -4641,9 +4759,16 @@ fn create_event_handler(
                             rootless.renderer.window.is_maximized(),
                             rootless.renderer.window.fullscreen().is_some(),
                         );
+                        state.rootless_dirty_surfaces.insert(rootless.surface_id());
                         state.needs_redraw = true;
                     }
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        rootless_clocks
+                            .entry(window_id)
+                            .or_default()
+                            .set_refresh_millihertz(window_refresh_millihertz(
+                                &rootless.renderer.window,
+                            ));
                         rootless.scale_factor = scale_factor;
                         rootless.renderer.set_scale_factor(scale_factor);
                         let size = rootless.renderer.window.inner_size();
@@ -4655,7 +4780,16 @@ fn create_event_handler(
                             rootless.renderer.window.is_maximized(),
                             rootless.renderer.window.fullscreen().is_some(),
                         );
+                        state.rootless_dirty_surfaces.insert(rootless.surface_id());
                         state.needs_redraw = true;
+                    }
+                    WindowEvent::Moved(_) => {
+                        rootless_clocks
+                            .entry(window_id)
+                            .or_default()
+                            .set_refresh_millihertz(window_refresh_millihertz(
+                                &rootless.renderer.window,
+                            ));
                     }
                     WindowEvent::CloseRequested => {
                         rootless.toplevel.send_close();
@@ -4668,6 +4802,7 @@ fn create_event_handler(
                         activate_toplevel(&mut state, Some(rootless.toplevel.wl_surface()));
                     }
                     WindowEvent::Focused(false) => {
+                        state.native_cursor_left_window(window_id);
                         release_pressed_keys(&mut state, event_time);
                         if state
                             .seat
@@ -4688,9 +4823,17 @@ fn create_event_handler(
                     }
                     WindowEvent::CursorEntered { .. } => {
                         rootless.renderer.window.set_cursor_visible(true);
+                        cursor_clock.set_refresh_millihertz(Some(
+                            rootless_clocks
+                                .entry(window_id)
+                                .or_default()
+                                .refresh_millihertz(),
+                        ));
+                        state.set_native_cursor_point_scale(1.0);
+                        state.native_cursor_entered(&rootless.renderer.window);
                     }
                     WindowEvent::CursorLeft { .. } => {
-                        crate::state::show_hidden_cursor();
+                        state.native_cursor_left_window(window_id);
                         if let Some(pointer) = state.seat.get_pointer() {
                             pointer.motion(
                                 &mut state,
@@ -4709,6 +4852,7 @@ fn create_event_handler(
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
                         }
+                        state.native_cursor_motion(&rootless.renderer.window, window_id);
                         rootless_pointer_motion(&mut state, &mut rootless, position, event_time);
                     }
                     WindowEvent::MouseInput {
@@ -4741,53 +4885,78 @@ fn create_event_handler(
                         state.handle_rotation_gesture(delta, phase, event_time);
                     }
                     WindowEvent::RedrawRequested => {
-                        let rendered =
-                            presentation::render_rootless_window(&mut rootless, &state.popups);
-                        if rendered > 0 && !rootless.presented_once {
-                            log::info!(
-                                "Presented first rootless frame for {:?} from {} surface buffer(s)",
-                                rootless.surface_id(),
-                                rendered
-                            );
-                            // AppKit may still report a freshly created window as hidden,
-                            // causing the earlier focus request to be ignored. Activate once
-                            // after real client content has reached the native window.
-                            rootless.presented_once = true;
-                            rootless.renderer.window.set_visible(true);
-                            rootless.renderer.window.focus_window();
-                        }
-                        if rendered == 0 && rootless.toplevel.wl_surface().is_alive() {
-                            log::debug!(
-                                "Rootless surface {:?} has not committed a drawable buffer yet",
-                                rootless.surface_id()
-                            );
-                        }
-                        let presented_at = std::time::Instant::now();
-                        if let Some(redraw_since) = pending_redraw_since.take() {
-                            let wait_ms =
-                                presented_at.duration_since(redraw_since).as_secs_f64() * 1000.0;
-                            perf_max_redraw_wait_ms = perf_max_redraw_wait_ms.max(wait_ms);
-                            if wait_ms > 25.0 {
-                                perf_late_redraws = perf_late_redraws.saturating_add(1);
-                            }
-                        }
-                        if let Some((input_at, commit_baseline)) = pending_input_sample
-                            && state.commit_counter > commit_baseline
+                        pending_native_redraws.remove(&window_id);
+                        rootless_clocks
+                            .entry(window_id)
+                            .or_default()
+                            .record_frame_started(std::time::Instant::now());
+                        rootless.renderer.begin_trace_frame(
+                            state.take_trace_frames(Some(&rootless.surface_id())),
+                        );
+                        if let Some(rendered) =
+                            presentation::render_rootless_window(&mut rootless, &state.popups)
                         {
-                            let sample =
-                                presented_at.duration_since(input_at).as_secs_f64() * 1000.0;
-                            input_to_present_ms = Some(
-                                input_to_present_ms
-                                    .map(|previous| previous * 0.8 + sample * 0.2)
-                                    .unwrap_or(sample),
+                            failed_redraw_retries.remove(&window_id);
+                            if rendered > 0 && !rootless.presented_once {
+                                log::info!(
+                                    "Presented first rootless frame for {:?} from {} surface buffer(s)",
+                                    rootless.surface_id(),
+                                    rendered
+                                );
+                                // AppKit may still report a freshly created window as hidden,
+                                // causing the earlier focus request to be ignored. Activate once
+                                // after real client content has reached the native window.
+                                rootless.presented_once = true;
+                                rootless.renderer.window.set_visible(true);
+                                rootless.renderer.window.focus_window();
+                            }
+                            if rendered == 0 && rootless.toplevel.wl_surface().is_alive() {
+                                log::debug!(
+                                    "Rootless surface {:?} has not committed a drawable buffer yet",
+                                    rootless.surface_id()
+                                );
+                            }
+                            let presented_at = std::time::Instant::now();
+                            rootless_clocks
+                                .entry(window_id)
+                                .or_default()
+                                .record_submission(presented_at);
+                            state.rootless_dirty_surfaces.remove(&rootless.surface_id());
+                            state.needs_redraw = !state.rootless_dirty_surfaces.is_empty();
+                            if let Some(redraw_since) = pending_redraw_since.take() {
+                                let wait_ms =
+                                    presented_at.duration_since(redraw_since).as_secs_f64()
+                                        * 1000.0;
+                                perf_max_redraw_wait_ms = perf_max_redraw_wait_ms.max(wait_ms);
+                                if wait_ms > 25.0 {
+                                    perf_late_redraws = perf_late_redraws.saturating_add(1);
+                                }
+                            }
+                            if let Some((input_at, commit_baseline)) = pending_input_sample
+                                && state.commit_counter > commit_baseline
+                            {
+                                let sample =
+                                    presented_at.duration_since(input_at).as_secs_f64() * 1000.0;
+                                input_to_present_ms = Some(
+                                    input_to_present_ms
+                                        .map(|previous| previous * 0.8 + sample * 0.2)
+                                        .unwrap_or(sample),
+                                );
+                                pending_input_sample = None;
+                            }
+                            perf_redraws = perf_redraws.saturating_add(1);
+                            let callback_time = state.start_time.elapsed().as_millis() as u32;
+                            let root_surface = rootless.surface_id();
+                            for callback in state.take_frame_callbacks_for(Some(&root_surface)) {
+                                callback.done(callback_time);
+                            }
+                        } else {
+                            state.rootless_dirty_surfaces.insert(rootless.surface_id());
+                            state.needs_redraw = true;
+                            failed_redraw_retries.insert(
+                                window_id,
+                                std::time::Instant::now() + std::time::Duration::from_millis(100),
                             );
-                            pending_input_sample = None;
-                        }
-                        perf_redraws = perf_redraws.saturating_add(1);
-                        let callback_time = state.start_time.elapsed().as_millis() as u32;
-                        let root_surface = rootless.surface_id();
-                        for callback in state.take_frame_callbacks_for(Some(&root_surface)) {
-                            callback.done(callback_time);
                         }
                     }
                     _ => {}
@@ -4795,8 +4964,10 @@ fn create_event_handler(
                 if keep_window {
                     rootless_windows.insert(window_id, rootless);
                 } else {
+                    rootless_clocks.remove(&window_id);
+                    pending_native_redraws.remove(&window_id);
                     // A closing window produces no CursorLeft for the pointer above it.
-                    crate::state::show_hidden_cursor();
+                    state.native_cursor_left_window(window_id);
                     if let Some(window_number) =
                         macos_gestures::window_number(&rootless.renderer.window)
                     {
@@ -4807,6 +4978,8 @@ fn create_event_handler(
             Event::WindowEvent { window_id, event } if window_id == renderer.window.id() => {
                 match event {
                     WindowEvent::Resized(size) => {
+                        desktop_clock
+                            .set_refresh_millihertz(window_refresh_millihertz(&renderer.window));
                         renderer.resize(size.width, size.height);
                         state.width = size.width;
                         state.height = size.height;
@@ -4827,7 +5000,7 @@ fn create_event_handler(
                         }
                         let mode = smithay::output::Mode {
                             size: (width, height).into(),
-                            refresh: 60_000,
+                            refresh: desktop_clock.refresh_millihertz() as i32,
                         };
                         state.output.change_current_state(
                             Some(mode),
@@ -4845,10 +5018,26 @@ fn create_event_handler(
                         state.needs_redraw = true;
                     }
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        desktop_clock
+                            .set_refresh_millihertz(window_refresh_millihertz(&renderer.window));
                         log::info!("ScaleFactorChanged: {}", scale_factor);
                         state.update_scale_factor(scale_factor);
                         renderer.set_scale_factor(scale_factor);
+                        state.set_native_cursor_point_scale(state.scale_factor / scale_factor);
                         state.needs_redraw = true;
+                    }
+                    WindowEvent::Moved(_) => {
+                        let previous_refresh = desktop_clock.refresh_millihertz();
+                        desktop_clock
+                            .set_refresh_millihertz(window_refresh_millihertz(&renderer.window));
+                        if previous_refresh != desktop_clock.refresh_millihertz()
+                            && let Some(mut mode) = state.output.current_mode()
+                        {
+                            mode.refresh = desktop_clock.refresh_millihertz() as i32;
+                            state
+                                .output
+                                .change_current_state(Some(mode), None, None, None);
+                        }
                     }
                     WindowEvent::CloseRequested => {
                         if display_worker_slot.is_some() {
@@ -4858,20 +5047,38 @@ fn create_event_handler(
                                 &mut state,
                                 start_time.elapsed().as_millis() as u32,
                             );
+                            state.native_cursor_left_window(window_id);
                             renderer.window.set_cursor_visible(true);
                             renderer.window.set_visible(false);
                         }
                     }
                     WindowEvent::CursorEntered { .. } => {
-                        if !state.layout.tiles.is_empty() {
-                            renderer.window.set_cursor_visible(false);
-                        }
+                        renderer.window.set_cursor_visible(true);
+                        cursor_clock
+                            .set_refresh_millihertz(Some(desktop_clock.refresh_millihertz()));
+                        state.set_native_cursor_point_scale(
+                            state.scale_factor / renderer.window.scale_factor(),
+                        );
+                        state.native_cursor_entered(&renderer.window);
                     }
                     WindowEvent::CursorLeft { .. } => {
-                        crate::state::show_hidden_cursor();
+                        state.native_cursor_left_window(window_id);
                         renderer.window.set_cursor_visible(true);
+                        if let Some(pointer) = state.seat.get_pointer() {
+                            pointer.motion(
+                                &mut state,
+                                None,
+                                &MotionEvent {
+                                    location: last_mouse_pos,
+                                    serial: SERIAL_COUNTER.next_serial(),
+                                    time: start_time.elapsed().as_millis() as u32,
+                                },
+                            );
+                            pointer.frame(&mut state);
+                        }
                     }
                     WindowEvent::Focused(false) => {
+                        state.native_cursor_left_window(window_id);
                         if let Some(keyboard) = state.seat.get_keyboard() {
                             let pressed_keys = keyboard.pressed_keys();
                             if !pressed_keys.is_empty() {
@@ -4956,6 +5163,7 @@ fn create_event_handler(
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
                         }
+                        state.native_cursor_motion(&renderer.window, window_id);
                         let scale = state.scale_factor;
                         let logical_pos = position.to_logical::<f64>(scale);
                         log::debug!(
@@ -4971,9 +5179,6 @@ fn create_event_handler(
                                 logical_pos.y,
                             ));
                         let delta = cursor_logical_point - last_mouse_pos;
-                        if !state.layout.tiles.is_empty() {
-                            renderer.window.set_cursor_visible(false);
-                        }
                         if let Some(target_id) = state.start_drag_request.take() {
                             let (cur_x, cur_y) = state
                                 .layout
@@ -5058,8 +5263,8 @@ fn create_event_handler(
                             pointer.motion(&mut state, focus, &event);
                         }
                         pointer.frame(&mut state);
+                        state.refresh_native_cursor();
                         last_mouse_pos = cursor_logical_point;
-                        let _ = display.flush_clients();
                     }
                     WindowEvent::MouseInput {
                         state: el_state,
@@ -5159,141 +5364,158 @@ fn create_event_handler(
                         state.handle_rotation_gesture(delta, phase, time);
                     }
                     WindowEvent::RedrawRequested => {
+                        pending_native_redraws.remove(&renderer.window.id());
                         let (width, height) = {
                             let size = renderer.window.inner_size();
                             (size.width, size.height)
                         };
                         if width > 0 && height > 0 {
+                            desktop_clock.record_frame_started(std::time::Instant::now());
+                            renderer.begin_trace_frame(state.take_trace_frames(None));
                             if width != renderer.width || height != renderer.height {
                                 renderer.resize(width, height);
                             }
-                            renderer.clear(0.1, 0.1, 0.15, 1.0);
-                            use smithay::reexports::wayland_server::Resource;
-                            let mut rendered_count = 0;
-                            let before_toplevels = state.toplevels.len();
-                            let before_tiles = state.layout.tiles.len();
-                            for tile in state.layout.tiles.iter() {
-                                if !tile.toplevel.wl_surface().is_alive() {
-                                    renderer.evict_texture(&tile.toplevel.wl_surface().id());
+                            if renderer.clear(0.1, 0.1, 0.15, 1.0) {
+                                failed_redraw_retries.remove(&window_id);
+                                use smithay::reexports::wayland_server::Resource;
+                                let mut rendered_count = 0;
+                                let before_toplevels = state.toplevels.len();
+                                let before_tiles = state.layout.tiles.len();
+                                for tile in state.layout.tiles.iter() {
+                                    if !tile.toplevel.wl_surface().is_alive() {
+                                        renderer.evict_texture(&tile.toplevel.wl_surface().id());
+                                    }
                                 }
-                            }
-                            state.toplevels.retain(|t| t.wl_surface().is_alive());
-                            state
-                                .layout
-                                .tiles
-                                .retain(|t| t.toplevel.wl_surface().is_alive());
-                            if state.toplevels.len() != before_toplevels
-                                || state.layout.tiles.len() != before_tiles
-                            {
-                                log::warn!(
-                                    "CLEANUP: toplevels {} -> {}, tiles {} -> {}",
-                                    before_toplevels,
-                                    state.toplevels.len(),
-                                    before_tiles,
-                                    state.layout.tiles.len()
-                                );
-                            }
-                            let scale = state.scale_factor;
-                            let (logical_width, logical_height) =
-                                layout::logical_size_from_physical(width, height, scale);
-                            if (logical_width, logical_height) != last_layout_size {
-                                last_layout_size = (logical_width, logical_height);
-                                state.layout.set_view_size(logical_width, logical_height);
-                            }
-                            if state.layout.tiles.is_empty() {
-                                log::debug!("RENDER: No tiles to render");
-                            } else {
-                                log::debug!("RENDER: {} tiles", state.layout.tiles.len());
-                            }
-                            state.popups.retain(|popup| popup.wl_surface().is_alive());
-                            for tile in state.layout.tiles.iter() {
-                                let wl_surface = tile.toplevel.wl_surface();
-                                let x_offset = tile.position.x;
-                                let y_offset = tile.position.y;
-                                let phys_x = (x_offset as f64 * scale) as i32;
-                                let phys_y = (y_offset as f64 * scale) as i32;
-                                let phys_w = (tile.size.w as f64 * scale) as i32;
-                                let phys_h = (tile.size.h as f64 * scale) as i32;
-                                rendered_count += presentation::render_toplevel_tree(
-                                    &mut renderer,
-                                    &tile.toplevel,
-                                    (x_offset, y_offset),
-                                    scale,
-                                );
-                                rendered_count += presentation::render_toplevel_popups(
-                                    &mut renderer,
-                                    wl_surface,
-                                    &state.popups,
-                                    (x_offset, y_offset),
-                                    scale,
-                                );
-                                let is_focused = state
-                                    .seat
-                                    .get_keyboard()
-                                    .and_then(|k| k.current_focus())
-                                    .map(|s| &s == wl_surface)
-                                    .unwrap_or(false);
-                                let border_width = 4;
-                                // Only draw border when tile has enough margin — same NDC
-                                // clipping issue as shadow if we go negative.
-                                if is_focused && phys_x >= border_width && phys_y >= border_width {
-                                    renderer.draw_border(
-                                        phys_x - border_width,
-                                        phys_y - border_width,
-                                        phys_w + border_width * 2,
-                                        phys_h + border_width * 2,
-                                        border_width as f32,
-                                    );
-                                }
-                            }
-                            if rendered_count > 0 || state.layout.tiles.is_empty() {
-                                blank_render_since = None;
-                            } else {
-                                let now = std::time::Instant::now();
-                                let blank_since = *blank_render_since.get_or_insert(now);
-                                if now.duration_since(blank_since)
-                                    >= std::time::Duration::from_secs(5)
-                                    && now.duration_since(last_render_diagnostic)
-                                        >= std::time::Duration::from_secs(5)
+                                state.toplevels.retain(|t| t.wl_surface().is_alive());
+                                state
+                                    .layout
+                                    .tiles
+                                    .retain(|t| t.toplevel.wl_surface().is_alive());
+                                if state.toplevels.len() != before_toplevels
+                                    || state.layout.tiles.len() != before_tiles
                                 {
-                                    last_render_diagnostic = now;
                                     log::warn!(
-                                        "RENDER: {} tiles have not produced a drawable surface for {}s",
-                                        state.layout.tiles.len(),
-                                        now.duration_since(blank_since).as_secs()
+                                        "CLEANUP: toplevels {} -> {}, tiles {} -> {}",
+                                        before_toplevels,
+                                        state.toplevels.len(),
+                                        before_tiles,
+                                        state.layout.tiles.len()
                                     );
                                 }
-                            }
-                            if let Err(e) = renderer.swap_buffers() {
-                                log::error!("Failed to swap buffers: {}", e);
-                            }
-                            let presented_at = std::time::Instant::now();
-                            if let Some(redraw_since) = pending_redraw_since.take() {
-                                let wait_ms =
-                                    presented_at.duration_since(redraw_since).as_secs_f64()
-                                        * 1000.0;
-                                perf_max_redraw_wait_ms = perf_max_redraw_wait_ms.max(wait_ms);
-                                if wait_ms > 25.0 {
-                                    perf_late_redraws = perf_late_redraws.saturating_add(1);
+                                let scale = state.scale_factor;
+                                let (logical_width, logical_height) =
+                                    layout::logical_size_from_physical(width, height, scale);
+                                if (logical_width, logical_height) != last_layout_size {
+                                    last_layout_size = (logical_width, logical_height);
+                                    state.layout.set_view_size(logical_width, logical_height);
                                 }
-                            }
-                            if let Some((input_at, commit_baseline)) = pending_input_sample
-                                && state.commit_counter > commit_baseline
-                            {
-                                let sample =
-                                    presented_at.duration_since(input_at).as_secs_f64() * 1000.0;
-                                input_to_present_ms = Some(
-                                    input_to_present_ms
-                                        .map(|previous| previous * 0.8 + sample * 0.2)
-                                        .unwrap_or(sample),
+                                if state.layout.tiles.is_empty() {
+                                    log::debug!("RENDER: No tiles to render");
+                                } else {
+                                    log::debug!("RENDER: {} tiles", state.layout.tiles.len());
+                                }
+                                state.popups.retain(|popup| popup.wl_surface().is_alive());
+                                for tile in state.layout.tiles.iter() {
+                                    let wl_surface = tile.toplevel.wl_surface();
+                                    let x_offset = tile.position.x;
+                                    let y_offset = tile.position.y;
+                                    let phys_x = (x_offset as f64 * scale) as i32;
+                                    let phys_y = (y_offset as f64 * scale) as i32;
+                                    let phys_w = (tile.size.w as f64 * scale) as i32;
+                                    let phys_h = (tile.size.h as f64 * scale) as i32;
+                                    rendered_count += presentation::render_toplevel_tree(
+                                        &mut renderer,
+                                        &tile.toplevel,
+                                        (x_offset, y_offset),
+                                        scale,
+                                    );
+                                    rendered_count += presentation::render_toplevel_popups(
+                                        &mut renderer,
+                                        wl_surface,
+                                        &state.popups,
+                                        (x_offset, y_offset),
+                                        scale,
+                                    );
+                                    let is_focused = state
+                                        .seat
+                                        .get_keyboard()
+                                        .and_then(|k| k.current_focus())
+                                        .map(|s| &s == wl_surface)
+                                        .unwrap_or(false);
+                                    let border_width = 4;
+                                    // Only draw border when tile has enough margin — same NDC
+                                    // clipping issue as shadow if we go negative.
+                                    if is_focused
+                                        && phys_x >= border_width
+                                        && phys_y >= border_width
+                                    {
+                                        renderer.draw_border(
+                                            phys_x - border_width,
+                                            phys_y - border_width,
+                                            phys_w + border_width * 2,
+                                            phys_h + border_width * 2,
+                                            border_width as f32,
+                                        );
+                                    }
+                                }
+                                if rendered_count > 0 || state.layout.tiles.is_empty() {
+                                    blank_render_since = None;
+                                } else {
+                                    let now = std::time::Instant::now();
+                                    let blank_since = *blank_render_since.get_or_insert(now);
+                                    if now.duration_since(blank_since)
+                                        >= std::time::Duration::from_secs(5)
+                                        && now.duration_since(last_render_diagnostic)
+                                            >= std::time::Duration::from_secs(5)
+                                    {
+                                        last_render_diagnostic = now;
+                                        log::warn!(
+                                            "RENDER: {} tiles have not produced a drawable surface for {}s",
+                                            state.layout.tiles.len(),
+                                            now.duration_since(blank_since).as_secs()
+                                        );
+                                    }
+                                }
+                                if let Err(e) = renderer.swap_buffers() {
+                                    log::error!("Failed to swap buffers: {}", e);
+                                }
+                                let presented_at = std::time::Instant::now();
+                                desktop_clock.record_submission(presented_at);
+                                if let Some(redraw_since) = pending_redraw_since.take() {
+                                    let wait_ms =
+                                        presented_at.duration_since(redraw_since).as_secs_f64()
+                                            * 1000.0;
+                                    perf_max_redraw_wait_ms = perf_max_redraw_wait_ms.max(wait_ms);
+                                    if wait_ms > 25.0 {
+                                        perf_late_redraws = perf_late_redraws.saturating_add(1);
+                                    }
+                                }
+                                if let Some((input_at, commit_baseline)) = pending_input_sample
+                                    && state.commit_counter > commit_baseline
+                                {
+                                    let sample =
+                                        presented_at.duration_since(input_at).as_secs_f64()
+                                            * 1000.0;
+                                    input_to_present_ms = Some(
+                                        input_to_present_ms
+                                            .map(|previous| previous * 0.8 + sample * 0.2)
+                                            .unwrap_or(sample),
+                                    );
+                                    pending_input_sample = None;
+                                }
+                                perf_redraws = perf_redraws.saturating_add(1);
+                                state.needs_redraw = false;
+                                let t = state.start_time.elapsed().as_millis() as u32;
+                                for cb in state.take_frame_callbacks_for(None) {
+                                    cb.done(t);
+                                }
+                            } else {
+                                state.needs_redraw = true;
+                                failed_redraw_retries.insert(
+                                    window_id,
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_millis(100),
                                 );
-                                pending_input_sample = None;
-                            }
-                            perf_redraws = perf_redraws.saturating_add(1);
-                            state.needs_redraw = false;
-                            let t = state.start_time.elapsed().as_millis() as u32;
-                            for cb in state.take_frame_callbacks_for(None) {
-                                cb.done(t);
                             }
                         }
                     }
@@ -5315,21 +5537,28 @@ fn create_event_handler(
                         return;
                     }
                 }
-                state.poll_host_clipboard();
-                reap_classic_connections(&mut active_classic_connections);
-                reap_exited_managed_displays(&mut managed_displays, &mut active_container_sessions);
-                sync_managed_displays(&managed_displays);
-                reap_exited_container_sessions(&mut active_container_sessions);
-                sync_active_container_sessions(&active_container_sessions);
+                if now >= next_maintenance {
+                    state.poll_host_clipboard();
+                    reap_classic_connections(&mut active_classic_connections);
+                    reap_exited_managed_displays(
+                        &mut managed_displays,
+                        &mut active_container_sessions,
+                    );
+                    sync_managed_displays(&managed_displays);
+                    reap_exited_container_sessions(&mut active_container_sessions);
+                    sync_active_container_sessions(&active_container_sessions);
+                    next_maintenance = now + maintenance_interval;
+                }
                 match display.dispatch_clients(&mut state) {
                     Ok(_) => {
                         state.request_pending_guest_clipboard();
-                        if let Err(error) = display.flush_clients() {
-                            log::debug!("Failed to flush Wayland clients: {}", error);
-                        }
+                        flush_wayland_output(&mut display, &wayland_source);
                     }
-                    Err(_) => {}
+                    Err(error) => log::debug!("Wayland dispatch failed: {error}"),
                 }
+                wayland_source.rearm();
+                state.refresh_native_cursor();
+                let now = std::time::Instant::now();
                 if state.needs_redraw && pending_redraw_since.is_none() {
                     pending_redraw_since = Some(now);
                 }
@@ -5355,6 +5584,7 @@ fn create_event_handler(
                         perf_late_redraws as f64 / elapsed,
                         perf_max_redraw_wait_ms,
                         input_to_present_ms,
+                        state.native_cursor_diagnostics(),
                     );
                     perf_window_start = now;
                     perf_last_redraws = perf_redraws;
@@ -5362,34 +5592,88 @@ fn create_event_handler(
                     perf_late_redraws = 0;
                     perf_max_redraw_wait_ms = 0.0;
                 }
-                // Keep the short poll only while a frame or input response is in
-                // flight. Merely owning a static window must not wake the worker
-                // 250 times per second indefinitely.
-                let poll_interval = if state.needs_redraw || pending_input_sample.is_some() {
-                    active_poll_interval
-                } else {
-                    idle_poll_interval
-                };
-                if state.needs_redraw && now.duration_since(last_frame) >= frame_duration {
-                    if presentation_mode.is_rootless() {
-                        let dirty_roots = std::mem::take(&mut state.rootless_dirty_surfaces);
-                        for window in rootless_windows.values() {
-                            if dirty_roots.is_empty() || dirty_roots.contains(&window.surface_id())
-                            {
+                let needs_maintenance = display_worker_parent.is_some()
+                    || !state.toplevels.is_empty()
+                    || !active_classic_connections.is_empty()
+                    || !active_container_sessions.is_empty()
+                    || !managed_displays.is_empty()
+                    || !pending_launch_workers.is_empty()
+                    || perf_redraws != perf_last_redraws
+                    || pending_input_sample.is_some();
+                let mut next_wakeup = needs_maintenance.then_some(next_maintenance);
+                if let Some(due) =
+                    cursor_clock.next_due(now, !state.cursor_frame_callbacks.is_empty())
+                {
+                    if due <= now {
+                        cursor_clock.record_frame_started(now);
+                        let time = state.start_time.elapsed().as_millis() as u32;
+                        for callback in state.take_cursor_frame_callbacks() {
+                            callback.done(time);
+                        }
+                        cursor_clock.record_submission(now);
+                        flush_wayland_output(&mut display, &wayland_source);
+                    } else {
+                        next_wakeup = Some(next_wakeup.map_or(due, |next| next.min(due)));
+                    }
+                }
+                if presentation_mode.is_rootless() {
+                    rootless_clocks.retain(|id, _| rootless_windows.contains_key(id));
+                    pending_native_redraws.retain(|id| rootless_windows.contains_key(id));
+                    if state.needs_redraw && state.rootless_dirty_surfaces.is_empty() {
+                        state.rootless_dirty_surfaces.extend(
+                            rootless_windows
+                                .values()
+                                .map(presentation::RootlessWindow::surface_id),
+                        );
+                    }
+                    for (id, window) in &rootless_windows {
+                        let root = window.surface_id();
+                        let has_work = state.rootless_dirty_surfaces.contains(&root)
+                            || state
+                                .pending_frame_callbacks
+                                .iter()
+                                .any(|callback| callback.root_surface.as_ref() == Some(&root));
+                        if pending_native_redraws.contains(id) {
+                            continue;
+                        }
+                        if window.renderer.width == 0 || window.renderer.height == 0 {
+                            continue;
+                        }
+                        let clock = rootless_clocks.entry(*id).or_default();
+                        if let Some(due) = clock.next_due(now, has_work) {
+                            let due = failed_redraw_retries
+                                .get(id)
+                                .map_or(due, |retry| due.max(*retry));
+                            if due <= now {
                                 window.renderer.request_redraw();
+                                pending_native_redraws.insert(*id);
+                                state.rootless_dirty_surfaces.remove(&root);
+                            } else {
+                                next_wakeup = Some(next_wakeup.map_or(due, |next| next.min(due)));
                             }
                         }
-                        state.needs_redraw = false;
-                    } else {
-                        renderer.request_redraw();
                     }
-                    last_frame = now;
-                    target.set_control_flow(ControlFlow::WaitUntil(now + poll_interval));
-                } else if state.needs_redraw {
-                    target.set_control_flow(ControlFlow::WaitUntil(last_frame + frame_duration));
-                } else {
-                    target.set_control_flow(ControlFlow::WaitUntil(now + poll_interval));
+                    state.needs_redraw = !state.rootless_dirty_surfaces.is_empty();
+                } else if !pending_native_redraws.contains(&renderer.window.id())
+                    && renderer.width > 0
+                    && renderer.height > 0
+                {
+                    let has_work = state.needs_redraw || !state.pending_frame_callbacks.is_empty();
+                    if let Some(due) = desktop_clock.next_due(now, has_work) {
+                        let due = failed_redraw_retries
+                            .get(&renderer.window.id())
+                            .map_or(due, |retry| due.max(*retry));
+                        if due <= now {
+                            renderer.request_redraw();
+                            pending_native_redraws.insert(renderer.window.id());
+                        } else {
+                            next_wakeup = Some(next_wakeup.map_or(due, |next| next.min(due)));
+                        }
+                    }
                 }
+                target.set_control_flow(
+                    next_wakeup.map_or(ControlFlow::Wait, ControlFlow::WaitUntil),
+                );
             }
             Event::Resumed => {
                 // Install menu bar once, after winit's applicationDidFinishLaunching.
@@ -5423,6 +5707,12 @@ fn create_event_handler(
                 }
             }
             Event::LoopExiting => {
+                if let Some(writer) = trace_writer.take() {
+                    std::thread::spawn(move || {
+                        let _ = writer.finish();
+                    });
+                }
+                wayland_source.stop();
                 macos_gestures::uninstall_all_swipe_recognizers();
                 for mut connection in active_classic_connections.drain(..) {
                     let _ = connection.child.kill();
@@ -5447,6 +5737,18 @@ fn create_event_handler(
                 }
             }
             _ => {}
+        }
+        if input_event {
+            flush_wayland_output(&mut display, &wayland_source);
+            if let Some(id) = input_trace {
+                state.latency_trace.record(
+                    latency_trace::Stage::Forwarded,
+                    latency_trace::Tags {
+                        correlation_id: Some(latency_trace::Tag::U64(id)),
+                        ..Default::default()
+                    },
+                );
+            }
         }
     })
 }

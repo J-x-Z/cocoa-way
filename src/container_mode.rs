@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +23,7 @@ use crate::application_model::{
     ProfileStatus, RuntimeStatus, TaskStatus, TaskStep, TaskStepStatus,
 };
 use crate::container_sessions::{self, ContainerSession};
+use crate::event_loop_signal::Sender;
 use crate::messages::CompositorMessage;
 use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quote};
 
@@ -209,6 +209,8 @@ struct PerformanceSnapshot {
     late_redraws_per_second: f64,
     max_redraw_wait_ms: f64,
     input_to_present_ms: Option<f64>,
+    #[serde(default)]
+    cursor: Option<serde_json::Value>,
     sampled_at_unix_ms: u128,
 }
 
@@ -653,6 +655,7 @@ pub fn record_performance_snapshot(
     late_redraws_per_second: f64,
     max_redraw_wait_ms: f64,
     input_to_present_ms: Option<f64>,
+    cursor: serde_json::Value,
 ) {
     let snapshot = PerformanceSnapshot {
         redraw_fps,
@@ -663,6 +666,7 @@ pub fn record_performance_snapshot(
         late_redraws_per_second,
         max_redraw_wait_ms,
         input_to_present_ms,
+        cursor: Some(cursor),
         sampled_at_unix_ms: now_unix_ms(),
     };
     publish_worker_performance(&snapshot);
@@ -744,6 +748,7 @@ fn update_live_display_fps_labels() {
                         late_redraws_per_second,
                         max_redraw_wait_ms,
                         input_to_present_ms,
+                        cursor: None,
                         sampled_at_unix_ms,
                     },
                 )
@@ -883,6 +888,31 @@ pub(crate) fn control_display_performance() -> Vec<(String, f64, f64, f64, f64, 
         }
     }
     displays
+}
+
+pub(crate) fn control_cursor_paths() -> Vec<serde_json::Value> {
+    let mut paths = Vec::new();
+    if let Some(snapshot) = performance_snapshot() {
+        paths.push(serde_json::json!({"slot": "default", "cursor": snapshot.cursor}));
+    }
+    let mut seen = HashSet::from(["default".to_string()]);
+    for active in active_sessions_snapshot() {
+        if !seen.insert(active.instance.display_slot.clone()) {
+            continue;
+        }
+        if let Some(snapshot) = performance_for_active_session(&active) {
+            paths.push(serde_json::json!({"slot": active.instance.display_slot, "cursor": snapshot.cursor}));
+        }
+    }
+    for display in MANAGED_DISPLAYS.lock().unwrap().iter() {
+        if !seen.insert(display.slot.clone()) {
+            continue;
+        }
+        if let Some(snapshot) = worker_performance_snapshot(&display.runtime_dir) {
+            paths.push(serde_json::json!({"slot": display.slot, "cursor": snapshot.cursor}));
+        }
+    }
+    paths
 }
 
 pub fn record_active_container_sessions(
@@ -5826,7 +5856,7 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
         add_label(
             parent,
             &format!(
-                "Max redraw wait {:.1} ms  |  host input -> present {}",
+                "Max redraw wait {:.1} ms  |  input -> CPU submit (estimate) {}",
                 snapshot.max_redraw_wait_ms,
                 snapshot
                     .input_to_present_ms

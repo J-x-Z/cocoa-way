@@ -17,7 +17,10 @@ use smithay::wayland::shell::xdg::decoration::{XdgDecorationState, XdgDecoration
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use crate::layout::Layout;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "native_cursor.rs"]
+mod native_cursor;
 
 const CLIPBOARD_IMAGE_MIME: &str = "image/png";
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -66,6 +69,8 @@ pub struct AppState {
     _pointer_constraints_state: smithay::wayland::pointer_constraints::PointerConstraintsState,
     _pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState,
     _relative_pointer_state: smithay::wayland::relative_pointer::RelativePointerManagerState,
+    _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
+    native_cursor: native_cursor::NativeCursor,
     _output_state: smithay::wayland::output::OutputManagerState,
     pub output: smithay::output::Output,
     pub toplevels: Vec<smithay::wayland::shell::xdg::ToplevelSurface>,
@@ -80,7 +85,7 @@ pub struct AppState {
         (f64, f64),
     )>,
     pub start_drag_request: Option<smithay::reexports::wayland_server::backend::ObjectId>,
-    pub loop_signal: std::sync::mpsc::Sender<crate::messages::CompositorMessage>,
+    pub loop_signal: crate::event_loop_signal::Sender<crate::messages::CompositorMessage>,
     pub presentation: crate::presentation::PresentationMode,
     pub width: u32,
     pub height: u32,
@@ -89,6 +94,10 @@ pub struct AppState {
     pub start_time: std::time::Instant,
     /// Frame callbacks collected during commit(); fired after swap_buffers().
     pub pending_frame_callbacks: Vec<PendingFrameCallback>,
+    /// Native cursor callbacks are paced by the main loop, independently of
+    /// scene redraws. Never acknowledge directly from cursor commits.
+    pub cursor_frame_callbacks:
+        Vec<smithay::reexports::wayland_server::protocol::wl_callback::WlCallback>,
     /// Set by Wayland commits or layout changes so the winit loop can avoid
     /// continuous redraws when the scene is idle.
     pub needs_redraw: bool,
@@ -100,6 +109,9 @@ pub struct AppState {
     /// Total Wayland surface commits observed since startup. Used for lightweight
     /// performance diagnostics in Container Mode.
     pub commit_counter: u64,
+    pub latency_trace: crate::latency_trace::LatencyTrace,
+    trace_frames:
+        std::collections::HashMap<smithay::reexports::wayland_server::backend::ObjectId, u64>,
     host_clipboard_text: Option<Arc<str>>,
     host_clipboard_image_png: Option<Arc<[u8]>>,
     pending_guest_clipboard_mime: Option<String>,
@@ -232,7 +244,7 @@ impl AppState {
     pub fn new(
         display_handle: &DisplayHandle,
         scale_factor: f64,
-        loop_signal: std::sync::mpsc::Sender<crate::messages::CompositorMessage>,
+        loop_signal: crate::event_loop_signal::Sender<crate::messages::CompositorMessage>,
         presentation: crate::presentation::PresentationMode,
         width: u32,
         height: u32,
@@ -328,6 +340,10 @@ impl AppState {
                 smithay::wayland::relative_pointer::RelativePointerManagerState::new::<Self>(
                     display_handle,
                 ),
+            _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<Self>(
+                display_handle,
+            ),
+            native_cursor: native_cursor::NativeCursor::default(),
             _output_state: output_state,
             output,
             toplevels: Vec::new(),
@@ -347,8 +363,11 @@ impl AppState {
             scale_factor,
             start_time: std::time::Instant::now(),
             pending_frame_callbacks: Vec::new(),
+            cursor_frame_callbacks: Vec::new(),
             needs_redraw: true,
             rootless_dirty_surfaces: std::collections::HashSet::new(),
+            latency_trace: crate::latency_trace::LatencyTrace::default(),
+            trace_frames: std::collections::HashMap::new(),
             commit_counter: 0,
             host_clipboard_text: None,
             host_clipboard_image_png: None,
@@ -359,6 +378,81 @@ impl AppState {
             pointer_gesture: PointerGestureTracker::default(),
             pointer_axis: PointerAxisTracker::default(),
         })
+    }
+
+    /// Call on content CursorEntered, after making winit's cursor visible once.
+    pub fn native_cursor_entered(&mut self, window: &winit::window::Window) {
+        self.native_cursor.entered(window);
+        self.refresh_native_cursor();
+    }
+
+    /// Reacquire after focus loss without CursorEntered. Pass WindowEvent's ID
+    /// to keep the unchanged-owner motion path free of AppKit/winit FFI calls.
+    pub fn native_cursor_motion(
+        &mut self,
+        window: &winit::window::Window,
+        window_id: winit::window::WindowId,
+    ) {
+        if self.native_cursor.ensure_entered(window, window_id) {
+            self.refresh_native_cursor();
+        }
+    }
+
+    /// Call before pointer.motion(None), and on focus loss/window removal.
+    pub fn native_cursor_left(&mut self) {
+        self.native_cursor.left();
+    }
+
+    /// Window-event cleanup that cannot release a different rootless owner.
+    pub fn native_cursor_left_window(&mut self, window_id: winit::window::WindowId) {
+        self.native_cursor.left_window(window_id);
+    }
+
+    pub fn native_cursor_diagnostics(&self) -> serde_json::Value {
+        self.native_cursor.diagnostics()
+    }
+
+    /// Cheap when unchanged; call after pointer motion (before dispatch) to
+    /// validate the request owner, and after dispatch to catch lock destruction.
+    /// Do not call inside with_pointer_constraint (its mutex would be reentered).
+    pub fn refresh_native_cursor(&mut self) {
+        let pointer = self.seat.get_pointer();
+        let focus = pointer.as_ref().and_then(|pointer| pointer.current_focus());
+        let locked = match (&pointer, &focus) {
+            (Some(pointer), Some(surface)) => {
+                smithay::wayland::pointer_constraints::with_pointer_constraint::<Self, _, _>(
+                    surface,
+                    pointer,
+                    |constraint| {
+                        constraint.is_some_and(|constraint| {
+                            matches!(
+                                *constraint,
+                                smithay::wayland::pointer_constraints::PointerConstraint::Locked(_)
+                            ) && constraint.is_active()
+                        })
+                    },
+                )
+            }
+            _ => false,
+        };
+        self.native_cursor
+            .set_focus(focus.map(|surface| surface.id()));
+        self.native_cursor.set_locked(locked);
+        self.native_cursor.refresh();
+    }
+
+    /// Drain only when the main loop's cursor frame clock reaches its deadline.
+    pub fn take_cursor_frame_callbacks(
+        &mut self,
+    ) -> Vec<smithay::reexports::wayland_server::protocol::wl_callback::WlCallback> {
+        std::mem::take(&mut self.cursor_frame_callbacks)
+    }
+
+    /// Wayland logical units to AppKit points (normally 1; Desktop's 1x mode
+    /// on a 2x display uses state.scale_factor / window.scale_factor()).
+    pub fn set_native_cursor_point_scale(&mut self, points_per_logical: f64) {
+        self.native_cursor.set_point_scale(points_per_logical);
+        self.refresh_native_cursor();
     }
 
     pub fn handle_pointer_axis(
@@ -607,6 +701,17 @@ impl AppState {
             .map(|toplevel| toplevel.wl_surface().id())
     }
 
+    pub fn take_trace_frames(
+        &mut self,
+        root: Option<&smithay::reexports::wayland_server::backend::ObjectId>,
+    ) -> Vec<u64> {
+        if let Some(root) = root {
+            self.trace_frames.remove(root).into_iter().collect()
+        } else {
+            self.trace_frames.drain().map(|(_, id)| id).collect()
+        }
+    }
+
     pub fn take_frame_callbacks_for(
         &mut self,
         root_surface: Option<&smithay::reexports::wayland_server::backend::ObjectId>,
@@ -643,7 +748,12 @@ impl AppState {
         if now.duration_since(self.last_pasteboard_poll) < std::time::Duration::from_millis(100) {
             return;
         }
-        self.last_pasteboard_poll = now;
+        self.refresh_host_clipboard();
+    }
+
+    /// Focus and paste input must not wait for the background maintenance timer.
+    pub fn refresh_host_clipboard(&mut self) {
+        self.last_pasteboard_poll = std::time::Instant::now();
 
         let Some(snapshot) = pasteboard_snapshot_if_changed(self.pasteboard_change_count) else {
             return;
@@ -854,12 +964,32 @@ impl CompositorHandler for AppState {
         // No-op: pre-commit hook logging removed to avoid 60fps log spam
     }
     fn commit(&mut self, surface: &WlSurface) {
+        if let Some(callbacks) = self.native_cursor.committed(surface) {
+            self.cursor_frame_callbacks.extend(callbacks);
+            self.commit_counter = self.commit_counter.saturating_add(1);
+            return;
+        }
         use smithay::wayland::compositor::{
             SurfaceAttributes, TraversalAction, with_surface_tree_downward,
         };
         // Resolve the owner before walking the tree. Smithay holds its surface-tree
         // mutex during traversal, so calling get_parent from the visitor deadlocks.
         let root_surface = self.root_toplevel_id_for_surface(surface);
+        if self.latency_trace.enabled() {
+            let id = self.commit_counter.saturating_add(1);
+            self.latency_trace.record(
+                crate::latency_trace::Stage::SurfaceCommit,
+                crate::latency_trace::Tags {
+                    correlation_id: Some(crate::latency_trace::Tag::U64(id)),
+                    ..Default::default()
+                },
+            );
+            if let Some(root) = root_surface.as_ref() {
+                // Coalesced commits stay unmatched; only the latest owner frame
+                // is carried through composition, never the latest input.
+                self.trace_frames.insert(root.clone(), id);
+            }
+        }
         let mut new_cbs = Vec::new();
         with_surface_tree_downward(
             surface,
@@ -890,7 +1020,14 @@ impl CompositorHandler for AppState {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        if self.native_cursor.destroyed(surface) {
+            self.pending_frame_callbacks
+                .retain(|pending| pending.source_surface != *surface);
+            self.refresh_native_cursor();
+            return;
+        }
         let surface_id = surface.id();
+        let affected_root = self.root_toplevel_id_for_surface(surface);
         let was_toplevel = self
             .toplevels
             .iter()
@@ -905,6 +1042,7 @@ impl CompositorHandler for AppState {
         if was_toplevel {
             self.output.leave(surface);
             self.rootless_dirty_surfaces.remove(&surface_id);
+            self.trace_frames.remove(&surface_id);
             self.pending_frame_callbacks
                 .retain(|pending| pending.root_surface.as_ref() != Some(&surface_id));
         }
@@ -921,6 +1059,7 @@ impl CompositorHandler for AppState {
 
         if let Some(pointer) = self.seat.get_pointer() {
             if pointer.current_focus().as_ref() == Some(surface) {
+                self.native_cursor_left();
                 // Wayland destruction can remove the native window before winit's
                 // CursorLeft/Destroyed events, so release its pointer here.
                 let location = pointer.current_location();
@@ -936,16 +1075,24 @@ impl CompositorHandler for AppState {
                     },
                 );
                 pointer.frame(self);
-                show_hidden_cursor();
             }
         }
+
+        self.refresh_native_cursor();
 
         if let Some(keyboard) = self.seat.get_keyboard() {
             if keyboard.current_focus().as_ref() == Some(surface) {
                 keyboard.set_focus(self, None, smithay::utils::SERIAL_COUNTER.next_serial());
             }
         }
-        self.needs_redraw = true;
+        if self.presentation.is_rootless() {
+            if !was_toplevel && let Some(root) = affected_root {
+                self.rootless_dirty_surfaces.insert(root);
+            }
+            self.needs_redraw = !self.rootless_dirty_surfaces.is_empty();
+        } else {
+            self.needs_redraw = true;
+        }
         if self.presentation.is_rootless() {
             let _ = self.loop_signal.send(
                 crate::messages::CompositorMessage::RootlessSurfaceDestroyed(surface_id.clone()),
@@ -1013,7 +1160,18 @@ impl XdgShellHandler for AppState {
         if surface.send_configure().is_err() {
             return;
         }
+        let root = self.root_toplevel_id_for_surface(
+            surface
+                .get_parent_surface()
+                .as_ref()
+                .unwrap_or(surface.wl_surface()),
+        );
         self.popups.push(surface);
+        if self.presentation.is_rootless()
+            && let Some(root) = root
+        {
+            self.rootless_dirty_surfaces.insert(root);
+        }
         self.needs_redraw = true;
     }
     fn grab(
@@ -1032,6 +1190,11 @@ impl XdgShellHandler for AppState {
         let geometry = positioner.get_geometry();
         surface.with_pending_state(|state| state.geometry = geometry);
         surface.send_repositioned(token);
+        if self.presentation.is_rootless()
+            && let Some(root) = self.root_toplevel_id_for_surface(surface.wl_surface())
+        {
+            self.rootless_dirty_surfaces.insert(root);
+        }
         self.needs_redraw = true;
     }
     fn maximize_request(&mut self, surface: smithay::wayland::shell::xdg::ToplevelSurface) {
@@ -1197,50 +1360,27 @@ impl SeatHandler for AppState {
         &mut self.seat_state
     }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        use objc2_app_kit::NSCursor;
-        use smithay::input::pointer::CursorIcon;
-        set_cursor_hidden(matches!(image, CursorImageStatus::Hidden));
-        unsafe {
-            match image {
-                CursorImageStatus::Hidden => {}
-                CursorImageStatus::Named(icon) => {
-                    let cursor = match icon {
-                        CursorIcon::Text | CursorIcon::VerticalText => NSCursor::IBeamCursor(),
-                        CursorIcon::Pointer => NSCursor::pointingHandCursor(),
-                        CursorIcon::Move | CursorIcon::AllScroll => NSCursor::openHandCursor(),
-                        CursorIcon::Grab => NSCursor::openHandCursor(),
-                        CursorIcon::Grabbing => NSCursor::closedHandCursor(),
-                        CursorIcon::Crosshair => NSCursor::crosshairCursor(),
-                        CursorIcon::NotAllowed | CursorIcon::NoDrop => {
-                            NSCursor::operationNotAllowedCursor()
-                        }
-                        CursorIcon::EResize
-                        | CursorIcon::WResize
-                        | CursorIcon::EwResize
-                        | CursorIcon::ColResize => NSCursor::resizeLeftRightCursor(),
-                        CursorIcon::NResize
-                        | CursorIcon::SResize
-                        | CursorIcon::NsResize
-                        | CursorIcon::RowResize => NSCursor::resizeUpDownCursor(),
-                        CursorIcon::NeResize | CursorIcon::SwResize | CursorIcon::NeswResize => {
-                            NSCursor::resizeLeftRightCursor()
-                        }
-                        CursorIcon::NwResize | CursorIcon::SeResize | CursorIcon::NwseResize => {
-                            NSCursor::resizeLeftRightCursor()
-                        }
-                        CursorIcon::Copy => NSCursor::dragCopyCursor(),
-                        CursorIcon::Alias => NSCursor::dragLinkCursor(),
-                        CursorIcon::ContextMenu => NSCursor::contextualMenuCursor(),
-                        CursorIcon::ZoomIn | CursorIcon::ZoomOut => NSCursor::crosshairCursor(),
-                        _ => NSCursor::arrowCursor(),
-                    };
-                    cursor.set();
+        let cursor_surface = match &image {
+            CursorImageStatus::Surface(surface) => Some(surface.clone()),
+            _ => None,
+        };
+        self.native_cursor.set_image(image);
+        // Smithay may hold the pointer mutex during this callback. Inspecting
+        // current_focus here would deadlock; the loop refreshes locks separately.
+        self.native_cursor.refresh();
+        if let Some(surface) = cursor_surface {
+            // A client can prepare/commit its surface before assigning the
+            // cursor role. Those callbacks were queued by the scene path.
+            let mut callbacks = Vec::new();
+            self.pending_frame_callbacks.retain(|pending| {
+                if pending.source_surface == surface {
+                    callbacks.push(pending.callback.clone());
+                    false
+                } else {
+                    true
                 }
-                CursorImageStatus::Surface(_) => {
-                    // Custom surface cursor — use arrow fallback for now
-                    NSCursor::arrowCursor().set();
-                }
-            }
+            });
+            self.cursor_frame_callbacks.extend(callbacks);
         }
     }
     fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
@@ -1398,6 +1538,7 @@ impl smithay::wayland::pointer_constraints::PointerConstraintsHandler for AppSta
         _surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         _pointer: &smithay::input::pointer::PointerHandle<Self>,
     ) {
+        self.refresh_native_cursor();
     }
     fn cursor_position_hint(
         &mut self,
@@ -1411,53 +1552,8 @@ smithay::delegate_pointer_constraints!(AppState);
 smithay::delegate_pointer_gestures!(AppState);
 smithay::delegate_relative_pointer!(AppState);
 
-// NSCursor hide/unhide calls are counted and must be balanced. Clients such as Chromium hide the
-// cursor repeatedly (YouTube does on every idle period during playback), so hide only once and
-// unhide as soon as a visible cursor is set again.
-struct CursorVisibility(AtomicBool);
-
-impl CursorVisibility {
-    fn update(&self, hidden: bool) -> Option<bool> {
-        (self.0.swap(hidden, Ordering::Relaxed) != hidden).then_some(hidden)
-    }
-}
-
-static CURSOR_VISIBILITY: CursorVisibility = CursorVisibility(AtomicBool::new(false));
-
-fn set_cursor_hidden(hidden: bool) {
-    use objc2_app_kit::NSCursor;
-    if let Some(hidden) = CURSOR_VISIBILITY.update(hidden) {
-        unsafe {
-            if hidden {
-                NSCursor::hide()
-            } else {
-                NSCursor::unhide()
-            }
-        }
-    }
-}
-
-/// A client hid the cursor and then lost the pointer without showing it again: the pointer left
-/// its window, or the window closed or left fullscreen underneath it. The client will hide it
-/// again on its next pointer enter if it still wants to.
-pub fn show_hidden_cursor() {
-    set_cursor_hidden(false);
-}
-
-#[cfg(test)]
-mod cursor_tests {
-    use super::*;
-
-    #[test]
-    fn repeated_cursor_requests_keep_hide_and_unhide_balanced() {
-        let visibility = CursorVisibility(AtomicBool::new(false));
-        let transitions = [false, true, true, true, false, false, true, false, false]
-            .into_iter()
-            .filter_map(|hidden| visibility.update(hidden))
-            .collect::<Vec<_>>();
-        assert_eq!(transitions, [true, false, true, false]);
-    }
-}
+smithay::delegate_cursor_shape!(AppState);
+impl smithay::wayland::tablet_manager::TabletSeatHandler for AppState {}
 
 fn nix_pipe() -> Option<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd)> {
     use std::os::unix::io::FromRawFd;
