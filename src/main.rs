@@ -3439,6 +3439,9 @@ fn retire_input_window(
     {
         release_pointer_lock(state, window);
     }
+    // Smithay resets the cursor during motion(None). Retire native ownership
+    // first so that reset cannot overwrite this client's explicit Hidden request.
+    state.native_cursor_left_window(owner);
     if state
         .pointer_input
         .focus()
@@ -3453,7 +3456,6 @@ fn retire_input_window(
             keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
         }
     }
-    state.native_cursor_left_window(owner);
 }
 
 fn prepare_pointer_focus(state: &mut AppState, window: &winit::window::Window, time: u32) {
@@ -3468,10 +3470,10 @@ fn prepare_pointer_focus(state: &mut AppState, window: &winit::window::Window, t
     {
         release_pointer_lock(state, window);
     }
-    clear_pointer_focus(state, time);
     if let Some(old_owner) = old_owner {
         state.native_cursor_left_window(old_owner);
     }
+    clear_pointer_focus(state, time);
 }
 
 fn invalidate_pointer_window(state: &mut AppState, window: &winit::window::Window, time: u32) {

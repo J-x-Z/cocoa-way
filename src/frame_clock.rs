@@ -11,7 +11,7 @@ const DEFAULT_REFRESH_MILLIHERTZ: u32 = 60_000;
 pub struct FrameClock {
     refresh_millihertz: u32,
     phase_anchor: Option<Instant>,
-    last_frame_time: Option<Instant>,
+    last_frame_started: Option<Instant>,
 }
 
 impl FrameClock {
@@ -19,19 +19,23 @@ impl FrameClock {
         let mut clock = Self {
             refresh_millihertz: DEFAULT_REFRESH_MILLIHERTZ,
             phase_anchor: None,
-            last_frame_time: None,
+            last_frame_started: None,
         };
         clock.set_refresh_millihertz(refresh_millihertz);
         clock
     }
 
     /// Missing or implausible monitor rates outside 1-1000 Hz use 60 Hz.
-    /// Updates preserve the phase anchor and frame progress. The next deadline
-    /// is a slot at the new rate strictly after the latest frame milestone.
+    /// Changing rate anchors the new phase at the latest actual frame start,
+    /// so rounded periods cannot replay a boundary from the previous rate.
     pub fn set_refresh_millihertz(&mut self, refresh_millihertz: Option<u32>) {
-        self.refresh_millihertz = refresh_millihertz
+        let refresh = refresh_millihertz
             .filter(|rate| (1_000..=1_000_000).contains(rate))
             .unwrap_or(DEFAULT_REFRESH_MILLIHERTZ);
+        if refresh != self.refresh_millihertz {
+            self.phase_anchor = self.last_frame_started;
+            self.refresh_millihertz = refresh;
+        }
     }
 
     pub fn refresh_millihertz(&self) -> u32 {
@@ -48,10 +52,11 @@ impl FrameClock {
             return None;
         }
 
-        let due = match (self.phase_anchor, self.last_frame_time) {
+        let due = match (self.phase_anchor, self.last_frame_started) {
             (Some(anchor), Some(last)) => {
                 // Find the next phase slot in constant time, even after a long
-                // idle/render. Round up the period to avoid exceeding the rate.
+                // idle. Completion cannot consume an unstarted frame slot.
+                // Round up the period to avoid exceeding the rate.
                 let period_ns = 1_000_000_000_000_u64.div_ceil(u64::from(self.refresh_millihertz));
                 let offset_ns =
                     (last.duration_since(anchor).as_nanos() % u128::from(period_ns)) as u64;
@@ -67,18 +72,20 @@ impl FrameClock {
     /// without resetting that phase. Older timestamps cannot rewind progress.
     pub fn record_frame_started(&mut self, started_at: Instant) {
         self.phase_anchor.get_or_insert(started_at);
-        self.last_frame_time = Some(
-            self.last_frame_time
+        self.last_frame_started = Some(
+            self.last_frame_started
                 .map_or(started_at, |last| last.max(started_at)),
         );
     }
 
     /// Call after actual submission, paired with `record_frame_started` before
-    /// rendering. This skips slots elapsed during rendering, but does not add a
-    /// whole period to the submission time. Without a prior start, this seeds
-    /// the phase at submission time instead.
+    /// rendering. Completion does not reserve another slot: a slow render has
+    /// already spent its frame interval, so fresh demand may be due immediately.
+    /// Without a prior start, this seeds the phase at submission time instead.
     pub fn record_submission(&mut self, submitted_at: Instant) {
-        self.record_frame_started(submitted_at);
+        if self.last_frame_started.is_none() {
+            self.record_frame_started(submitted_at);
+        }
     }
 }
 
@@ -91,6 +98,80 @@ impl Default for FrameClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_at_next_boundary_does_not_consume_an_unstarted_slot() {
+        let anchor = Instant::now();
+        let period = Duration::from_nanos(16_666_667);
+        let mut clock = FrameClock::new(Some(60_000));
+
+        clock.record_frame_started(anchor);
+        clock.record_submission(anchor + period);
+
+        // Only slot zero started. Completing it at slot one's boundary must not
+        // defer fresh work to slot two, as the current submission bookkeeping does.
+        assert_eq!(clock.next_due(anchor + period, true), Some(anchor + period));
+    }
+
+    #[test]
+    fn callback_driven_period_render_does_not_add_another_period_of_waiting() {
+        let anchor = Instant::now();
+        let render_overrun = Duration::from_micros(100);
+        let callback_round_trip = Duration::from_micros(250);
+
+        for (refresh, period_ns) in [(60_000, 16_666_667), (120_000, 8_333_334)] {
+            let mut clock = FrameClock::new(Some(refresh));
+            let period = Duration::from_nanos(period_ns);
+            let mut committed_at = anchor;
+            for frame in 0..60 {
+                let started_at = clock.next_due(committed_at, true).unwrap();
+                assert_eq!(
+                    started_at, committed_at,
+                    "frame {frame} at {refresh} mHz: a completed period render already exhausted the start interval",
+                );
+                clock.record_frame_started(started_at);
+                let submitted_at = started_at + period + render_overrun;
+                clock.record_submission(submitted_at);
+                assert_eq!(clock.next_due(submitted_at, false), None);
+
+                // The client waits for frame.done, then returns exactly one new
+                // commit. There is no queued backlog to replay or continuous producer.
+                committed_at = submitted_at + callback_round_trip;
+            }
+        }
+    }
+
+    #[test]
+    fn subperiod_render_crossing_a_boundary_does_not_skip_an_extra_start() {
+        let anchor = Instant::now();
+        let period = Duration::from_nanos(16_666_667);
+        let render_time = Duration::from_millis(12);
+        let wakeup_delay = Duration::from_millis(5);
+        let callback_round_trip = Duration::from_micros(250);
+        let mut clock = FrameClock::new(Some(60_000));
+
+        clock.record_frame_started(anchor);
+        clock.record_submission(anchor + render_time);
+        let committed_at = anchor + render_time + callback_round_trip;
+        let requested_at = clock.next_due(committed_at, true).unwrap();
+        assert_eq!(requested_at, anchor + period);
+
+        let started_at = requested_at + wakeup_delay;
+        clock.record_frame_started(started_at);
+        let submitted_at = started_at + render_time;
+        clock.record_submission(submitted_at);
+        assert_eq!(clock.next_due(submitted_at, false), None);
+
+        let next_commit = submitted_at + callback_round_trip;
+        let next_due = clock.next_due(next_commit, true).unwrap();
+        // Phase pacing or a conservative start-to-start cap can both satisfy
+        // this bound. Submission must not push the next start out to 3 * period.
+        let latest_due = (started_at + period).max(next_commit);
+        assert!(
+            next_due <= latest_due,
+            "next start {next_due:?} exceeds one start interval {latest_due:?}",
+        );
+    }
 
     #[test]
     fn continuous_three_ms_renders_keep_sixty_and_one_twenty_hz_phase() {
@@ -214,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_changes_preserve_phase_and_never_replay_consumed_slots() {
+    fn refresh_changes_preserve_progress_and_never_replay_consumed_slots() {
         let now = Instant::now();
         let mut clock = FrameClock::new(Some(60_000));
         let slow_period = Duration::from_nanos(16_666_667);
@@ -227,7 +308,7 @@ mod tests {
 
         clock.set_refresh_millihertz(Some(120_000));
         assert_eq!(clock.refresh_millihertz(), 120_000);
-        let fast_due = now + fast_period * 3;
+        let fast_due = now + slow_period + fast_period;
         assert_eq!(clock.next_due(sampled_at, true), Some(fast_due));
         clock.set_refresh_millihertz(Some(120_000));
         assert_eq!(clock.next_due(sampled_at, true), Some(fast_due));
@@ -271,13 +352,15 @@ mod tests {
     }
 
     #[test]
-    fn long_render_skips_all_elapsed_slots_without_immediate_redraw() {
+    fn long_render_allows_one_fresh_frame_without_replaying_elapsed_slots() {
         let now = Instant::now();
         let mut clock = FrameClock::default();
         clock.record_frame_started(now);
         let submitted_at = now + Duration::from_millis(90);
         clock.record_submission(submitted_at);
 
+        assert_eq!(clock.next_due(submitted_at, true), Some(submitted_at),);
+        clock.record_frame_started(submitted_at);
         assert_eq!(
             clock.next_due(submitted_at, true),
             Some(now + Duration::from_nanos(16_666_667) * 6),
@@ -292,6 +375,7 @@ mod tests {
 
         clock.record_frame_started(now);
         clock.record_submission(submitted_at);
+        clock.record_frame_started(submitted_at);
         clock.record_frame_started(now);
         clock.record_submission(now);
         assert_eq!(

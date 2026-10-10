@@ -648,9 +648,11 @@ mod tests {
     fn native_leave_preserves_explicit_hidden_request() {
         let mut cursor = NativeCursor::default();
         let focus = ObjectId::null();
+        let owner = WindowId::from(1_u64);
+        cursor.window_id = Some(owner);
         cursor.set_focus(Some(focus.clone()));
         cursor.set_image(CursorImageStatus::Hidden);
-        cursor.left();
+        cursor.left_window(owner);
         // This is the reset Smithay sends when the parent clears pointer focus.
         cursor.set_image(CursorImageStatus::default_named());
         assert_eq!(cursor.requested, CursorImageStatus::Hidden);
