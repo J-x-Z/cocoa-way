@@ -172,17 +172,25 @@ impl PointerAxisTracker {
             }
             MouseScrollDelta::PixelDelta(position) => {
                 let logical = position.to_logical::<f64>(scale_factor.max(f64::EPSILON));
-                // AppKit includes momentum in these deltas. Preserve it without inviting
-                // clients to add a second kinetic scroll for a raw Finger sequence.
-                let source = AxisSource::Continuous;
-                ((-logical.x, -logical.y), source, None)
+                // GTK normalizes 10 Wayland axis units to one step; Firefox's
+                // touchpad path expands that step to 40 pixels. AppKit supplies
+                // pixel distances, so convert units rather than multiplying speed.
+                const AXIS_UNITS_PER_POINT: f64 = 10.0 / 40.0;
+                (
+                    (
+                        -logical.x * AXIS_UNITS_PER_POINT,
+                        -logical.y * AXIS_UNITS_PER_POINT,
+                    ),
+                    AxisSource::Finger,
+                    None,
+                )
             }
         };
 
         let horizontal_moved = axis.0 != 0.0;
         let vertical_moved = axis.1 != 0.0;
-        // Continuous/Wheel stops are optional in Wayland. The host momentum stream
-        // does not need synthetic stops; raw Finger input would still require them.
+        // AppKit momentum is filtered by the native monitor. End raw Finger
+        // sequences once so the guest can supply its own kinetic scrolling.
         let terminal = matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled);
         let stop = if source == AxisSource::Finger && terminal {
             (
@@ -1683,15 +1691,14 @@ mod pointer_axis_tests {
             )
             .expect("non-zero trackpad movement should produce a frame");
 
-        assert_eq!(frame.source, Some(AxisSource::Continuous));
-        assert_eq!(frame.axis, (-6.0, 4.0));
+        assert_eq!(frame.source, Some(AxisSource::Finger));
+        assert_eq!(frame.axis, (-1.5, 1.0));
         assert_eq!(frame.stop, (false, false));
         assert_eq!(frame.v120, None);
     }
 
-    /// Preserve the host momentum stream without asking clients for another kinetic phase.
     #[test]
-    fn trackpad_scrolls_are_not_advertised_as_finger() {
+    fn trackpad_scrolls_use_pixel_pan_instead_of_trackpoint_lines() {
         let mut tracker = PointerAxisTracker::default();
         for phase in [TouchPhase::Started, TouchPhase::Moved, TouchPhase::Moved] {
             let frame = tracker
@@ -1702,31 +1709,22 @@ mod pointer_axis_tests {
                     10,
                 )
                 .expect("non-zero trackpad movement should produce a frame");
-            assert_ne!(
-                frame.source,
-                Some(AxisSource::Finger),
-                "a gesture macOS may already be adding inertia to must not ask \
-                 the client to add its own"
-            );
-            assert_eq!(frame.source, Some(AxisSource::Continuous));
+            assert_eq!(frame.source, Some(AxisSource::Finger));
+            // GTK divides axis units by 10, then Firefox expands them by 40.
+            assert_eq!(-frame.axis.1 / 10.0 * 40.0, 2.0);
         }
 
-        // The terminal frame carries no stop, because no kinetic scroll was
-        // delegated to the client that would need terminating.
         let end = tracker.frame(
             2.0,
             MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
             TouchPhase::Ended,
             11,
         );
-        assert!(
-            end.is_none() || end.unwrap().stop == (false, false),
-            "a non-finger source must not emit axis_stop"
-        );
+        assert_eq!(end.unwrap().stop, (false, true));
     }
 
     #[test]
-    fn continuous_scroll_ends_without_synthetic_axis_stops() {
+    fn zero_delta_end_stops_every_active_trackpad_axis_once() {
         let mut tracker = PointerAxisTracker::default();
         tracker.frame(
             1.0,
@@ -1734,29 +1732,77 @@ mod pointer_axis_tests {
             TouchPhase::Started,
             10,
         );
-        // Trackpad frames are `Continuous`, so the terminal frame carries no
-        // `axis_stop` (nothing was delegated to the client to terminate) and a
-        // zero-delta frame with nothing active is not worth sending at all.
         let end = tracker.frame(
             1.0,
             MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
             TouchPhase::Ended,
             11,
         );
+        let end = end.expect("finger release must stop both active axes");
+        assert_eq!(end.axis, (0.0, 0.0));
+        assert_eq!(end.stop, (true, true));
         assert!(
-            end.is_none() || end.unwrap().stop == (false, false),
-            "a non-finger source must not emit axis_stop: {end:?}"
+            tracker
+                .frame(
+                    1.0,
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+                    TouchPhase::Ended,
+                    12,
+                )
+                .is_none()
         );
-        // Enough movement to be forwarded, still no stop.
-        let moved_end = tracker
+    }
+
+    #[test]
+    fn cancelling_a_gesture_stops_its_active_axis() {
+        let mut tracker = PointerAxisTracker::default();
+        tracker.frame(
+            1.0,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(3.0, 0.0)),
+            TouchPhase::Started,
+            10,
+        );
+        let cancelled = tracker
             .frame(
                 1.0,
-                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 2.0)),
-                TouchPhase::Ended,
-                12,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+                TouchPhase::Cancelled,
+                11,
             )
-            .expect("a terminal frame with movement is still forwarded");
-        assert_eq!(moved_end.stop, (false, false));
+            .expect("cancellation must stop the active axis");
+        assert_eq!(cancelled.stop, (true, false));
+    }
+
+    #[test]
+    fn trackpad_distance_is_independent_of_hidpi_scale() {
+        for scale in [1.0, 1.5, 2.0, 3.0] {
+            let mut tracker = PointerAxisTracker::default();
+            let frame = tracker
+                .frame(
+                    scale,
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(8.0 * scale, -40.0 * scale)),
+                    TouchPhase::Moved,
+                    10,
+                )
+                .unwrap();
+            assert_eq!(frame.axis, (-2.0, 10.0));
+            assert_eq!(frame.v120, None);
+        }
+    }
+
+    #[test]
+    fn small_trackpad_deltas_are_not_rounded_to_wheel_ticks() {
+        let mut tracker = PointerAxisTracker::default();
+        let frame = tracker
+            .frame(
+                2.0,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.125, -0.25)),
+                TouchPhase::Moved,
+                10,
+            )
+            .unwrap();
+        assert_eq!(frame.axis, (-0.015625, 0.03125));
+        assert_eq!(frame.v120, None);
     }
 
     #[test]

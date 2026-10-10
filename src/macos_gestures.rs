@@ -1,6 +1,6 @@
 use block2::RcBlock;
 use objc2::runtime::AnyObject;
-use objc2_app_kit::{NSEvent, NSEventMask};
+use objc2_app_kit::{NSEvent, NSEventMask, NSEventPhase, NSEventType};
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
@@ -88,19 +88,38 @@ fn install_monitor() -> Result<objc2::rc::Retained<AnyObject>, String> {
         let event_ref = unsafe { event.as_ref() };
         let window_number = unsafe { event_ref.windowNumber() };
         let tracked = MONITOR.with(|state| state.borrow().windows.contains(&window_number));
-        if tracked {
+        if unsafe { event_ref.r#type() } == NSEventType::ScrollWheel {
+            if suppress_scroll_momentum(
+                tracked,
+                unsafe { event_ref.hasPreciseScrollingDeltas() },
+                unsafe { event_ref.momentumPhase() },
+            ) {
+                // Finger/axis_stop lets the guest own kinetic scrolling. Forwarding
+                // AppKit's post-release momentum as well would apply inertia twice.
+                return std::ptr::null_mut();
+            }
+        } else if tracked {
             let delta = unsafe { (event_ref.deltaX(), -event_ref.deltaY()) };
             queue_discrete_swipe(window_number, delta);
         }
         event.as_ptr()
     });
-    unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Swipe, &block) }
-        .ok_or_else(|| "macOS did not install the local swipe event monitor".into())
+    unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+            NSEventMask::Swipe | NSEventMask::ScrollWheel,
+            &block,
+        )
+    }
+    .ok_or_else(|| "macOS did not install the local gesture event monitor".into())
+}
+
+fn suppress_scroll_momentum(tracked: bool, precise: bool, momentum: NSEventPhase) -> bool {
+    tracked && precise && momentum != NSEventPhase::None
 }
 
 // Keep the old function name so the event-loop integration stays platform-local.
-// Unlike an NSPanGestureRecognizer, an NSEvent swipe monitor does not compete
-// with Winit's native scroll, magnify, or rotation responders.
+// The monitor leaves raw scroll, magnify and rotation to Winit, and filters only
+// synthesized scroll momentum in registered guest windows, not the GUI panel.
 pub fn install_swipe_recognizer(window: &Window) -> Result<(), String> {
     let window_number = window_number(window).ok_or("AppKit window is not attached yet")?;
     MONITOR.with(|state| {
@@ -133,4 +152,40 @@ pub fn uninstall_all_swipe_recognizers() {
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_finger_scrolls_and_mouse_wheels_reach_winit() {
+        assert!(!suppress_scroll_momentum(true, true, NSEventPhase::None));
+        assert!(!suppress_scroll_momentum(
+            true,
+            false,
+            NSEventPhase::Changed
+        ));
+    }
+
+    #[test]
+    fn guest_windows_drop_every_host_momentum_phase() {
+        for phase in [
+            NSEventPhase::Began,
+            NSEventPhase::Changed,
+            NSEventPhase::Ended,
+            NSEventPhase::Cancelled,
+        ] {
+            assert!(suppress_scroll_momentum(true, true, phase));
+        }
+    }
+
+    #[test]
+    fn gui_panel_keeps_native_scroll_momentum() {
+        assert!(!suppress_scroll_momentum(
+            false,
+            true,
+            NSEventPhase::Changed
+        ));
+    }
 }
