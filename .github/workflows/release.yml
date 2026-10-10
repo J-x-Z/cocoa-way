@@ -18,16 +18,23 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
-        run: brew install libxkbcommon pixman pkg-config
+        run: brew install libxkbcommon pkg-config
 
       - name: Verify release version
         run: |
           PACKAGE_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "cocoa-way"))')
           test "${GITHUB_REF_NAME}" = "v${PACKAGE_VERSION}"
+
+      - name: Verify vendored sources
+        run: python3 scripts/vendor-smithay.py
 
       - name: Build for arm64
         run: cargo build --release --bins --locked
@@ -90,6 +97,7 @@ jobs:
           test -f Cocoa-Way.app/Contents/Resources/xkb/symbols/us
           for executable in cocoa-way cocoa-wayctl cocoa-way-mcp; do
             ! otool -L "Cocoa-Way.app/Contents/MacOS/${executable}" | grep -E '/(opt/homebrew|usr/local|nix)/'
+            ! otool -L "Cocoa-Way.app/Contents/MacOS/${executable}" | grep -i pixman
           done
           codesign --verify --deep --strict --verbose=2 Cocoa-Way.app
           Cocoa-Way.app/Contents/MacOS/cocoa-wayctl --help >/dev/null

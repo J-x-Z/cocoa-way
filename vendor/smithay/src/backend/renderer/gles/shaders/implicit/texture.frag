@@ -3,12 +3,12 @@
 //_DEFINES_
 
 #if defined(EXTERNAL)
-// #extension GL_OES_EGL_image_external : require
+#extension GL_OES_EGL_image_external : require
 #endif
 
 precision mediump float;
 #if defined(EXTERNAL)
-uniform sampler2D tex;
+uniform samplerExternalOES tex;
 #else
 uniform sampler2D tex;
 #endif

@@ -61,5 +61,3 @@ impl std::fmt::Display for DeadResource {
 }
 
 impl std::error::Error for DeadResource {}
-
-pub mod simd_utils;

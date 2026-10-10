@@ -106,7 +106,6 @@ impl Drop for EGLDisplayHandle {
         if self.should_terminate {
             unsafe {
                 // ignore errors on drop
-                #[cfg(not(target_os = "macos"))]
                 ffi::egl::Terminate(self.handle);
             }
         }
@@ -323,33 +322,6 @@ impl EGLDisplay {
             dmabuf_render_formats,
             span,
         })
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn new_dummy() -> Self {
-        let handle = std::ptr::null();
-        let display = Arc::new(EGLDisplayHandle {
-            handle,
-            should_terminate: false,
-            _native: Box::new(()),
-        });
-        Self {
-            display,
-            surface_type: 0,
-            egl_version: (1, 4),
-            extensions: EGLExtensions {
-                extensions: vec![],
-                has_fences: false,
-                has_native_fences: false,
-                has_image_base: false,
-                has_import_dmabuf: false,
-                has_import_dmabuf_modifiers: false,
-                has_export_dmabuf: false,
-            },
-            dmabuf_import_formats: FormatSet::default(),
-            dmabuf_render_formats: FormatSet::default(),
-            span: tracing::Span::none(),
-        }
     }
 
     /// Create a new [`EGLDisplay`] from an already initialized EGLDisplay and EGLConfig handle

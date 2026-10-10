@@ -64,7 +64,6 @@
 //! for how to forward smithays debug output to other `log` compatible frameworks.
 
 pub mod backend;
-pub mod compat; // Platform compatibility layer for Windows support
 #[cfg(feature = "desktop")]
 pub mod desktop;
 pub mod input;

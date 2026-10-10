@@ -47,7 +47,6 @@ use crate::{
             Buffer, Format, Fourcc,
         },
         egl::{
-            display::{EGLDisplay, PixelFormat},
             fence::EGLFence,
             ffi::egl::{self as ffi_egl, types::EGLImage},
             EGLContext, EGLDevice, EGLSurface, MakeCurrentError,
@@ -175,9 +174,6 @@ enum GlesTargetInternal<'a> {
         buf: &'a mut GlesRenderbuffer,
         fbo: ffi::types::GLuint,
     },
-    Default {
-        size: (i32, i32),
-    },
 }
 
 impl Texture for GlesTarget<'_> {
@@ -199,7 +195,6 @@ impl Texture for GlesTarget<'_> {
                 .to_buffer(1, Transform::Normal),
             GlesTargetInternal::Texture { texture, .. } => texture.size(),
             GlesTargetInternal::Renderbuffer { buf, .. } => buf.size(),
-            GlesTargetInternal::Default { size } => (*size).into(),
         }
     }
 
@@ -232,7 +227,6 @@ impl GlesTargetInternal<'_> {
             }
             GlesTargetInternal::Texture { texture, .. } => Some((texture.0.format?, texture.0.has_alpha)),
             GlesTargetInternal::Renderbuffer { buf, .. } => Some((buf.0.format, buf.0.has_alpha)),
-            GlesTargetInternal::Default { .. } => Some((ffi::RGB8, false)), // Assume RGB8 opaque
         }
     }
 
@@ -252,7 +246,6 @@ impl GlesTargetInternal<'_> {
                     GlesTargetInternal::Renderbuffer { ref fbo, .. } => {
                         gl.BindFramebuffer(ffi::FRAMEBUFFER, *fbo)
                     }
-                    GlesTargetInternal::Default { .. } => gl.BindFramebuffer(ffi::FRAMEBUFFER, 0),
                     _ => unreachable!(),
                 }
             }
@@ -279,17 +272,6 @@ impl Drop for GlesTargetInternal<'_> {
             }
             _ => {}
         }
-    }
-}
-
-impl crate::backend::renderer::Bind<(i32, i32)> for GlesRenderer {
-    fn bind<'a>(&mut self, size: &'a mut (i32, i32)) -> Result<GlesTarget<'a>, GlesError> {
-        unsafe {
-            #[cfg(not(target_os = "macos"))]
-            self.egl.make_current()?;
-            self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
-        }
-        Ok(GlesTarget(GlesTargetInternal::Default { size: *size }))
     }
 }
 
@@ -353,7 +335,7 @@ impl GlesCleanup {
                     gl.DeleteTextures(1, &texture);
                 },
                 CleanupResource::EGLImage(image) => unsafe {
-                    ffi_egl::DestroyImageKHR(egl.display().get_display_handle().handle, image);
+                    ffi_egl::DestroyImageKHR(**egl.display().get_display_handle(), image);
                 },
                 CleanupResource::FramebufferObject(fbo) => unsafe {
                     gl.DeleteFramebuffers(1, &fbo);
@@ -749,116 +731,12 @@ impl GlesRenderer {
             span,
             gl_debug_span,
         };
-
-        #[cfg(not(target_os = "macos"))]
         renderer.egl.unbind()?;
-        Ok(renderer)
-    }
-
-    #[cfg(target_os = "macos")]
-    /// Creates a new OpenGL ES renderer from a given loader closure
-    pub unsafe fn new_with_loader<F>(loader: F) -> Result<GlesRenderer, GlesError>
-    where
-        F: FnMut(&str) -> *const std::ffi::c_void,
-    {
-        // MacOS external loader constructor
-        let (gl, gl_version, exts, capabilities, gl_debug_span) = {
-            let gl = ffi::Gles2::load_with(loader);
-            let ext_ptr = gl.GetString(ffi::EXTENSIONS) as *const std::ffi::c_char;
-            let exts = if !ext_ptr.is_null() {
-                let p = CStr::from_ptr(ext_ptr);
-                let list = String::from_utf8(p.to_bytes().to_vec()).unwrap_or_else(|_| String::new());
-                list.split(' ').map(|e| e.to_string()).collect::<Vec<_>>()
-            } else {
-                vec![]
-            };
-
-            let gl_version = version::GlVersion::try_from(&gl).unwrap_or_else(|_| version::GLES_2_0);
-
-            // Assume capabilities for macOS 3.3+ core profile
-            let capabilities = vec![
-                Capability::Instancing,
-                Capability::Renderbuffer,
-                Capability::Blit,
-                Capability::_10Bit,
-                Capability::Fencing,
-                Capability::Debug,
-            ];
-            (gl, gl_version, exts, capabilities, None)
-        };
-
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        let span = tracing::Span::none();
-
-        let tex_program = texture_program(&gl, shaders::FRAGMENT_SHADER, &[], sender.clone())?;
-        let solid_program = solid_program(&gl)?;
-
-        // Initialize vertices based on drawing methodology.
-        let vertices: &[ffi::types::GLfloat] = if capabilities.contains(&Capability::Instancing) {
-            &INSTANCED_VERTS
-        } else {
-            &TRIANGLE_VERTS
-        };
-
-        let mut vbos = [0; 2];
-        gl.GenBuffers(vbos.len() as i32, vbos.as_mut_ptr());
-        gl.BindBuffer(ffi::ARRAY_BUFFER, vbos[0]);
-        gl.BufferData(
-            ffi::ARRAY_BUFFER,
-            std::mem::size_of_val(vertices) as isize,
-            vertices.as_ptr() as *const _,
-            ffi::STATIC_DRAW,
-        );
-        gl.BindBuffer(ffi::ARRAY_BUFFER, vbos[1]);
-        gl.BufferData(
-            ffi::ARRAY_BUFFER,
-            (std::mem::size_of::<ffi::types::GLfloat>() * OUTPUT_VERTS.len()) as isize,
-            OUTPUT_VERTS.as_ptr() as *const _,
-            ffi::STATIC_DRAW,
-        );
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-
-        let egl = EGLContext::new_dummy(&EGLDisplay::new_dummy());
-        egl.user_data().get_or_insert_threadsafe(GlesCleanup::default);
-        egl.user_data()
-            .insert_if_missing_threadsafe(ContextId::<GlesTexture>::new);
-
-        let renderer = GlesRenderer {
-            gl,
-            egl,
-
-            #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
-            egl_reader: None,
-
-            extensions: exts,
-            is_software: false,
-            gl_version,
-            capabilities,
-
-            tex_program,
-            solid_program,
-            vbos,
-            min_filter: TextureFilter::Linear,
-            max_filter: TextureFilter::Linear,
-
-            buffers: Vec::new(),
-            dmabuf_cache: std::collections::HashMap::new(),
-            vertices: Vec::with_capacity(6 * 16),
-            non_opaque_damage: Vec::with_capacity(16),
-            opaque_damage: Vec::with_capacity(16),
-
-            debug_flags: DebugFlags::empty(),
-            _not_send: PhantomData,
-            span,
-            gl_debug_span,
-        };
-
         Ok(renderer)
     }
 
     fn bind_texture<'a>(&mut self, texture: &'a GlesTexture) -> Result<GlesTarget<'a>, GlesError> {
         unsafe {
-            #[cfg(not(target_os = "macos"))]
             self.egl.make_current()?;
         }
 
@@ -903,12 +781,10 @@ impl GlesRenderer {
     #[profiling::function]
     fn unbind(&mut self) -> Result<(), GlesError> {
         unsafe {
-            #[cfg(not(target_os = "macos"))]
             self.egl.make_current()?;
         }
         unsafe { self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0) };
         self.cleanup();
-        #[cfg(not(target_os = "macos"))]
         self.egl.unbind()?;
         Ok(())
     }
@@ -990,14 +866,6 @@ impl ImportMemWl for GlesRenderer {
             let has_alpha = has_alpha(fourcc);
             let (mut internal_format, read_format, type_) =
                 fourcc_to_gl_formats(fourcc).ok_or(GlesError::UnsupportedWlPixelFormat(data.format))?;
-
-            // PATCH: macOS Core Profile (3.3+) requires RGBA/RGBA8 internal format.
-            // BGRA internal format is not supported (only BGRA *format* is supported for upload).
-            #[cfg(target_os = "macos")]
-            if internal_format == ffi::BGRA_EXT {
-                internal_format = ffi::RGBA8;
-            }
-
             if self.gl_version.major == 2 {
                 // es 2.0 doesn't define sized variants
                 internal_format = match internal_format {
@@ -1155,13 +1023,6 @@ impl ImportMem for GlesRenderer {
         let has_alpha = has_alpha(format);
         let (mut internal, format, layout) =
             fourcc_to_gl_formats(format).expect("We check the format before");
-
-        // PATCH: macOS Core Profile (3.3+) requires RGBA/RGBA8 internal format.
-        #[cfg(target_os = "macos")]
-        if internal == ffi::BGRA_EXT {
-            internal = ffi::RGBA8;
-        }
-
         if self.gl_version.major == 2 {
             // es 2.0 doesn't define sized variants
             internal = match internal {
@@ -1681,7 +1542,7 @@ impl Bind<Dmabuf> for GlesRenderer {
                         if status != ffi::FRAMEBUFFER_COMPLETE {
                             self.gl.DeleteFramebuffers(1, &mut fbo as *mut _);
                             self.gl.DeleteRenderbuffers(1, &mut rbo as *mut _);
-                            ffi_egl::DestroyImageKHR(self.egl.display().get_display_handle().handle, image);
+                            ffi_egl::DestroyImageKHR(**self.egl.display().get_display_handle(), image);
                             return Err(GlesError::FramebufferBindingError);
                         }
                         let buf = GlesBuffer(Rc::new(GlesBufferInner {
@@ -2426,8 +2287,22 @@ impl Frame for GlesFrame<'_, '_> {
 
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
-    fn clear(&mut self, _color: Color32F, _at: &[Rectangle<i32, Physical>]) -> Result<(), GlesError> {
-        Ok(())
+    fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), GlesError> {
+        if at.is_empty() {
+            return Ok(());
+        }
+
+        unsafe {
+            self.renderer.gl.Disable(ffi::BLEND);
+        }
+
+        let res = self.draw_solid(Rectangle::from_size(self.size), at, color);
+
+        unsafe {
+            self.renderer.gl.Enable(ffi::BLEND);
+            self.renderer.gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+        }
+        res
     }
 
     #[instrument(level = "trace", skip(self), parent = &self.span)]
@@ -2640,17 +2515,7 @@ impl GlesFrame<'_, '_> {
             );
 
             gl.EnableVertexAttribArray(self.renderer.solid_program.attrib_position as u32);
-
-            // PATCH: macOS Core Profile requires VBOs (Client arrays not supported)
-            let mut temp_vbo = 0;
-            gl.GenBuffers(1, &mut temp_vbo);
-            gl.BindBuffer(ffi::ARRAY_BUFFER, temp_vbo);
-            gl.BufferData(
-                ffi::ARRAY_BUFFER,
-                (self.renderer.vertices.len() * 4) as isize,
-                self.renderer.vertices.as_ptr() as *const _,
-                ffi::STREAM_DRAW,
-            );
+            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
 
             gl.VertexAttribPointer(
                 self.renderer.solid_program.attrib_position as u32,
@@ -2658,7 +2523,7 @@ impl GlesFrame<'_, '_> {
                 ffi::FLOAT,
                 ffi::FALSE,
                 0,
-                0 as *const _,
+                self.renderer.vertices.as_ptr() as *const _,
             );
 
             let damage_len = damage.len() as i32;
@@ -2674,14 +2539,13 @@ impl GlesFrame<'_, '_> {
                     gl.DrawArrays(ffi::TRIANGLES, 0, 60);
 
                     // Set damage pointer to the next 10 rectangles.
-                    let offset = (i + 1) * 60 * 4 * 4;
                     gl.VertexAttribPointer(
                         self.renderer.solid_program.attrib_position as u32,
                         4,
                         ffi::FLOAT,
                         ffi::FALSE,
                         0,
-                        offset as *const usize as *const _,
+                        self.renderer.vertices.as_ptr().add((i + 1) as usize * 60 * 4) as *const _,
                     );
                 }
 
@@ -2689,7 +2553,6 @@ impl GlesFrame<'_, '_> {
                 let count = ((damage_len - 1) % 10 + 1) * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count);
             }
-            gl.DeleteBuffers(1, &temp_vbo);
 
             gl.DisableVertexAttribArray(self.renderer.solid_program.attrib_vert as u32);
             gl.DisableVertexAttribArray(self.renderer.solid_program.attrib_position as u32);
@@ -2977,17 +2840,7 @@ impl GlesFrame<'_, '_> {
 
             // vert_position
             gl.EnableVertexAttribArray(program.attrib_vert_position as u32);
-
-            // PATCH: macOS Core Profile requires VBOs (Client arrays not supported)
-            let mut temp_vbo = 0;
-            gl.GenBuffers(1, &mut temp_vbo);
-            gl.BindBuffer(ffi::ARRAY_BUFFER, temp_vbo);
-            gl.BufferData(
-                ffi::ARRAY_BUFFER,
-                (self.renderer.vertices.len() * 4) as isize,
-                self.renderer.vertices.as_ptr() as *const _,
-                ffi::STREAM_DRAW,
-            );
+            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
 
             gl.VertexAttribPointer(
                 program.attrib_vert_position as u32,
@@ -2995,7 +2848,7 @@ impl GlesFrame<'_, '_> {
                 ffi::FLOAT,
                 ffi::FALSE,
                 0,
-                0 as *const _,
+                self.renderer.vertices.as_ptr() as *const _,
             );
 
             if self.renderer.capabilities.contains(&Capability::Instancing) {
@@ -3009,14 +2862,13 @@ impl GlesFrame<'_, '_> {
                     gl.DrawArrays(ffi::TRIANGLES, 0, 60);
 
                     // Set damage pointer to the next 10 rectangles.
-                    let offset = (i + 1) * 60 * 4 * 4;
                     gl.VertexAttribPointer(
-                        program.attrib_vert_position as u32,
+                        self.renderer.solid_program.attrib_position as u32,
                         4,
                         ffi::FLOAT,
                         ffi::FALSE,
                         0,
-                        offset as *const usize as *const _,
+                        self.renderer.vertices.as_ptr().add((i + 1) * 60 * 4) as *const _,
                     );
                 }
 
@@ -3024,7 +2876,6 @@ impl GlesFrame<'_, '_> {
                 let count = ((damage_len - 1) % 10 + 1) * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count as i32);
             }
-            gl.DeleteBuffers(1, &temp_vbo);
 
             gl.BindTexture(target, 0);
             gl.DisableVertexAttribArray(program.attrib_vert as u32);

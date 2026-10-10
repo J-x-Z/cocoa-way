@@ -313,7 +313,7 @@ where
 
 impl<D, S> PointerGrab<D> for DnDGrab<D, S, D::PointerFocus>
 where
-    D: DndGrabHandler + Send,
+    D: DndGrabHandler,
     D: SeatHandler,
     <D as SeatHandler>::PointerFocus: DndFocus<D> + 'static,
     D: 'static,
@@ -444,7 +444,7 @@ where
 
 impl<D, S> TouchGrab<D> for DnDGrab<D, S, D::TouchFocus>
 where
-    D: DndGrabHandler + Send,
+    D: DndGrabHandler,
     D: SeatHandler,
     <D as SeatHandler>::TouchFocus: DndFocus<D> + 'static,
     D: 'static,

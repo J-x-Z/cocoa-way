@@ -87,7 +87,7 @@ pub mod renderer;
 
 #[cfg(feature = "backend_drm")]
 pub mod drm;
-#[cfg(all(unix, feature = "backend_egl"))]
+#[cfg(feature = "backend_egl")]
 pub mod egl;
 #[cfg(feature = "backend_libinput")]
 pub mod libinput;
@@ -98,9 +98,6 @@ pub mod udev;
 
 #[cfg(feature = "backend_vulkan")]
 pub mod vulkan;
-
-#[cfg(all(windows, feature = "backend_wgl"))]
-pub mod wgl;
 
 #[cfg(feature = "backend_winit")]
 pub mod winit;

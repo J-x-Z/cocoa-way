@@ -1,0 +1,24 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -18,13 +18,7 @@ rustdoc-args = ["--cfg", "docsrs"]
+ 
+ [workspace]
+ resolver = "3"
+-members = [
+-    "smithay-drm-extras",
+-    "smallvil",
+-    "anvil",
+-    "wlcs_anvil",
+-    "test_clients",
+-]
++members = []
+ 
+ [dependencies]
+ appendlist = "1.4"
+diff --git a/.rustfmt.toml b/.rustfmt.toml
+new file mode 100644
+--- /dev/null
++++ b/.rustfmt.toml
+@@ -0,0 +1 @@
++disable_all_formatting = true

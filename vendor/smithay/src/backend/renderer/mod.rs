@@ -24,14 +24,7 @@ use crate::wayland::{compositor::SurfaceData, shm::fourcc_to_shm_format};
 #[cfg(feature = "wayland_frontend")]
 use wayland_server::protocol::{wl_buffer, wl_shm};
 
-#[cfg(any(all(unix, feature = "backend_egl"), all(windows, feature = "backend_wgl")))]
-mod gl_loader;
-#[cfg(any(all(unix, feature = "backend_egl"), all(windows, feature = "backend_wgl")))]
-pub use gl_loader::get_proc_address;
-
-// GLES renderer requires EGL for context management, so Unix-only for now
-// Windows support will require significant GLES refactoring to use WGL contexts
-#[cfg(all(feature = "renderer_gl", unix, feature = "backend_egl"))]
+#[cfg(feature = "renderer_gl")]
 pub mod gles;
 
 #[cfg(feature = "renderer_glow")]
@@ -43,13 +36,8 @@ pub mod pixman;
 mod color;
 pub use color::Color32F;
 
-#[cfg(unix)]
 use crate::backend::allocator::{dmabuf::Dmabuf, Format, Fourcc};
-#[cfg(not(unix))]
-use crate::backend::allocator::{Format, Fourcc};
-
 #[cfg(all(
-    unix,
     feature = "wayland_frontend",
     feature = "backend_egl",
     feature = "use_system_lib"
@@ -626,7 +614,6 @@ pub trait ImportDmaWl: ImportDma {
 }
 
 /// Trait for Renderers supporting importing dmabufs.
-#[cfg(unix)]
 pub trait ImportDma: Renderer {
     /// Returns supported formats for dmabufs.
     fn dmabuf_formats(&self) -> FormatSet {

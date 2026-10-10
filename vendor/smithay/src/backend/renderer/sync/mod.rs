@@ -1,15 +1,9 @@
 //! Helper for synchronizing rendering operations
-
-use std::{error::Error, fmt, sync::Arc};
-
-#[cfg(unix)]
-use std::os::unix::io::OwnedFd;
-#[cfg(windows)]
-use std::os::windows::io::OwnedHandle as OwnedFd;
+use std::{error::Error, fmt, os::unix::io::OwnedFd, sync::Arc};
 
 use downcast_rs::{impl_downcast, Downcast};
 
-#[cfg(all(unix, feature = "backend_egl"))]
+#[cfg(feature = "backend_egl")]
 mod egl;
 
 /// Waiting for the fence was interrupted for an unknown reason.

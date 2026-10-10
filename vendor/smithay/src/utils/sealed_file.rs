@@ -1,29 +1,19 @@
-//! Sealed files for safe sharing with clients
-//!
-//! Uses memfd on Linux/Android/FreeBSD, tempfile on others
-
-use std::{ffi::CStr, fs::File};
-
-// Platform-specific fd imports
-#[cfg(unix)]
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
-
-#[cfg(windows)]
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, RawHandle};
-
-#[cfg(windows)]
-type RawFd = RawHandle;
-#[cfg(windows)]
-type BorrowedFd<'a> = BorrowedHandle<'a>;
+use std::{
+    ffi::CStr,
+    fs::File,
+    io::Write,
+    os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd},
+};
 
 /// A file whose fd cannot be written by other processes
 ///
 /// This mechanism is useful for giving clients access to large amounts of
 /// information such as keymaps without them being able to write to the handle.
 ///
-/// On Linux, Android, and FreeBSD, this uses a sealed memfd. On other platforms
-/// it creates a POSIX shared memory object with `shm_open`, opens a read-only
-/// copy, and unlinks it.
+/// On Linux, Android, and FreeBSD, this uses a sealed memfd. On macOS it reopens
+/// a private temporary file read-only and unlinks it. On other platforms it
+/// creates a POSIX shared memory object with `shm_open`, opens a read-only copy,
+/// and unlinks it.
 #[derive(Debug)]
 pub struct SealedFile {
     file: File,
@@ -40,7 +30,7 @@ impl SealedFile {
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "android"))]
     pub fn with_data(name: &CStr, data: &[u8]) -> Result<Self, std::io::Error> {
         use rustix::fs::{MemfdFlags, SealFlags};
-        use std::io::{Seek, Write};
+        use std::io::Seek;
 
         let fd = rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
 
@@ -62,17 +52,67 @@ impl SealedFile {
     }
 
     /// Create a `[SealedFile]` with the given binary data.
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "android")))]
+    #[cfg(target_os = "macos")]
     pub fn with_data(_name: &CStr, data: &[u8]) -> Result<Self, std::io::Error> {
-        use std::io::{Seek, SeekFrom, Write};
-
-        let mut file = tempfile::tempfile()?;
-        file.write_all(data)?;
-        file.flush()?;
-        file.seek(SeekFrom::Start(0))?;
-
+        // Darwin cannot populate a POSIX SHM object after reopening it read-only.
+        // Reopen a private temporary file instead, then unlink it before sharing.
+        let mut temporary = tempfile::NamedTempFile::new()?;
+        temporary.write_all(data)?;
+        temporary.flush()?;
+        let file = std::fs::OpenOptions::new().read(true).open(temporary.path())?;
+        temporary.close()?;
         Ok(Self {
             file,
+            size: data.len(),
+        })
+    }
+
+    /// Create a `[SealedFile]` with the given binary data.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "android",
+        target_os = "macos"
+    )))]
+    pub fn with_data(name: &CStr, data: &[u8]) -> Result<Self, std::io::Error> {
+        use rand::{distr::Alphanumeric, Rng};
+        use rustix::{
+            io::Errno,
+            shm::{self, Mode},
+        };
+
+        let mut rng = rand::rng();
+
+        // `memfd_create` isn't available. Instead, try `shm_open` with a randomized name, and
+        // loop a couple times if it exists.
+        let mut n = 0;
+        let (shm_name, mut file) = loop {
+            let mut shm_name = name.to_bytes().to_owned();
+            shm_name.push(b'-');
+            shm_name.extend((0..7).map(|_| rng.sample(Alphanumeric)));
+            let fd = shm::open(
+                shm_name.as_slice(),
+                shm::OFlags::RDWR | shm::OFlags::CREATE | shm::OFlags::EXCL,
+                Mode::RWXU,
+            );
+            if !matches!(fd, Err(Errno::EXIST)) || n > 3 {
+                break (shm_name, File::from(fd?));
+            }
+            n += 1;
+        };
+
+        // Sealing isn't available, so re-open read-only.
+        let fd_rdonly = shm::open(shm_name.as_slice(), shm::OFlags::RDONLY, Mode::empty())?;
+        let file_rdonly = File::from(fd_rdonly);
+
+        // Unlink so another process can't open shm file.
+        let _ = shm::unlink(shm_name.as_slice());
+
+        file.write_all(data)?;
+        file.flush()?;
+
+        Ok(Self {
+            file: file_rdonly,
             size: data.len(),
         })
     }
@@ -83,30 +123,14 @@ impl SealedFile {
     }
 }
 
-#[cfg(unix)]
 impl AsRawFd for SealedFile {
     fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
     }
 }
 
-#[cfg(unix)]
 impl AsFd for SealedFile {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
-    }
-}
-
-#[cfg(windows)]
-impl AsRawHandle for SealedFile {
-    fn as_raw_handle(&self) -> RawHandle {
-        std::os::windows::io::AsRawHandle::as_raw_handle(&self.file)
-    }
-}
-
-#[cfg(windows)]
-impl AsHandle for SealedFile {
-    fn as_handle(&self) -> BorrowedHandle<'_> {
-        std::os::windows::io::AsHandle::as_handle(&self.file)
     }
 }

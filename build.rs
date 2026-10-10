@@ -3,7 +3,6 @@ fn main() {
     {
         // Use pkg-config so Homebrew/Nix/other setups can resolve dependencies.
         check_pkg_config("xkbcommon", "libxkbcommon");
-        check_pkg_config("pixman-1", "pixman");
     }
 }
 

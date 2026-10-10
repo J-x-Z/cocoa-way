@@ -1,28 +1,28 @@
 [package]
 name = "cocoa-way"
-version = "2.0.3"
+version = "2.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 default-run = "cocoa-way"
 
 
 [dependencies]
-smithay = { path = "vendor/smithay", default-features = false, features = ["wayland_frontend", "xkbcommon"] }
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+smithay = { path = "vendor/smithay", default-features = false, features = ["wayland_frontend"] }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 raw-window-handle = "0.6"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-block2 = "0.5.1"
-objc2 = { version = "0.5.2", default-features = false, features = ["std"] }
-objc2-foundation = { version = "0.2.2", default-features = false, features = ["std", "NSData", "NSString"] }
-objc2-metal = { version = "0.2.2", default-features = false, features = [
+block2 = "=0.5.1"
+objc2 = { version = "=0.5.2", default-features = false, features = ["std"] }
+objc2-foundation = { version = "=0.2.2", default-features = false, features = ["std", "NSData", "NSString"] }
+objc2-metal = { version = "=0.2.2", default-features = false, features = [
     "std", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
     "MTLCommandEncoder", "MTLLibrary", "MTLRenderPipeline",
     "MTLRenderCommandEncoder", "MTLTexture", "MTLPixelFormat",
     "MTLDrawable", "MTLRenderPass", "MTLTypes",
 ] }
-objc2-app-kit = { version = "0.2.2", default-features = false, features = [
+objc2-app-kit = { version = "=0.2.2", default-features = false, features = [
     "NSApplication", "NSMenu", "NSMenuItem", "NSResponder",
     "NSWindow", "NSAlert", "NSView", "NSGraphics",
     "NSControl", "NSText", "NSTextField", "NSSecureTextField",
@@ -34,7 +34,7 @@ objc2-app-kit = { version = "0.2.2", default-features = false, features = [
     "NSImage",
     "NSEvent", "NSRunningApplication", "block2", "libc",
 ] }
-objc2-quartz-core = { version = "0.2.2", default-features = false, features = [
+objc2-quartz-core = { version = "=0.2.2", default-features = false, features = [
     "std", "CAMetalLayer", "CALayer", "objc2-metal",
 ] }
 log = "0.4"

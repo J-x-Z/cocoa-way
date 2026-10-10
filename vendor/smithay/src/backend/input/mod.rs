@@ -2,13 +2,7 @@
 
 use std::path::PathBuf;
 
-// Platform-specific keycode type
-#[cfg(unix)]
 pub use xkbcommon::xkb::Keycode;
-
-#[cfg(windows)]
-/// Keycode type for Windows (equivalent to virtual key code)
-pub type Keycode = u32;
 
 mod tablet;
 

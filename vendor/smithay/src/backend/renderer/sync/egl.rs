@@ -1,15 +1,10 @@
-//! EGL fence implementation (Unix only)
-
-#[cfg(unix)]
-use std::os::unix::io::OwnedFd;
-use std::time::Duration;
+use std::{os::unix::io::OwnedFd, time::Duration};
 
 use crate::backend::{
     egl::fence::EGLFence,
     renderer::sync::{Fence, Interrupted},
 };
 
-#[cfg(unix)]
 impl Fence for EGLFence {
     fn wait(&self) -> Result<(), Interrupted> {
         self.client_wait(None, false).map(|_| ()).map_err(|err| {

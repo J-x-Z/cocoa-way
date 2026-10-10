@@ -2,12 +2,7 @@
 
 mod grab;
 
-#[cfg(unix)]
-use std::os::fd::OwnedFd;
-#[cfg(windows)]
-use std::os::windows::io::OwnedHandle as OwnedFd;
-
-use std::{any::Any, sync::Arc};
+use std::{any::Any, os::fd::OwnedFd, sync::Arc};
 
 use smallvec::SmallVec;
 #[cfg(feature = "wayland_frontend")]

@@ -1,6 +1,18 @@
 [smithay]
-repository = "https://github.com/J-x-Z/smithay-universal.git"
-revision = "be6b5c477f87bfd234bd5a525306ac9802f0a716"
-upstream_repository = "https://github.com/Smithay/smithay.git"
-upstream_base = "6329f5b21693c53b0370cc7f62523ea4d0a42073"
-features = ["wayland_frontend", "xkbcommon"]
+repository = "https://github.com/Smithay/smithay.git"
+revision = "6329f5b21693c53b0370cc7f62523ea4d0a42073"
+features = ["wayland_frontend"]
+source_paths = ["Cargo.toml", "build.rs", "src", "LICENSE.txt", "README.md", "examples", "benches"]
+# Proven frontend fixes, not a second platform fork.
+backports = [
+    "f106c6200f7a31c4b25f1b8027d9f87570c84a9e", # xdg-shell v7
+    "b42e9cbaac8aa0cf34f36e6432f439a9f528c7a0", # selection finish
+    "ca932e042fa9ad150605c150a86275b85f9ad5b3", # text-input focus
+    "1ca641f5bef0b09d36cec757bbb31b255c6b7b7f", # popup dispatch
+    "ae14fa12f6ee3fc4dd4c766ffb21848f991a6a18", # xdg-foreign roles
+    "712d565b4b8bf34a136f42b39fcbf729ab635d3f", # selection device cleanup
+    "39ee351a0352379313daff66938a830ac71e1459", # SHM destruction
+    "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef", # unknown text-input enums
+]
+patches = ["patches/smithay/standalone.patch", "patches/smithay/darwin-sealed-file.patch"]
+tree_sha256 = "cb5ad509e55aaf3a2fe232ba6fbfebdcedfe1c68eb70c6e852ff4524e6dac565"

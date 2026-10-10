@@ -1,35 +1,5 @@
 <img align="right" width="25%" src="https://github.com/Smithay/smithay/assets/20758186/7a84ab10-e229-4823-bad8-9c647546407b">
 
-# 🌐 Smithay Universal (Fork)
-
-> **Research Artifact**: This is a modified fork of [Smithay](https://github.com/Smithay/smithay) designed for cross-platform Wayland research.
-> It enables **native Wayland compositors on macOS and Windows** without Linux kernel dependency, VMs, or X11 translation.
-
-## 🚀 Key Improvements & Modifications
-
-### 1. Universal Winit Backend
-We have significantly overhauled the `backend::winit` module to serve as a production-grade backend rather than just a debug tool.
-- **MacOS (Cocoa/CGL)**: Implemented native CGL context management, `IOSurface` mapping, and Retina scaling support.
-- **Windows (WGL/EGL)**: (In Progress) Implementation of WGL context creation via `glutin`.
-- **Latency Optimization**: Custom rendering loop integration to bypass strict OS windowing limitations.
-
-### 2. Event Loop Fusion
-- **CFRunLoop Integration**: Implements a `Calloop` Event Source that hooks directly into macOS `CFRunLoop`, allowing Wayland clients to be dispatched purely within the native macOS application loop.
-- **Input Bridging**: Low-latency translation of `Winit` events to Wayland input events (keyboard, mouse, touchpad gestures).
-### 3. Experimental: "Turbo-Charged" SIMD Acceleration
-- **Zero-Cost Mapping**: Implements the "Zero-Cost Protocol Virtualization" architecture described in our IEEE TC paper draft.
-- **NEON/AVX2 Swizzling**: Includes a hand-tuned [SIMD module](src/utils/simd_utils.rs) for `wl_shm` format conversion, bridging the performance gap on non-Linux platforms lacking `dmabuf`.
-- **Validation**: Pass `swizzle_correctness` check via `cargo test` (or standalone `turbo_test.rs`).
-- **📄 Paper**: Full manuscript and benchmarks at [../paper/](../paper/)
-
-### 4. Build System
-- Decoupled `gbm` and `libinput` dependencies to allow compilation on non-Linux targets.
-- Added macOS-specific feature flags and linking arguments.
-
----
-
-# Smithay (Original README)
-
 # Smithay
 
 [![Crates.io](https://img.shields.io/crates/v/smithay.svg)](https://crates.io/crates/smithay)
@@ -95,13 +65,3 @@ Rust.
 ## Contact us
 
 If you have questions or want to discuss the project with us, our main chatroom is on Matrix: [`#smithay:matrix.org`](https://matrix.to/#/#smithay:matrix.org).
-
-## License
-
-This project (Smithay-Universal) is licensed under the **GNU General Public License v3.0**.
-
-The original [Smithay](https://github.com/Smithay/smithay) library remains under the MIT license. Modifications in this fork are licensed under GPLv3.
-
-Permissions of this strong copyleft license are conditioned on making available complete source code of licensed works and modifications, which include larger works using a licensed work, under the same license. Copyright and license notices must be preserved. Contributors provide an express grant of patent rights.
-
-See the [LICENSE](LICENSE) file for details.

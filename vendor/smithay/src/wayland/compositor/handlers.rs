@@ -172,7 +172,6 @@ where
         handle: &DisplayHandle,
         data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
-        tracing::info!("WlSurface Request: {:?}", request);
         match request {
             wl_surface::Request::Attach { buffer, x, y } => {
                 let offset: Point<i32, Client> = (x, y).into();
@@ -195,8 +194,6 @@ where
 
                 let client_scale = state.client_compositor_state(client).client_scale();
                 let offset = offset.map(|p| p.to_f64().to_logical(client_scale).to_i32_round());
-
-                tracing::info!("Handling Attach for surface {:?}, buffer: {:?}", surface, buffer);
 
                 PrivateSurfaceData::with_states(surface, |states| {
                     let mut guard = states.cached_state.get::<SurfaceAttributes>();
@@ -268,7 +265,6 @@ where
                 });
             }
             wl_surface::Request::Commit => {
-                tracing::info!("Handling Commit for surface {:?}", surface);
                 let client_scale = state.client_compositor_state(client).client_scale();
                 PrivateSurfaceData::with_states(surface, |states| {
                     states

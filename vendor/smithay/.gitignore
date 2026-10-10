@@ -1,7 +1,0 @@
-/target
-**/*.rs.bk
-Cargo.lock
-**/*.log
-**/*.txt
-!LICENSE.txt
-.DS_Store

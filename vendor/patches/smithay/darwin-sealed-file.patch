@@ -1,0 +1,47 @@
+diff --git a/src/utils/sealed_file.rs b/src/utils/sealed_file.rs
+--- a/src/utils/sealed_file.rs
++++ b/src/utils/sealed_file.rs
+@@ -10,9 +10,10 @@ use std::{
+ /// This mechanism is useful for giving clients access to large amounts of
+ /// information such as keymaps without them being able to write to the handle.
+ ///
+-/// On Linux, Android, and FreeBSD, this uses a sealed memfd. On other platforms
+-/// it creates a POSIX shared memory object with `shm_open`, opens a read-only
+-/// copy, and unlinks it.
++/// On Linux, Android, and FreeBSD, this uses a sealed memfd. On macOS it reopens
++/// a private temporary file read-only and unlinks it. On other platforms it
++/// creates a POSIX shared memory object with `shm_open`, opens a read-only copy,
++/// and unlinks it.
+ #[derive(Debug)]
+ pub struct SealedFile {
+     file: File,
+@@ -51,7 +52,28 @@ impl SealedFile {
+     }
+ 
+     /// Create a `[SealedFile]` with the given binary data.
+-    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "android")))]
++    #[cfg(target_os = "macos")]
++    pub fn with_data(_name: &CStr, data: &[u8]) -> Result<Self, std::io::Error> {
++        // Darwin cannot populate a POSIX SHM object after reopening it read-only.
++        // Reopen a private temporary file instead, then unlink it before sharing.
++        let mut temporary = tempfile::NamedTempFile::new()?;
++        temporary.write_all(data)?;
++        temporary.flush()?;
++        let file = std::fs::OpenOptions::new().read(true).open(temporary.path())?;
++        temporary.close()?;
++        Ok(Self {
++            file,
++            size: data.len(),
++        })
++    }
++
++    /// Create a `[SealedFile]` with the given binary data.
++    #[cfg(not(any(
++        target_os = "linux",
++        target_os = "freebsd",
++        target_os = "android",
++        target_os = "macos"
++    )))]
+     pub fn with_data(name: &CStr, data: &[u8]) -> Result<Self, std::io::Error> {
+         use rand::{distr::Alphanumeric, Rng};
+         use rustix::{

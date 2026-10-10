@@ -25,7 +25,6 @@ use std::time::Duration;
 use calloop::generic::Generic;
 use calloop::{EventSource, Interest, PostAction, Readiness, Token};
 use tracing::{debug, info, info_span, instrument, trace, warn};
-#[cfg(feature = "backend_winit_wayland")]
 use wayland_egl as wegl;
 use winit::platform::pump_events::PumpStatus;
 use winit::platform::scancode::PhysicalKeyExtScancode;
@@ -134,7 +133,6 @@ where
                 })?;
 
         let (surface, is_x11) = match window.window_handle().map(|handle| handle.as_raw()) {
-            #[cfg(feature = "backend_winit_wayland")]
             Ok(RawWindowHandle::Wayland(handle)) => {
                 debug!("Winit backend: Wayland");
                 let size = window.inner_size();
@@ -399,16 +397,13 @@ impl WinitEventLoop {
         // SAFETY: we don't drop event loop ourselves.
         let event_loop = unsafe { self.event_loop.get_mut() };
 
-        tracing::info!("Smithay: Starting pump_app_events");
         event_loop.pump_app_events(
             Some(Duration::ZERO),
             &mut WinitEventLoopApp {
                 inner: &mut self.inner,
                 callback,
             },
-        );
-        tracing::info!("Smithay: Finished pump_app_events");
-        PumpStatus::Continue
+        )
     }
 }
 

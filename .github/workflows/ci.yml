@@ -15,16 +15,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Install dependencies
-        run: brew install libxkbcommon pixman pkg-config
+        run: brew install libxkbcommon pkg-config
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - name: Verify vendored sources
+        run: python3 scripts/vendor-smithay.py
 
       - name: Run tests
         run: cargo test --workspace --locked
