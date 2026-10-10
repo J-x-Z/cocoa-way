@@ -117,6 +117,10 @@ For a local Apple Container application:
 5. Run **Check**, then **Launch**.
 6. Inspect instance status, logs, terminal, files, audio, display assignment, and resource diagnostics in the same panel.
 
+Use the application's **More... > Resources & Platform...** action to set CPUs, memory, shared memory, platform, or Rosetta for the next launch. Empty fields restore runtime defaults; existing unrelated runtime arguments are preserved. Resource changes do not resize a running VM.
+
+The first check or launch after installing or updating Apple Container may download its kernel and init image. If this bootstrap fails or times out, finish the runtime download and retry Check. It does not mean the application image is missing GUI dependencies. The default init and Transport V2 paths have been tested with Apple Container 1.5.0.
+
 ## Presentation modes
 
 ### Desktop

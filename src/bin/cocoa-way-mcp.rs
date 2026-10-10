@@ -407,6 +407,8 @@ fn onboarding(arguments: &Value, socket: &Path) -> Result<Value, String> {
             "Confirm Apple's separate Container runtime is installed. If it is missing, install the latest official release from https://github.com/apple/container/releases/latest, then start it from Container > Apple Container.",
             "Call cocoa_way_image_sources and choose a trusted GUI-ready image path.",
             "Call cocoa_way_application_template with the image and application command.",
+            "Review CPU, memory, shared memory, platform, and Rosetta in Applications > More... > Resources & Platform...; changes apply to the next launch, not a running VM.",
+            "After a runtime update, allow Apple Container to finish kernel/init-image downloads. A bootstrap timeout is not proof that the application image lacks GUI tools; retry Check after the runtime is ready.",
             "Review the generated profile in Applications > New Application, run Check, then launch explicitly.",
         ],
         "remote-ssh" | "local-socket" => vec![
@@ -437,13 +439,13 @@ fn image_sources(socket: &Path) -> Result<Value, String> {
         "sources": [
             {
                 "kind": "oci-registry",
-                "action": "Images > Pull Image",
+                "action": "Images > Pull from Source...",
                 "example": "registry.fedoraproject.org/fedora:<release>",
                 "note": "Pull only a registry and tag you trust. A base image is not GUI-ready until it contains Waypipe and the requested application."
             },
             {
                 "kind": "oci-archive",
-                "action": "Images > Load OCI",
+                "action": "Images > Import OCI Archive...",
                 "note": "Import an OCI archive produced by another trusted runtime."
             },
             {
@@ -498,7 +500,8 @@ fn application_template(arguments: &Value) -> Result<Value, String> {
         "steps": [
             "Confirm the image is local in Images; pull, load, or build it if needed.",
             "Open Applications > New Application and enter these fields, or append the reviewed block to container-sessions.toml.",
-            "Run Check. Resolve missing Waypipe, application, clipboard, or audio dependencies in the image.",
+            "Review next-launch limits in Applications > More... > Resources & Platform... when needed.",
+            "Run Check. Resolve missing Waypipe or application tools in the image; audio is optional. For kernel/init-image download failures, finish runtime setup and retry rather than rebuilding the application image.",
             "Launch explicitly from Cocoa-Way after Check reports Ready."
         ],
         "note": "Use desktop for nested compositors such as niri or Hyprland; use rootless for regular xdg-shell applications such as Foot or Firefox."

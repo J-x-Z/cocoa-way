@@ -1385,12 +1385,8 @@ fn spawn_image_load(sender: Sender<CompositorMessage>, path: String) {
             return;
         };
 
-        let mut child = match std::process::Command::new(command_path)
-            .env("PATH", &child_path)
-            .args(["image", "load", "--input", &path])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+        let mut child = match image_load_command(&command_path, &child_path, &path)
+            .and_then(|mut command| command.spawn())
         {
             Ok(child) => child,
             Err(error) => {
@@ -1430,6 +1426,38 @@ fn spawn_image_load(sender: Sender<CompositorMessage>, path: String) {
             }
         }
     });
+}
+
+fn image_load_command(
+    binary: &std::path::Path,
+    child_path: &str,
+    archive: &str,
+) -> std::io::Result<std::process::Command> {
+    let input = std::fs::File::open(archive)?;
+    let metadata = input.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OCI archive must be a regular file",
+        ));
+    }
+    if let Some(available) = diagnostics::filesystem_available_bytes(&std::env::temp_dir())
+        && available.saturating_sub(metadata.len()) < 8 * 1024 * 1024 * 1024
+    {
+        return Err(std::io::Error::other(
+            "Not enough local disk space to stage this archive while keeping 8 GiB free",
+        ));
+    }
+    // The runtime's image service may not be able to read external or protected volumes.
+    // Its stdin import stages the archive locally and removes the staging file on completion.
+    let mut command = std::process::Command::new(binary);
+    command
+        .env("PATH", child_path)
+        .args(["image", "load"])
+        .stdin(std::process::Stdio::from(input))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    Ok(command)
 }
 
 fn spawn_image_build(
@@ -2721,6 +2749,44 @@ fn main() {
 #[cfg(test)]
 mod display_slot_tests {
     use super::*;
+
+    #[test]
+    fn image_load_passes_archive_bytes_without_a_daemon_visible_source_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(archive.path(), b"oci archive test bytes").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("container");
+        std::fs::write(&binary, "#!/bin/sh\nexec /bin/cat\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command =
+            image_load_command(&binary, "/usr/bin:/bin", archive.path().to_str().unwrap()).unwrap();
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["image", "load"]);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"oci archive test bytes");
+    }
+
+    #[test]
+    fn image_load_rejects_missing_and_non_regular_inputs() {
+        assert!(
+            image_load_command(
+                std::path::Path::new("container"),
+                "/usr/bin:/bin",
+                "/nonexistent/cocoa-way-test.tar",
+            )
+            .is_err()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            image_load_command(
+                std::path::Path::new("container"),
+                "/usr/bin:/bin",
+                directory.path().to_str().unwrap(),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn apple_image_pull_uses_plain_progress_and_selected_transport_options() {

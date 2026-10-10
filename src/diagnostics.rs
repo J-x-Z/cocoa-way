@@ -376,7 +376,7 @@ fn run_command(
     crate::runtime_commands::capture(command, timeout).map_err(|error| error.to_string())
 }
 
-fn filesystem_available_bytes(path: &Path) -> Option<u64> {
+pub(crate) fn filesystem_available_bytes(path: &Path) -> Option<u64> {
     let path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
