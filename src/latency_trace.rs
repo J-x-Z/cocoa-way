@@ -28,6 +28,15 @@
 //!   addPresentedHandler is gated by its currently disabled `block2` feature.
 //!   Parent can use `objc2::msg_send![drawable, addPresentedHandler: &*block]` with
 //!   the existing block2::RcBlock dependency, without changing Cargo features.
+//! - Metal diagnostics share the event stream, host clock and bounded queue.
+//!   Analyzers must recognize these auxiliary stages without adding them as
+//!   prerequisites to the original causal chain. DrawableAcquireStarted ->
+//!   DrawableAcquireFinished brackets nextDrawable, including a nil result.
+//!   DrawableAcquireFinished -> ComposeFinished measures CPU-side encoding elapsed
+//!   time, including instrumentation overhead, not CPU utilization.
+//!   GPUStarted/GPUCompleted use command-buffer API
+//!   times; GPUCompletionCallback/MetalPresentedCallback use callback arrival.
+//!   Neither callback arrival nor GPU completion is display presentation.
 //! - Drop ALL trace clones (including callbacks), then call TraceWriter::finish()
 //!   off the UI thread to drain/flush. No joining or file I/O occurs on trace drop.
 //!   Abrupt process exit can lose buffered records; absence of final stats is
@@ -89,6 +98,23 @@ pub enum Stage {
     ComposeStarted,
     CPUSubmitted,
     MetalPresented,
+    DrawableAcquireStarted,
+    DrawableAcquireFinished,
+    ComposeFinished,
+    GPUStarted,
+    GPUCompleted,
+    GPUCompletionCallback,
+    GPUCommandFailed,
+    MetalPresentedCallback,
+}
+
+impl Stage {
+    fn requires_reported_time(self) -> bool {
+        matches!(
+            self,
+            Self::MetalPresented | Self::GPUStarted | Self::GPUCompleted
+        )
+    }
 }
 
 /// Borrow tags on the hot path; strings are copied only when tracing is enabled.
@@ -208,7 +234,7 @@ impl LatencyTrace {
         let Some(inner) = &self.inner else {
             return false;
         };
-        if stage == Stage::MetalPresented {
+        if stage.requires_reported_time() {
             inner.counts.rejected.fetch_add(1, Relaxed);
             return false;
         }
@@ -226,7 +252,7 @@ impl LatencyTrace {
             tags.source_event_time,
             tags.window_id,
         ];
-        if (stage == Stage::MetalPresented && timestamp_ns == 0)
+        if (stage.requires_reported_time() && timestamp_ns == 0)
             || values
                 .into_iter()
                 .flatten()
@@ -250,6 +276,60 @@ impl LatencyTrace {
             return false;
         }
         true
+    }
+
+    /// Fan out one sampled milestone without sampling a different time per ID.
+    pub fn record_frame_at_ns(
+        &self,
+        stage: Stage,
+        timestamp_ns: u64,
+        frames: &[u64],
+        window: u64,
+    ) -> usize {
+        if !self.enabled() {
+            return 0;
+        }
+        let mut queued = 0;
+        for &id in frames {
+            queued += usize::from(self.record_at_ns(
+                stage,
+                timestamp_ns,
+                Tags {
+                    correlation_id: Some(Tag::U64(id)),
+                    window_id: Some(Tag::U64(window)),
+                    ..Default::default()
+                },
+            ));
+        }
+        queued
+    }
+
+    /// Call only for successful command-buffer completion, using its GPU API times.
+    /// Reject unavailable times individually and reversed pairs as a whole.
+    /// Never replace an API timestamp with callback time.
+    pub fn gpu_execution(&self, started: f64, completed: f64, tags: Tags<'_>) -> bool {
+        let Some(inner) = &self.inner else {
+            return false;
+        };
+        let start = media_time_ns(started).filter(|ns| *ns > 0);
+        let end = media_time_ns(completed).filter(|ns| *ns > 0);
+        if start
+            .zip(end)
+            .is_some_and(|(start, end)| end < start || completed < started)
+        {
+            inner.counts.rejected.fetch_add(1, Relaxed);
+            return false;
+        }
+        let record_time = |stage, time| match time {
+            Some(ns) => self.record_at_ns(stage, ns, tags),
+            None => {
+                inner.counts.rejected.fetch_add(1, Relaxed);
+                false
+            }
+        };
+        let start_queued = record_time(Stage::GPUStarted, start);
+        let end_queued = record_time(Stage::GPUCompleted, end);
+        start_queued && end_queued
     }
 
     /// Pass actual drawable.presentedTime seconds, not the callback's arrival time.
@@ -388,7 +468,7 @@ mod tests {
 
     #[test]
     fn json_stages_and_tag_types_are_valid() {
-        let (trace, rx) = LatencyTrace::fast_for_test(6);
+        let (trace, rx) = LatencyTrace::fast_for_test(14);
         let stages = [
             Stage::HostNativeInput,
             Stage::Forwarded,
@@ -396,6 +476,14 @@ mod tests {
             Stage::ComposeStarted,
             Stage::CPUSubmitted,
             Stage::MetalPresented,
+            Stage::DrawableAcquireStarted,
+            Stage::DrawableAcquireFinished,
+            Stage::ComposeFinished,
+            Stage::GPUStarted,
+            Stage::GPUCompleted,
+            Stage::GPUCompletionCallback,
+            Stage::GPUCommandFailed,
+            Stage::MetalPresentedCallback,
         ];
         let names = [
             "HostNativeInput",
@@ -404,6 +492,14 @@ mod tests {
             "ComposeStarted",
             "CPUSubmitted",
             "MetalPresented",
+            "DrawableAcquireStarted",
+            "DrawableAcquireFinished",
+            "ComposeFinished",
+            "GPUStarted",
+            "GPUCompleted",
+            "GPUCompletionCallback",
+            "GPUCommandFailed",
+            "MetalPresentedCallback",
         ];
         for (stage, name) in stages.into_iter().zip(names) {
             assert!(trace.record_at_ns(
@@ -426,6 +522,127 @@ mod tests {
             assert_eq!(row["source_event_serial"].as_u64(), Some(u64::MAX));
             assert!(row["window_id"].is_null());
         }
+    }
+
+    #[test]
+    fn frame_milestones_preserve_ids_window_and_queue_bound() {
+        let (trace, rx) = LatencyTrace::fast_for_test(2);
+        assert_eq!(
+            trace.record_frame_at_ns(Stage::DrawableAcquireStarted, 42, &[11, 12, 13], 8),
+            2
+        );
+        assert_eq!(trace.dropped_count(), 1);
+        for id in [11, 12] {
+            let row = serde_json::to_value(rx.try_recv().unwrap()).unwrap();
+            assert_eq!(row["stage"], "DrawableAcquireStarted");
+            assert_eq!(row["timestamp_ns"], 42);
+            assert_eq!(row["correlation_id"], id);
+            assert_eq!(row["window_id"], 8);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn acquire_end_does_not_require_a_successful_submission() {
+        let (trace, rx) = LatencyTrace::fast_for_test(2);
+        for (stage, timestamp) in [
+            (Stage::DrawableAcquireStarted, 10),
+            (Stage::DrawableAcquireFinished, 30),
+        ] {
+            assert_eq!(trace.record_frame_at_ns(stage, timestamp, &[11], 8), 1);
+        }
+        let rows: Vec<_> = rx.try_iter().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].timestamp_ns - rows[0].timestamp_ns, 20);
+        assert!(rows.iter().all(|row| row.stage != Stage::CPUSubmitted));
+    }
+
+    #[test]
+    fn gpu_api_times_and_callback_arrival_do_not_fake_presentation() {
+        let (trace, rx) = LatencyTrace::fast_for_test(4);
+        let tags = Tags {
+            correlation_id: Some(Tag::U64(11)),
+            window_id: Some(Tag::U64(8)),
+            ..Default::default()
+        };
+        assert!(trace.record_at_ns(Stage::GPUCompletionCallback, 2_000_000_000, tags));
+        assert!(trace.gpu_execution(1.0, 1.5, tags));
+        assert!(trace.record_at_ns(Stage::MetalPresentedCallback, 3_000_000_000, tags));
+        assert!(!trace.presented(0.0, tags));
+        let rows: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.stage, row.timestamp_ns))
+                .collect::<Vec<_>>(),
+            vec![
+                (Stage::GPUCompletionCallback, 2_000_000_000),
+                (Stage::GPUStarted, 1_000_000_000),
+                (Stage::GPUCompleted, 1_500_000_000),
+                (Stage::MetalPresentedCallback, 3_000_000_000),
+            ]
+        );
+        for row in rows {
+            let row = serde_json::to_value(row).unwrap();
+            assert_eq!(row["correlation_id"], 11);
+            assert_eq!(row["window_id"], 8);
+        }
+        assert_eq!(
+            trace.inner.as_ref().unwrap().counts.rejected.load(Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn unavailable_gpu_time_does_not_discard_the_other_api_timestamp() {
+        let (trace, rx) = LatencyTrace::fast_for_test(2);
+        assert!(!trace.gpu_execution(0.0, 1.0, Tags::default()));
+        assert!(!trace.gpu_execution(1.0, 0.0, Tags::default()));
+        let rows: Vec<_> = rx.try_iter().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].stage, Stage::GPUCompleted);
+        assert_eq!(rows[1].stage, Stage::GPUStarted);
+        assert!(rows.iter().all(|row| row.timestamp_ns == 1_000_000_000));
+        assert_eq!(
+            trace.inner.as_ref().unwrap().counts.rejected.load(Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn gpu_api_times_reject_zero_invalid_reversed_and_callback_substitutes() {
+        let (trace, rx) = LatencyTrace::fast_for_test(2);
+        for (start, end) in [
+            (0.0, 0.0),
+            (2.0, 1.0),
+            (-1.0, -1.0),
+            (f64::NAN, f64::NAN),
+            (f64::INFINITY, f64::INFINITY),
+            (u64::MAX as f64 / 1e9, u64::MAX as f64 / 1e9),
+        ] {
+            assert!(!trace.gpu_execution(start, end, Tags::default()));
+        }
+        for stage in [Stage::GPUStarted, Stage::GPUCompleted] {
+            assert!(!trace.record(stage, Tags::default()));
+            assert!(!trace.record_at_ns(stage, 0, Tags::default()));
+        }
+        assert_eq!(
+            trace.inner.as_ref().unwrap().counts.rejected.load(Relaxed),
+            15
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn disabled_metal_diagnostics_do_not_sample_or_queue() {
+        let trace = LatencyTrace::default();
+        assert!(!trace.record(Stage::GPUCompletionCallback, Tags::default()));
+        assert_eq!(
+            trace.record_frame_at_ns(Stage::DrawableAcquireStarted, 1, &[11], 8),
+            0
+        );
+        assert!(!trace.gpu_execution(f64::NAN, f64::NAN, Tags::default()));
+        assert!(!trace.presented(1.0, Tags::default()));
+        assert_eq!(trace.dropped_count(), 0);
     }
 
     #[test]

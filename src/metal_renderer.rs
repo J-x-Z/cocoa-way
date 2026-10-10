@@ -257,7 +257,28 @@ impl MetalRenderer {
         // Drop any leftover frame state from a previous incomplete frame.
         *frame_slot = None;
 
-        let Some(drawable) = (unsafe { self.layer.nextDrawable() }) else {
+        let acquire_started = (self.trace.enabled() && !self.trace_frames.borrow().is_empty())
+            .then(crate::latency_trace::now_ns);
+        let drawable = unsafe { self.layer.nextDrawable() };
+        if let Some(started) = acquire_started {
+            // Sample both boundaries before enqueueing, also when acquisition fails.
+            let finished = crate::latency_trace::now_ns();
+            let frames = self.trace_frames.borrow();
+            let window = u64::from(self.window.id());
+            self.trace.record_frame_at_ns(
+                crate::latency_trace::Stage::DrawableAcquireStarted,
+                started,
+                &frames,
+                window,
+            );
+            self.trace.record_frame_at_ns(
+                crate::latency_trace::Stage::DrawableAcquireFinished,
+                finished,
+                &frames,
+                window,
+            );
+        }
+        let Some(drawable) = drawable else {
             log::warn!("Metal: nextDrawable returned nil");
             return false;
         };
@@ -302,14 +323,67 @@ impl MetalRenderer {
         };
         unsafe {
             frame.encoder.endEncoding();
+            let compose_finished = (self.trace.enabled() && !self.trace_frames.borrow().is_empty())
+                .then(crate::latency_trace::now_ns);
             let traced_frames = std::mem::take(&mut *self.trace_frames.borrow_mut());
-            if self.trace.enabled() && !traced_frames.is_empty() {
-                let trace = self.trace.clone();
+            if let Some(finished) = compose_finished {
                 let window = u64::from(self.window.id());
+                self.trace.record_frame_at_ns(
+                    crate::latency_trace::Stage::ComposeFinished,
+                    finished,
+                    &traced_frames,
+                    window,
+                );
+                let trace = self.trace.clone();
+                let callback_frames = traced_frames.clone();
+                let completed = block2::RcBlock::new(
+                    move |command_buffer: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                        let arrived = crate::latency_trace::now_ns();
+                        let command_buffer = command_buffer.as_ref();
+                        trace.record_frame_at_ns(
+                            crate::latency_trace::Stage::GPUCompletionCallback,
+                            arrived,
+                            &callback_frames,
+                            window,
+                        );
+                        if command_buffer.status() == MTLCommandBufferStatus::Completed {
+                            let started = command_buffer.GPUStartTime();
+                            let finished = command_buffer.GPUEndTime();
+                            for &id in &callback_frames {
+                                trace.gpu_execution(
+                                    started,
+                                    finished,
+                                    crate::latency_trace::Tags {
+                                        correlation_id: Some(crate::latency_trace::Tag::U64(id)),
+                                        window_id: Some(crate::latency_trace::Tag::U64(window)),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                        } else {
+                            trace.record_frame_at_ns(
+                                crate::latency_trace::Stage::GPUCommandFailed,
+                                arrived,
+                                &callback_frames,
+                                window,
+                            );
+                        }
+                    },
+                );
+                // Metal copies the block; it owns only trace state and numeric IDs.
+                let () = objc2::msg_send![&*frame.command_buffer, addCompletedHandler: &*completed];
+                let trace = self.trace.clone();
                 let callback_frames = traced_frames.clone();
                 let block = block2::RcBlock::new(
                     move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                        let arrived = crate::latency_trace::now_ns();
                         let presented = drawable.as_ref().presentedTime();
+                        trace.record_frame_at_ns(
+                            crate::latency_trace::Stage::MetalPresentedCallback,
+                            arrived,
+                            &callback_frames,
+                            window,
+                        );
                         for id in &callback_frames {
                             trace.presented(
                                 presented,

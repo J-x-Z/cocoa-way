@@ -65,6 +65,9 @@ MAX_LINE_BYTES = 16_384
 MAX_CLOCK_BYTES = 16 * 1024 * 1024
 PROBE = "cocoa-way.input-latency-probe"
 STAGES = ("HostNativeInput", "Forwarded", "SurfaceCommit", "ComposeStarted", "CPUSubmitted", "MetalPresented")
+METAL_STAGES = ("DrawableAcquireStarted", "DrawableAcquireFinished", "ComposeFinished",
+                "GPUStarted", "GPUCompleted", "GPUCompletionCallback", "GPUCommandFailed",
+                "MetalPresentedCallback")
 HOST_FIELDS = set("schema kind session_id clock queue_capacity dropped rejected final stage timestamp_ns correlation_id source_event_serial source_event_time window_id probe_marker".split())
 GUEST_FIELDS = set(("schema probe tag pid record guest_monotonic_ns event event_sequence seat_global protocol_serial "
                     "forwarded_event_time_ms_opaque evdev_key evdev_code raw_state handler_start_ns receipt_ns "
@@ -467,10 +470,10 @@ def analyze(host, guest, clock, verified=False, tag=None, session=None):
     host = [r for r in host if r.get("session_id") == session]
     events = [r for r in host if r.get("kind") == "event"]
     for r in events:
-        if r.get("clock") != "host_ca" or r.get("stage") not in STAGES or not uint(r.get("timestamp_ns")):
+        if r.get("clock") != "host_ca" or r.get("stage") not in STAGES + METAL_STAGES or not uint(r.get("timestamp_ns")):
             raise ValueError("wrong Host stage/timestamp/clock")
-        if r["stage"] == "MetalPresented" and r["timestamp_ns"] == 0:
-            raise ValueError("zero is not actual Metal presentation")
+        if r["stage"] in ("MetalPresented", "GPUStarted", "GPUCompleted") and r["timestamp_ns"] == 0:
+            raise ValueError("zero is not a reported API timestamp")
     all_receipts = [r for r in guest if r.get("record") == "input_received"]
     inputs = [r for r in all_receipts if r.get("event") == "key"]
     handlers = [r for r in guest if r.get("record") == "input_handled" and r.get("event") == "key"]
@@ -799,6 +802,21 @@ class StaticTests(unittest.TestCase):
         self.assertEqual(r["metrics"]["guest_pre_commit_to_host_compose_started_frame"]["quantiles_ns"]["p50"],[50,70])
         self.assertEqual(r["metrics"]["guest_pre_commit_to_host_cpu_submitted_frame"]["quantiles_ns"]["p50"],[60,80])
         self.assertFalse(r["loss"]["host_final_stats_complete"])
+
+    def test_auxiliary_metal_events_do_not_extend_the_input_causal_chain(self):
+        h,g,c = self.fixture()
+        h.extend({"kind":"event", "session_id":"s", "stage":stage, "clock":"host_ca",
+                  "timestamp_ns":ns, "correlation_id":2}
+                 for stage, ns in [("DrawableAcquireStarted",1261),
+                                   ("DrawableAcquireFinished",1262),
+                                   ("GPUCompletionCallback",1290),
+                                   ("MetalPresentedCallback",1310)])
+        r = analyze(h,g,c,True)
+        self.assertEqual(r["metrics"]["host_observation_to_actual_metal_presented_single_cause"]["quantiles_ns"]["p99"],300)
+        h[:] = [row for row in h if row.get("stage") != "MetalPresented"]
+        r = analyze(h,g,c,True)
+        self.assertEqual(r["metrics"]["host_observation_to_actual_metal_presented_single_cause"]["n"],0)
+        self.assertIsNone(r["metrics"]["host_observation_to_actual_metal_presented_single_cause"]["quantiles_ns"])
 
     def test_explicit_clock_gate_and_boot_mismatch(self):
         h,g,c = self.fixture()

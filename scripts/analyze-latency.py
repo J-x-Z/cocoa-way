@@ -17,7 +17,7 @@ Missing final stats means drop/loss totals are unknown, not zero.
 Memory is bounded: retain the first --max-groups correlation groups and at most
 --max-sessions sessions; no eviction/reopening that could hide duplicates. Keep
 one compact event and a count per stage, including ALL later duplicates of kept
-groups. Exact percentile storage is bounded by 8 * max-groups samples. Capacity
+groups. Exact percentile storage is bounded by len(PAIRS) * max-groups samples. Capacity
 omissions are declared; this retained subset is NOT a random/all-frame sample.
 Repeated/coalesced SurfaceCommits are ALL unmatched to compose, never first/latest
 selected; compose/submit/present spans can still be verified independently.
@@ -37,11 +37,24 @@ STAGES = (
     "HostNativeInput", "Forwarded", "SurfaceCommit", "ComposeStarted",
     "CPUSubmitted", "MetalPresented",
 )
+METAL_STAGES = (
+    "DrawableAcquireStarted", "DrawableAcquireFinished", "ComposeFinished",
+    "GPUStarted", "GPUCompleted", "GPUCompletionCallback", "GPUCommandFailed",
+    "MetalPresentedCallback",
+)
+METAL_PAIRS = (
+    ("DrawableAcquireStarted", "DrawableAcquireFinished"),
+    ("DrawableAcquireFinished", "ComposeFinished"),
+    ("CPUSubmitted", "GPUStarted"),
+    ("GPUStarted", "GPUCompleted"),
+    ("CPUSubmitted", "GPUCompletionCallback"),
+    ("CPUSubmitted", "MetalPresentedCallback"),
+)
 PAIRS = tuple(zip(STAGES, STAGES[1:])) + (
     ("SurfaceCommit", "MetalPresented"),
     ("ComposeStarted", "MetalPresented"),
     ("HostNativeInput", "MetalPresented"),
-)
+) + METAL_PAIRS
 U64_MAX = (1 << 64) - 1
 MAX_LINE_BYTES = 16_384
 DEFAULT_MAX_GROUPS = 50_000
@@ -99,12 +112,12 @@ def analyze(lines, max_groups=DEFAULT_MAX_GROUPS, max_sessions=DEFAULT_MAX_SESSI
             elif kind == "event":
                 stage = row.get("stage")
                 clock = row.get("clock")
-                if stage not in STAGES or not is_u64(row.get("timestamp_ns")):
+                if stage not in STAGES + METAL_STAGES or not is_u64(row.get("timestamp_ns")):
                     raise ValueError("invalid stage/time")
                 if type(clock) is not str or not is_tag(clock):
                     raise ValueError("missing clock domain")
-                if stage == "MetalPresented" and row["timestamp_ns"] == 0:
-                    raise ValueError("not actually presented")
+                if stage in ("MetalPresented", "GPUStarted", "GPUCompleted") and row["timestamp_ns"] == 0:
+                    raise ValueError("reported API time unavailable")
                 for field in ("correlation_id", "window_id", "source_event_serial", "source_event_time"):
                     if row.get(field) is not None and not is_tag(row[field]):
                         raise ValueError("invalid tag")
@@ -156,14 +169,14 @@ def analyze(lines, max_groups=DEFAULT_MAX_GROUPS, max_sessions=DEFAULT_MAX_SESSI
     for group in groups.values():
         if group.get("SurfaceCommit", [0])[0] > 1:
             multiple_commit_groups += 1
-        for stage in STAGES:
+        for stage in STAGES + METAL_STAGES:
             if not group.get(stage):
                 missing[stage] += 1
             elif group[stage][0] > 1:
                 ambiguous[stage] += 1
         for pair in PAIRS:
             start, end = pair
-            span = STAGES[STAGES.index(start):STAGES.index(end) + 1]
+            span = pair if pair in METAL_PAIRS else STAGES[STAGES.index(start):STAGES.index(end) + 1]
             if any(not group.get(stage) for stage in span):
                 excluded[pair]["missing"] += 1
                 continue
@@ -212,7 +225,7 @@ def report(result):
     if result["untracked_records"]:
         print("Untracked sessions' drop totals and distinct session count are UNKNOWN.")
     print("Missing/ambiguous counts concern retained groups only; no_id means uncorrelated events.")
-    for stage in STAGES:
+    for stage in STAGES + METAL_STAGES:
         print(f"  {stage}: events={result['stages'][stage]} no_id={result['unmatched'][stage]} "
               f"capacity_unanalyzed={result['unanalyzed'][stage]} "
               f"missing={result['missing'][stage]} ambiguous={result['ambiguous'][stage]}")
@@ -229,6 +242,7 @@ def report(result):
     for (start, end), reasons in result["excluded"].items():
         print(f"  {start} -> {end}: " + (", ".join(f"{k}={v}" for k, v in sorted(reasons.items())) or "none"))
     print("Trace loss, missing stages and capacity-prefix selection can bias percentiles; not all-frame latency.")
+    print("GPU completion and presented-callback arrival are not actual presentation or photon timestamps.")
 
 
 def bounded_lines(stream):
@@ -341,6 +355,23 @@ class AnalysisTests(unittest.TestCase):
         rows = ["{", self.event("Bogus", 1), self.event("MetalPresented", 0),
                 self.event("Forwarded", -1), self.event("Forwarded", 1, True)]
         self.assertEqual(analyze(rows)["invalid"], 5)
+
+    def test_gpu_and_callback_times_do_not_imply_actual_presentation(self):
+        rows = [self.event("CPUSubmitted", 10), self.event("GPUStarted", 20),
+                self.event("GPUCompleted", 30), self.event("GPUCompletionCallback", 40),
+                self.event("MetalPresentedCallback", 50)]
+        result = analyze(rows)
+        self.assertEqual(result["invalid"], 0)
+        self.assertEqual(result["missing"]["MetalPresented"], 1)
+        self.assertTrue(result["metrics"])
+        self.assertFalse(any(end == "MetalPresented" for (_, _, end) in result["metrics"]))
+
+    def test_drawable_acquisition_without_submission_is_still_measurable(self):
+        result = analyze([self.event("DrawableAcquireStarted", 10),
+                          self.event("DrawableAcquireFinished", 30)])
+        self.assertEqual(result["invalid"], 0)
+        self.assertEqual(result["missing"]["CPUSubmitted"], 1)
+        self.assertEqual(len(result["metrics"]), 1)
 
 
 def main():
