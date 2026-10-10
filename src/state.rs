@@ -59,6 +59,7 @@ pub struct PendingFrameCallback {
     pub root_surface: Option<smithay::reexports::wayland_server::backend::ObjectId>,
     pub source_surface: WlSurface,
     pub callback: smithay::reexports::wayland_server::protocol::wl_callback::WlCallback,
+    pub trace_commit: Option<u64>,
 }
 
 pub struct AppState {
@@ -876,15 +877,12 @@ impl AppState {
         }
     }
 
-    pub fn take_frame_callbacks_for(
+    fn take_frame_callbacks_for(
         &mut self,
         root_surface: Option<&smithay::reexports::wayland_server::backend::ObjectId>,
-    ) -> Vec<smithay::reexports::wayland_server::protocol::wl_callback::WlCallback> {
+    ) -> Vec<PendingFrameCallback> {
         if root_surface.is_none() {
-            return std::mem::take(&mut self.pending_frame_callbacks)
-                .into_iter()
-                .map(|pending| pending.callback)
-                .collect();
+            return std::mem::take(&mut self.pending_frame_callbacks);
         }
 
         let mut selected = Vec::new();
@@ -898,13 +896,35 @@ impl AppState {
                     .flatten()
             });
             if resolved_root.as_ref() == root_surface {
-                selected.push(pending.callback);
+                selected.push(pending);
             } else {
                 remaining.push(pending);
             }
         }
         self.pending_frame_callbacks = remaining;
         selected
+    }
+
+    pub fn send_frame_callbacks_for(
+        &mut self,
+        root_surface: Option<&smithay::reexports::wayland_server::backend::ObjectId>,
+        time: u32,
+    ) {
+        let mut notified = std::collections::HashSet::new();
+        for pending in self.take_frame_callbacks_for(root_surface) {
+            pending.callback.done(time);
+            if let Some(id) = pending.trace_commit
+                && notified.insert(id)
+            {
+                self.latency_trace.record(
+                    crate::latency_trace::Stage::FrameCallbackDone,
+                    crate::latency_trace::Tags {
+                        correlation_id: Some(crate::latency_trace::Tag::U64(id)),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
     }
 
     pub fn poll_host_clipboard(&mut self) {
@@ -1142,25 +1162,34 @@ impl CompositorHandler for AppState {
         // Resolve the owner before walking the tree. Smithay holds its surface-tree
         // mutex during traversal, so calling get_parent from the visitor deadlocks.
         let root_surface = self.root_toplevel_id_for_surface(surface);
-        if self.latency_trace.enabled() {
+        let trace_commit = if self.latency_trace.enabled() {
             let id = crate::latency_trace::next_id();
+            let surface_id = format!("{:?}", surface.id());
+            let (probe_marker, commit_flags) =
+                smithay::wayland::compositor::with_states(surface, |states| {
+                    let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                    let current = attributes.current();
+                    let flags = u64::from(current.buffer.is_some())
+                        | (u64::from(!current.damage.is_empty()) << 1)
+                        | (u64::from(!current.frame_callbacks.is_empty()) << 2);
+                    let marker = match current.buffer.as_ref() {
+                        Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buffer)) => {
+                            crate::render::with_buffer_pixels(buffer, |width, _, _, pixels, _| {
+                                crate::probe_marker::decode(width, pixels)
+                            })
+                            .flatten()
+                        }
+                        _ => None,
+                    };
+                    (marker, flags)
+                });
             self.latency_trace.record(
                 crate::latency_trace::Stage::SurfaceCommit,
                 crate::latency_trace::Tags {
                     correlation_id: Some(crate::latency_trace::Tag::U64(id)),
-                    probe_marker: smithay::wayland::compositor::with_states(surface, |states| {
-                        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-                        match attributes.current().buffer.as_ref() {
-                            Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(
-                                buffer,
-                            )) => crate::render::with_buffer_pixels(
-                                buffer,
-                                |width, _, _, pixels, _| crate::probe_marker::decode(width, pixels),
-                            )
-                            .flatten(),
-                            _ => None,
-                        }
-                    }),
+                    probe_marker,
+                    surface_id: Some(crate::latency_trace::Tag::String(&surface_id)),
+                    commit_flags: Some(commit_flags),
                     ..Default::default()
                 },
             );
@@ -1169,7 +1198,10 @@ impl CompositorHandler for AppState {
                 // is carried through composition, never the latest input.
                 self.trace_frames.insert(root.clone(), id);
             }
-        }
+            Some(id)
+        } else {
+            None
+        };
         let mut new_cbs = Vec::new();
         let mut input_buffers = Vec::new();
         with_surface_tree_downward(
@@ -1198,6 +1230,11 @@ impl CompositorHandler for AppState {
                         root_surface: root_surface.clone(),
                         source_surface: callback_surface.clone(),
                         callback,
+                        // Child callbacks may originate in a different commit.
+                        // Leave them unmatched instead of inventing an association.
+                        trace_commit: (callback_surface == surface)
+                            .then_some(trace_commit)
+                            .flatten(),
                     }
                 }));
             },

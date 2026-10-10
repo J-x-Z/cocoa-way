@@ -67,7 +67,7 @@ PROBE = "cocoa-way.input-latency-probe"
 STAGES = ("HostNativeInput", "Forwarded", "SurfaceCommit", "ComposeStarted", "CPUSubmitted", "MetalPresented")
 METAL_STAGES = ("DrawableAcquireStarted", "DrawableAcquireFinished", "ComposeFinished",
                 "GPUStarted", "GPUCompleted", "GPUCompletionCallback", "GPUCommandFailed",
-                "MetalPresentedCallback")
+                "MetalPresentedCallback", "FrameCallbackDone")
 HOST_FIELDS = set("schema kind session_id clock queue_capacity dropped rejected final stage timestamp_ns correlation_id source_event_serial source_event_time window_id probe_marker".split())
 GUEST_FIELDS = set(("schema probe tag pid record guest_monotonic_ns event event_sequence seat_global protocol_serial "
                     "forwarded_event_time_ms_opaque evdev_key evdev_code raw_state handler_start_ns receipt_ns "

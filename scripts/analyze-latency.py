@@ -40,7 +40,7 @@ STAGES = (
 METAL_STAGES = (
     "DrawableAcquireStarted", "DrawableAcquireFinished", "ComposeFinished",
     "GPUStarted", "GPUCompleted", "GPUCompletionCallback", "GPUCommandFailed",
-    "MetalPresentedCallback",
+    "MetalPresentedCallback", "FrameCallbackDone",
 )
 METAL_PAIRS = (
     ("DrawableAcquireStarted", "DrawableAcquireFinished"),
@@ -49,6 +49,7 @@ METAL_PAIRS = (
     ("GPUStarted", "GPUCompleted"),
     ("CPUSubmitted", "GPUCompletionCallback"),
     ("CPUSubmitted", "MetalPresentedCallback"),
+    ("SurfaceCommit", "FrameCallbackDone"),
 )
 PAIRS = tuple(zip(STAGES, STAGES[1:])) + (
     ("SurfaceCommit", "MetalPresented"),
@@ -118,9 +119,11 @@ def analyze(lines, max_groups=DEFAULT_MAX_GROUPS, max_sessions=DEFAULT_MAX_SESSI
                     raise ValueError("missing clock domain")
                 if stage in ("MetalPresented", "GPUStarted", "GPUCompleted") and row["timestamp_ns"] == 0:
                     raise ValueError("reported API time unavailable")
-                for field in ("correlation_id", "window_id", "source_event_serial", "source_event_time"):
+                for field in ("correlation_id", "window_id", "source_event_serial", "source_event_time", "surface_id"):
                     if row.get(field) is not None and not is_tag(row[field]):
                         raise ValueError("invalid tag")
+                if row.get("commit_flags") is not None and (not is_u64(row["commit_flags"]) or row["commit_flags"] > 7):
+                    raise ValueError("invalid cached-work flags")
                 stages[stage] += 1
             elif kind not in ("session", "calibration"):
                 raise ValueError("unknown record kind")
@@ -372,6 +375,12 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(result["invalid"], 0)
         self.assertEqual(result["missing"]["CPUSubmitted"], 1)
         self.assertEqual(len(result["metrics"]), 1)
+
+    def test_callback_done_does_not_require_a_buffer_submission(self):
+        result = analyze([self.event("SurfaceCommit", 10), self.event("FrameCallbackDone", 20)])
+        self.assertEqual(result["invalid"], 0)
+        self.assertEqual(len(result["metrics"]), 1)
+        self.assertEqual(result["missing"]["CPUSubmitted"], 1)
 
 
 def main():

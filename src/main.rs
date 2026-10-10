@@ -5432,9 +5432,7 @@ fn create_event_handler(
                             perf_redraws = perf_redraws.saturating_add(1);
                             let callback_time = state.start_time.elapsed().as_millis() as u32;
                             let root_surface = rootless.surface_id();
-                            for callback in state.take_frame_callbacks_for(Some(&root_surface)) {
-                                callback.done(callback_time);
-                            }
+                            state.send_frame_callbacks_for(Some(&root_surface), callback_time);
                         } else {
                             state.rootless_dirty_surfaces.insert(rootless.surface_id());
                             state.needs_redraw = true;
@@ -5957,9 +5955,7 @@ fn create_event_handler(
                                 perf_redraws = perf_redraws.saturating_add(1);
                                 state.needs_redraw = false;
                                 let t = state.start_time.elapsed().as_millis() as u32;
-                                for cb in state.take_frame_callbacks_for(None) {
-                                    cb.done(t);
-                                }
+                                state.send_frame_callbacks_for(None, t);
                             } else {
                                 state.needs_redraw = true;
                                 failed_redraw_retries.insert(

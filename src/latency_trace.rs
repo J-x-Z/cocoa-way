@@ -106,6 +106,7 @@ pub enum Stage {
     GPUCompletionCallback,
     GPUCommandFailed,
     MetalPresentedCallback,
+    FrameCallbackDone,
 }
 
 impl Stage {
@@ -132,6 +133,10 @@ pub struct Tags<'a> {
     pub source_event_time: Option<Tag<'a>>,
     pub window_id: Option<Tag<'a>>,
     pub probe_marker: Option<[u8; 120]>,
+    pub surface_id: Option<Tag<'a>>,
+    /// Cached work at commit handling: bit 0 buffer, bit 1 damage, bit 2 callbacks.
+    /// This is not a complete visual-change classifier or raw protocol request log.
+    pub commit_flags: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +166,10 @@ struct Event {
     window_id: Option<OwnedTag>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe_marker: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    surface_id: Option<OwnedTag>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_flags: Option<u64>,
 }
 
 #[derive(Default)]
@@ -251,6 +260,7 @@ impl LatencyTrace {
             tags.source_event_serial,
             tags.source_event_time,
             tags.window_id,
+            tags.surface_id,
         ];
         if (stage.requires_reported_time() && timestamp_ns == 0)
             || values
@@ -270,6 +280,8 @@ impl LatencyTrace {
             source_event_time: tags.source_event_time.map(Into::into),
             window_id: tags.window_id.map(Into::into),
             probe_marker: tags.probe_marker.map(|marker| marker.to_vec()),
+            surface_id: tags.surface_id.map(Into::into),
+            commit_flags: tags.commit_flags,
         };
         if inner.tx.try_send(event).is_err() {
             inner.counts.dropped.fetch_add(1, Relaxed);
@@ -468,7 +480,7 @@ mod tests {
 
     #[test]
     fn json_stages_and_tag_types_are_valid() {
-        let (trace, rx) = LatencyTrace::fast_for_test(14);
+        let (trace, rx) = LatencyTrace::fast_for_test(15);
         let stages = [
             Stage::HostNativeInput,
             Stage::Forwarded,
@@ -484,6 +496,7 @@ mod tests {
             Stage::GPUCompletionCallback,
             Stage::GPUCommandFailed,
             Stage::MetalPresentedCallback,
+            Stage::FrameCallbackDone,
         ];
         let names = [
             "HostNativeInput",
@@ -500,6 +513,7 @@ mod tests {
             "GPUCompletionCallback",
             "GPUCommandFailed",
             "MetalPresentedCallback",
+            "FrameCallbackDone",
         ];
         for (stage, name) in stages.into_iter().zip(names) {
             assert!(trace.record_at_ns(
@@ -511,6 +525,8 @@ mod tests {
                     source_event_time: Some(Tag::String("native:1.25s")),
                     window_id: None,
                     probe_marker: None,
+                    surface_id: Some(Tag::String("wl_surface@1[0]")),
+                    commit_flags: Some(4),
                 }
             ));
             let mut bytes = Vec::new();
