@@ -598,16 +598,20 @@ where
 
 pub fn apple_publish_socket_supported(container: &Path, child_path: &str) -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        Command::new(container)
-            .env("PATH", child_path)
-            .args(["run", "--help"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains("--publish-socket"))
-            .unwrap_or(false)
-    })
+    if let Some(supported) = SUPPORTED.get() {
+        return *supported;
+    }
+    let mut command = Command::new(container);
+    command.env("PATH", child_path).args(["run", "--help"]);
+    let Ok(output) = command_output_with_timeout(command, Duration::from_secs(6)) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let supported = String::from_utf8_lossy(&output.stdout).contains("--publish-socket");
+    let _ = SUPPORTED.set(supported);
+    supported
 }
 
 fn relay_transport_host_socket(local_socket: &str) -> Result<String, String> {
@@ -1707,27 +1711,35 @@ fn runtime_container_is_running(
     child_path: &str,
     name: &str,
 ) -> bool {
+    let mut command = Command::new(binary);
+    command.env("PATH", child_path);
     match runtime_kind {
-        ContainerRuntime::Apple => Command::new(binary)
-            .env("PATH", child_path)
-            .args(["list", "--all"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| apple_container_list_has_running(&output.stdout, name))
-            .unwrap_or(false),
-        ContainerRuntime::Docker => Command::new(binary)
-            .env("PATH", child_path)
-            .args(["inspect", "-f", "{{.State.Running}}", name])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line.trim() == "true")
-            })
-            .unwrap_or(false),
+        ContainerRuntime::Apple => command_output_with_timeout(
+            {
+                command.args(["list", "--all"]);
+                command
+            },
+            Duration::from_secs(6),
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| apple_container_list_has_running(&output.stdout, name))
+        .unwrap_or(false),
+        ContainerRuntime::Docker => command_output_with_timeout(
+            {
+                command.args(["inspect", "-f", "{{.State.Running}}", name]);
+                command
+            },
+            Duration::from_secs(6),
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.trim() == "true")
+        })
+        .unwrap_or(false),
         ContainerRuntime::OrbStack => false,
     }
 }
@@ -1873,14 +1885,41 @@ fn validate_display_slot(session: &ContainerSession) -> Result<(), LaunchError> 
 }
 
 fn preflight_apple_container(runtime_binary: &Path, child_path: &str) -> Result<(), LaunchError> {
-    let output = Command::new(runtime_binary)
+    let mut command = Command::new(runtime_binary);
+    command
         .env("PATH", child_path)
-        .args(["system", "status"])
-        .output()
-        .map_err(|source| LaunchError::StartContainer {
-            session: "Apple Container status check".into(),
-            source,
-        })?;
+        .args(["system", "status", "--format", "json"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(6)).map_err(|error| {
+        LaunchError::RuntimeNotReady {
+            runtime: "Apple Container".into(),
+            hint: format!(
+                "System status check failed: {error}. Run `container system start` and retry."
+            ),
+        }
+    })?;
+    if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        crate::runtime_paths::remember_apple_container_status(&status);
+        if output.status.success()
+            && status.get("status").and_then(serde_json::Value::as_str) == Some("running")
+        {
+            return Ok(());
+        }
+        return Err(LaunchError::RuntimeNotReady {
+            runtime: "Apple Container".into(),
+            hint: "Run `container system start` and wait until the system reports running.".into(),
+        });
+    }
+    // Older CLI versions do not have structured system status.
+    let mut command = Command::new(runtime_binary);
+    command.env("PATH", child_path).args(["system", "status"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(6)).map_err(|error| {
+        LaunchError::RuntimeNotReady {
+            runtime: "Apple Container".into(),
+            hint: format!(
+                "System status check failed: {error}. Run `container system start` and retry."
+            ),
+        }
+    })?;
     if !output.status.success() {
         return Err(LaunchError::RuntimeNotReady {
             runtime: "Apple Container".into(),
@@ -1911,20 +1950,18 @@ fn inspect_image(
     image: &str,
     hint: &str,
 ) -> Result<(), LaunchError> {
-    match Command::new(runtime_binary)
-        .env("PATH", child_path)
-        .args(args)
-        .output()
-    {
+    let mut command = Command::new(runtime_binary);
+    command.env("PATH", child_path).args(args);
+    match command_output_with_timeout(command, Duration::from_secs(6)) {
         Ok(output) if output.status.success() => Ok(()),
         Ok(_) => Err(LaunchError::ImageUnavailable {
             runtime: runtime.into(),
             image: image.into(),
             hint: hint.into(),
         }),
-        Err(source) => Err(LaunchError::StartContainer {
-            session: format!("{} image check", runtime),
-            source,
+        Err(error) => Err(LaunchError::RuntimeNotReady {
+            runtime: runtime.into(),
+            hint: format!("Image inspection failed: {error}. Check the runtime service and retry."),
         }),
     }
 }
@@ -1937,10 +1974,19 @@ fn verify_gui_tools_in_image(
     runtime_label: &str,
     image: &str,
 ) -> Result<(), LaunchError> {
+    // Opening the panel can check many profiles at once. Only one probe VM may run at a time.
+    static PROBE_LOCK: Mutex<()> = Mutex::new(());
+    static PROBE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let _probe = PROBE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let run_probes = |probes: &[String]| {
+        let name = format!(
+            "cocoa-way-check-{}-{}",
+            std::process::id(),
+            PROBE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let mut cmd = Command::new(runtime_binary);
         cmd.env("PATH", child_path);
-        cmd.arg("run").arg("--rm");
+        cmd.args(["run", "--rm", "--name", &name]);
         for env in &session.env {
             cmd.arg("--env").arg(env);
         }
@@ -1956,7 +2002,12 @@ fn verify_gui_tools_in_image(
         );
         append_guest_command(&mut cmd, image, "sh");
         cmd.args(["-lc", &script]);
-        command_output_with_timeout(cmd, Duration::from_secs(60))
+        let result = command_output_with_timeout(cmd, Duration::from_secs(60));
+        if result.is_err() {
+            // Killing a CLI does not necessarily stop a VM owned by the runtime daemon.
+            cleanup_named_runtime_container(runtime, runtime_binary, child_path, &name);
+        }
+        result
     };
 
     let mut required_probes = vec!["command -v waypipe >/dev/null".to_string()];
@@ -2380,6 +2431,87 @@ fn spawn_waypipe_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mock_runtime(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("container");
+        std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, binary)
+    }
+
+    #[test]
+    fn apple_preflight_accepts_structured_status() {
+        let (_directory, binary) = mock_runtime("printf '%s\\n' '{\"status\":\"running\"}'");
+        assert!(preflight_apple_container(&binary, "/usr/bin:/bin").is_ok());
+    }
+
+    #[test]
+    fn apple_preflight_does_not_override_structured_stopped_status_with_legacy_text() {
+        let (_directory, binary) = mock_runtime(
+            "if [ \"$3\" = --format ]; then printf '%s\\n' '{\"status\":\"unregistered\"}'; exit 1; fi\nprintf 'status running\\n'",
+        );
+        assert!(matches!(
+            preflight_apple_container(&binary, "/usr/bin:/bin"),
+            Err(LaunchError::RuntimeNotReady { .. })
+        ));
+    }
+
+    #[test]
+    fn apple_preflight_supports_cli_without_json_status() {
+        let (_directory, binary) = mock_runtime(
+            "if [ \"$3\" = --format ]; then printf 'Unknown option --format\\n' >&2; exit 64; fi\nprintf 'status running\\n'",
+        );
+        assert!(preflight_apple_container(&binary, "/usr/bin:/bin").is_ok());
+    }
+
+    #[test]
+    fn failed_image_inspection_command_is_a_runtime_error() {
+        assert!(matches!(
+            inspect_image(
+                Path::new("/nonexistent/cocoa-way-test-runtime"),
+                "/usr/bin:/bin",
+                &["image", "inspect", "test:latest"],
+                "Apple Container",
+                "test:latest",
+                "Pull it first.",
+            ),
+            Err(LaunchError::RuntimeNotReady { .. })
+        ));
+    }
+
+    #[test]
+    fn simultaneous_image_checks_do_not_run_multiple_probe_vms() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = shell_single_quote(&directory.path().join("probe.lock").display().to_string());
+        let (_binary_directory, binary) = mock_runtime(&format!(
+            "mkdir {lock} || exit 1\nsleep 0.1\nrmdir {lock}\nprintf 'COCOA_WAY_IMAGE_PROBE_STARTED\\n'"
+        ));
+        let session: ContainerSession = toml::from_str(
+            "name = 'Probe'\nimage = 'test:latest'\ncommand = 'foot'\naudio = false",
+        )
+        .unwrap();
+        thread::scope(|scope| {
+            let handles = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        verify_gui_tools_in_image(
+                            &session,
+                            &binary,
+                            "/usr/bin:/bin",
+                            ContainerRuntime::Apple,
+                            "Apple Container",
+                            &session.image,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+    }
 
     #[test]
     fn dependency_probe_distinguishes_bootstrap_errors_from_missing_tools() {
