@@ -172,23 +172,8 @@ impl PointerAxisTracker {
             }
             MouseScrollDelta::PixelDelta(position) => {
                 let logical = position.to_logical::<f64>(scale_factor.max(f64::EPSILON));
-                // AppKit has already fully interpreted this gesture. When the
-                // flick warrants it, macOS produces the inertia itself and
-                // delivers it as a separate momentum phase of the same event,
-                // which arrives here as more pixel deltas.
-                //
-                // Reporting `AxisSource::Finger` would promise the opposite:
-                // that contract tells the client "I am adding no inertia, so
-                // compute the velocity and run your own kinetic scroll". The
-                // client then appends a second inertial phase on top of the
-                // macOS one, and the view keeps gliding after the user's
-                // fingers have stopped.
-                //
-                // `Continuous` is the source defined for "continuous
-                // coordinate space, but we may or may not know when it stops",
-                // which is exactly a host that arbitrates inertia itself. It
-                // keeps the fine-grained pixel deltas, unlike `Wheel`, which
-                // would quantise them into line steps.
+                // AppKit includes momentum in these deltas. Preserve it without inviting
+                // clients to add a second kinetic scroll for a raw Finger sequence.
                 let source = AxisSource::Continuous;
                 ((-logical.x, -logical.y), source, None)
             }
@@ -196,11 +181,8 @@ impl PointerAxisTracker {
 
         let horizontal_moved = axis.0 != 0.0;
         let vertical_moved = axis.1 != 0.0;
-        // `axis_stop` is only meaningful for `Finger`: it is the signal a
-        // client uses to end the kinetic scroll it was asked to run itself. No
-        // source we emit is `Finger` any more, so no stop is ever due. The
-        // bookkeeping below is kept because `PointerAxisTracker` also models
-        // the `Finger` case for callers that forward raw libinput-style input.
+        // Continuous/Wheel stops are optional in Wayland. The host momentum stream
+        // does not need synthetic stops; raw Finger input would still require them.
         let terminal = matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled);
         let stop = if source == AxisSource::Finger && terminal {
             (
@@ -1707,10 +1689,7 @@ mod pointer_axis_tests {
         assert_eq!(frame.v120, None);
     }
 
-    /// A trackpad gesture must not be advertised as `Finger`: that source tells
-    /// the client to run its own kinetic scroll, which double-applies the
-    /// inertia macOS has already produced. Regression test for the view
-    /// continuing to glide after the fingers stopped.
+    /// Preserve the host momentum stream without asking clients for another kinetic phase.
     #[test]
     fn trackpad_scrolls_are_not_advertised_as_finger() {
         let mut tracker = PointerAxisTracker::default();
@@ -1747,7 +1726,7 @@ mod pointer_axis_tests {
     }
 
     #[test]
-    fn zero_delta_end_stops_every_active_trackpad_axis() {
+    fn continuous_scroll_ends_without_synthetic_axis_stops() {
         let mut tracker = PointerAxisTracker::default();
         tracker.frame(
             1.0,
