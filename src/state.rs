@@ -172,12 +172,35 @@ impl PointerAxisTracker {
             }
             MouseScrollDelta::PixelDelta(position) => {
                 let logical = position.to_logical::<f64>(scale_factor.max(f64::EPSILON));
-                ((-logical.x, -logical.y), AxisSource::Finger, None)
+                // AppKit has already fully interpreted this gesture. When the
+                // flick warrants it, macOS produces the inertia itself and
+                // delivers it as a separate momentum phase of the same event,
+                // which arrives here as more pixel deltas.
+                //
+                // Reporting `AxisSource::Finger` would promise the opposite:
+                // that contract tells the client "I am adding no inertia, so
+                // compute the velocity and run your own kinetic scroll". The
+                // client then appends a second inertial phase on top of the
+                // macOS one, and the view keeps gliding after the user's
+                // fingers have stopped.
+                //
+                // `Continuous` is the source defined for "continuous
+                // coordinate space, but we may or may not know when it stops",
+                // which is exactly a host that arbitrates inertia itself. It
+                // keeps the fine-grained pixel deltas, unlike `Wheel`, which
+                // would quantise them into line steps.
+                let source = AxisSource::Continuous;
+                ((-logical.x, -logical.y), source, None)
             }
         };
 
         let horizontal_moved = axis.0 != 0.0;
         let vertical_moved = axis.1 != 0.0;
+        // `axis_stop` is only meaningful for `Finger`: it is the signal a
+        // client uses to end the kinetic scroll it was asked to run itself. No
+        // source we emit is `Finger` any more, so no stop is ever due. The
+        // bookkeeping below is kept because `PointerAxisTracker` also models
+        // the `Finger` case for callers that forward raw libinput-style input.
         let terminal = matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled);
         let stop = if source == AxisSource::Finger && terminal {
             (
@@ -1678,10 +1701,49 @@ mod pointer_axis_tests {
             )
             .expect("non-zero trackpad movement should produce a frame");
 
-        assert_eq!(frame.source, Some(AxisSource::Finger));
+        assert_eq!(frame.source, Some(AxisSource::Continuous));
         assert_eq!(frame.axis, (-6.0, 4.0));
         assert_eq!(frame.stop, (false, false));
         assert_eq!(frame.v120, None);
+    }
+
+    /// A trackpad gesture must not be advertised as `Finger`: that source tells
+    /// the client to run its own kinetic scroll, which double-applies the
+    /// inertia macOS has already produced. Regression test for the view
+    /// continuing to glide after the fingers stopped.
+    #[test]
+    fn trackpad_scrolls_are_not_advertised_as_finger() {
+        let mut tracker = PointerAxisTracker::default();
+        for phase in [TouchPhase::Started, TouchPhase::Moved, TouchPhase::Moved] {
+            let frame = tracker
+                .frame(
+                    2.0,
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 4.0)),
+                    phase,
+                    10,
+                )
+                .expect("non-zero trackpad movement should produce a frame");
+            assert_ne!(
+                frame.source,
+                Some(AxisSource::Finger),
+                "a gesture macOS may already be adding inertia to must not ask \
+                 the client to add its own"
+            );
+            assert_eq!(frame.source, Some(AxisSource::Continuous));
+        }
+
+        // The terminal frame carries no stop, because no kinetic scroll was
+        // delegated to the client that would need terminating.
+        let end = tracker.frame(
+            2.0,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+            TouchPhase::Ended,
+            11,
+        );
+        assert!(
+            end.is_none() || end.unwrap().stop == (false, false),
+            "a non-finger source must not emit axis_stop"
+        );
     }
 
     #[test]
@@ -1693,28 +1755,29 @@ mod pointer_axis_tests {
             TouchPhase::Started,
             10,
         );
-        let end = tracker
+        // Trackpad frames are `Continuous`, so the terminal frame carries no
+        // `axis_stop` (nothing was delegated to the client to terminate) and a
+        // zero-delta frame with nothing active is not worth sending at all.
+        let end = tracker.frame(
+            1.0,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+            TouchPhase::Ended,
+            11,
+        );
+        assert!(
+            end.is_none() || end.unwrap().stop == (false, false),
+            "a non-finger source must not emit axis_stop: {end:?}"
+        );
+        // Enough movement to be forwarded, still no stop.
+        let moved_end = tracker
             .frame(
                 1.0,
-                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 2.0)),
                 TouchPhase::Ended,
-                11,
+                12,
             )
-            .expect("the terminal frame must carry axis_stop");
-
-        assert_eq!(end.axis, (0.0, 0.0));
-        assert_eq!(end.stop, (true, true));
-        assert!(
-            tracker
-                .frame(
-                    1.0,
-                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
-                    TouchPhase::Ended,
-                    12,
-                )
-                .is_none(),
-            "a completed gesture must not leak active axes"
-        );
+            .expect("a terminal frame with movement is still forwarded");
+        assert_eq!(moved_end.stop, (false, false));
     }
 
     #[test]
