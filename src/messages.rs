@@ -22,6 +22,8 @@ pub enum CompositorMessage {
     RootlessBeginMove(smithay::reexports::wayland_server::backend::ObjectId),
     ShowDefaultDisplay,
     ToggleHiDpi,
+    ToggleDesktopBackground,
+    RestoreDesktopWindow,
     Connect(usize),
     ConnectMachine(crate::connections::Connection),
     ReloadMenu,

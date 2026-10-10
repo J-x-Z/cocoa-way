@@ -17,7 +17,9 @@ mod container_mode;
 mod container_sessions;
 mod control_api;
 mod control_protocol;
+mod desktop_background;
 mod diagnostics;
+mod display_link;
 mod event_loop_signal;
 mod frame_clock;
 mod input_policy;
@@ -3226,7 +3228,7 @@ fn pointer_owner_window<'a>(
     } else {
         rootless
             .get(&owner)
-            .map(|rootless| &rootless.renderer.window)
+            .map(|rootless| rootless.renderer.window.as_ref())
     }
 }
 
@@ -3677,6 +3679,11 @@ fn create_event_handler(
         .map_err(|error| format!("failed to create the Cocoa-Way window: {error}"))?;
     let mut renderer = metal_renderer::MetalRenderer::new(window)
         .map_err(|error| format!("failed to initialize Metal rendering: {error}"))?;
+    if !presentation_mode.is_rootless()
+        && std::env::var("COCOA_WAY_NATIVE_FRAME_SOURCE").as_deref() == Ok("1")
+    {
+        renderer.enable_native_frame_source();
+    }
     if let Err(error) = macos_gestures::install_swipe_recognizer(&renderer.window) {
         log::warn!("Three-finger swipe support is unavailable: {}", error);
     }
@@ -3789,6 +3796,7 @@ fn create_event_handler(
     )
     .map_err(|error| format!("failed to monitor Wayland readiness: {error}"))?;
     let mut hidpi_enabled = false;
+    let mut desktop_background = desktop_background::DesktopBackground::default();
 
     // Will be installed in Event::Resumed (after winit's applicationDidFinishLaunching)
     let connections_for_menu = connections::load_connections();
@@ -3942,10 +3950,26 @@ fn create_event_handler(
                     state.install_guest_clipboard(generation, pasteboard_change_count, payload);
                 }
                 CompositorMessage::Maximize(max) => {
+                    if desktop_background.is_active() {
+                        if let Err(error) = desktop_background.restore(&renderer.window) {
+                            log::warn!("Could not restore desktop role before maximizing: {error}");
+                            continue;
+                        }
+                        menu_bar::set_desktop_background_active(false);
+                    }
                     log::info!("Handling Maximize: {}", max);
                     renderer.window.set_maximized(max);
                 }
                 CompositorMessage::Fullscreen(full) => {
+                    if desktop_background.is_active() {
+                        if let Err(error) = desktop_background.restore(&renderer.window) {
+                            log::warn!(
+                                "Could not restore desktop role before full-screen: {error}"
+                            );
+                            continue;
+                        }
+                        menu_bar::set_desktop_background_active(false);
+                    }
                     log::info!("Handling Fullscreen: {}", full);
                     if full {
                         renderer
@@ -3957,8 +3981,49 @@ fn create_event_handler(
                 }
                 CompositorMessage::ShowDefaultDisplay => {
                     if display_worker_slot.is_none() {
+                        if let Err(error) = desktop_background.restore(&renderer.window) {
+                            log::warn!("Could not restore the desktop window: {error}");
+                        }
+                        menu_bar::set_desktop_background_active(desktop_background.is_active());
                         renderer.window.set_visible(true);
                         renderer.window.focus_window();
+                    }
+                }
+                CompositorMessage::ToggleDesktopBackground => {
+                    if !presentation_mode.is_rootless() {
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
+                        match desktop_background.toggle(&renderer.window) {
+                            Ok(active) => log::info!("Interactive desktop background: {active}"),
+                            Err(error) => log::warn!("Could not change desktop role: {error}"),
+                        }
+                        state.needs_redraw = true;
+                        renderer.request_redraw();
+                    } else {
+                        log::warn!("Desktop background is available only for desktop presentation");
+                    }
+                    menu_bar::set_desktop_background_active(desktop_background.is_active());
+                }
+                CompositorMessage::RestoreDesktopWindow => {
+                    retire_input_window(
+                        &mut state,
+                        &mut key_transitions,
+                        &renderer.window,
+                        start_time.elapsed().as_millis() as u32,
+                    );
+                    if let Err(error) = desktop_background.restore(&renderer.window) {
+                        log::warn!("Could not restore the desktop window: {error}");
+                    }
+                    menu_bar::set_desktop_background_active(desktop_background.is_active());
+                    if !presentation_mode.is_rootless() {
+                        renderer.window.set_visible(true);
+                        renderer.window.focus_window();
+                        state.needs_redraw = true;
+                        renderer.request_redraw();
                     }
                 }
                 CompositorMessage::RootlessToplevelCreated(surface_id) => {
@@ -5539,6 +5604,10 @@ fn create_event_handler(
                             &renderer.window,
                             start_time.elapsed().as_millis() as u32,
                         );
+                        if let Err(error) = desktop_background.restore(&renderer.window) {
+                            log::warn!("Could not restore desktop role before closing: {error}");
+                        }
+                        menu_bar::set_desktop_background_active(desktop_background.is_active());
                         if display_worker_slot.is_some() {
                             target.exit();
                         } else {
@@ -5720,6 +5789,21 @@ fn create_event_handler(
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
                         }
+                        if el_state == ElementState::Pressed {
+                            // Desktop-level windows can receive a click without becoming key.
+                            // Focus only in response to that click, never on render/timer activity.
+                            if desktop_background.is_active() && !renderer.window.has_focus() {
+                                renderer.window.focus_window();
+                            }
+                            if renderer.window.has_focus() {
+                                set_keyboard_owner(
+                                    &mut state,
+                                    &mut key_transitions,
+                                    Some(window_id),
+                                    start_time.elapsed().as_millis() as u32,
+                                );
+                            }
+                        }
                         log::info!("MouseInput: {:?} {:?}", button, el_state);
                         let serial = SERIAL_COUNTER.next_serial();
                         let pointer = state.seat.get_pointer().unwrap();
@@ -5818,7 +5902,7 @@ fn create_event_handler(
                             let size = renderer.window.inner_size();
                             (size.width, size.height)
                         };
-                        if width > 0 && height > 0 {
+                        if width > 0 && height > 0 && renderer.ready_for_redraw() {
                             desktop_clock.record_frame_started(std::time::Instant::now());
                             renderer.begin_trace_frame(state.take_trace_frames(None));
                             if width != renderer.width || height != renderer.height {
@@ -6112,7 +6196,12 @@ fn create_event_handler(
                     && renderer.height > 0
                 {
                     let has_work = state.needs_redraw || !state.pending_frame_callbacks.is_empty();
-                    if let Some(due) = desktop_clock.next_due(now, has_work) {
+                    let due = if renderer.uses_native_frame_source() {
+                        has_work.then_some(now)
+                    } else {
+                        desktop_clock.next_due(now, has_work)
+                    };
+                    if let Some(due) = due {
                         let due = failed_redraw_retries
                             .get(&renderer.window.id())
                             .map_or(due, |retry| due.max(*retry));
@@ -6159,7 +6248,26 @@ fn create_event_handler(
                     log::info!("macOS menu bar installed");
                 }
             }
+            Event::Suspended => {
+                if desktop_background.is_active() {
+                    retire_input_window(
+                        &mut state,
+                        &mut key_transitions,
+                        &renderer.window,
+                        start_time.elapsed().as_millis() as u32,
+                    );
+                    if let Err(error) = desktop_background.restore(&renderer.window) {
+                        log::warn!("Could not restore suspended desktop role: {error}");
+                    }
+                    menu_bar::set_desktop_background_active(desktop_background.is_active());
+                    renderer.window.set_visible(false);
+                }
+            }
             Event::LoopExiting => {
+                if let Err(error) = desktop_background.restore(&renderer.window) {
+                    log::warn!("Could not restore desktop role during shutdown: {error}");
+                }
+                menu_bar::set_desktop_background_active(desktop_background.is_active());
                 release_pointer_lock(&mut state, &renderer.window);
                 if let Some(writer) = trace_writer.take() {
                     std::thread::spawn(move || {

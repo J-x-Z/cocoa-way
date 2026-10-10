@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use winit::window::Window;
 
 // All three shaders share one vertex function; each has its own fragment function.
@@ -110,7 +111,7 @@ pub(crate) struct BufferDamage {
 }
 
 pub struct MetalRenderer {
-    pub window: Window,
+    pub window: Arc<Window>,
     pub width: u32,
     pub height: u32,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -125,10 +126,12 @@ pub struct MetalRenderer {
     texture_cache: RefCell<HashMap<ObjectId, CachedTexture>>,
     trace: crate::latency_trace::LatencyTrace,
     trace_frames: RefCell<Vec<u64>>,
+    native_frame_source: Option<crate::display_link::NativeFrameSource>,
 }
 
 impl MetalRenderer {
     pub fn new(window: Window) -> Result<Self, String> {
+        let window = Arc::new(window);
         unsafe {
             // ── 1. Get Metal device ──────────────────────────────────────────
             let device_ptr = MTLCreateSystemDefaultDevice();
@@ -205,12 +208,34 @@ impl MetalRenderer {
                 texture_cache: RefCell::new(HashMap::new()),
                 trace: crate::latency_trace::LatencyTrace::default(),
                 trace_frames: RefCell::new(Vec::new()),
+                native_frame_source: None,
             })
         }
     }
 
     pub fn set_trace(&mut self, trace: crate::latency_trace::LatencyTrace) {
         self.trace = trace;
+    }
+
+    pub fn enable_native_frame_source(&mut self) {
+        match crate::display_link::NativeFrameSource::new(&self.layer, self.window.clone()) {
+            Ok(Some(source)) => {
+                self.native_frame_source = Some(source);
+                log::info!("Experimental CAMetalDisplayLink frame source enabled");
+            }
+            Ok(None) => log::warn!("CAMetalDisplayLink unavailable; retaining window frame clock"),
+            Err(error) => log::warn!("Native frame source unavailable: {error}"),
+        }
+    }
+
+    pub fn uses_native_frame_source(&self) -> bool {
+        self.native_frame_source.is_some()
+    }
+
+    pub fn ready_for_redraw(&self) -> bool {
+        self.native_frame_source
+            .as_ref()
+            .is_none_or(|source| source.has_drawable())
     }
 
     pub fn begin_trace_frame(&self, frames: Vec<u64>) {
@@ -259,7 +284,10 @@ impl MetalRenderer {
 
         let acquire_started = (self.trace.enabled() && !self.trace_frames.borrow().is_empty())
             .then(crate::latency_trace::now_ns);
-        let drawable = unsafe { self.layer.nextDrawable() };
+        let drawable = match &self.native_frame_source {
+            Some(source) => source.take_drawable(),
+            None => unsafe { self.layer.nextDrawable() },
+        };
         if let Some(started) = acquire_started {
             // Sample both boundaries before enqueueing, also when acquisition fails.
             let finished = crate::latency_trace::now_ns();
@@ -422,7 +450,11 @@ impl MetalRenderer {
     }
 
     pub fn request_redraw(&self) {
-        self.window.request_redraw();
+        if let Some(source) = &self.native_frame_source {
+            source.request_frame();
+        } else {
+            self.window.request_redraw();
+        }
     }
 
     // ── Texture cache helpers ─────────────────────────────────────────────────

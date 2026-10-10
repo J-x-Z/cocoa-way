@@ -8,14 +8,14 @@
 //!   - separator
 //!   - saved connections from ~/.config/cocoa-way/connections.toml
 
-use std::sync::Mutex;
+use std::{cell::RefCell, sync::Mutex};
 
 use objc2::declare_class;
 use objc2::mutability::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{ClassType, DeclaredClass, msg_send, msg_send_id, sel};
-use objc2_app_kit::{NSAlert, NSApplication, NSImage, NSMenu, NSMenuItem};
+use objc2_app_kit::{NSAlert, NSApplication, NSEventModifierFlags, NSImage, NSMenu, NSMenuItem};
 use objc2_foundation::{MainThreadMarker, NSData, NSString};
 
 use crate::connections::Connection;
@@ -25,6 +25,35 @@ use crate::messages::CompositorMessage;
 
 // ── Global channel sender ─────────────────────────────────────────────────────
 static SENDER: Mutex<Option<Sender<CompositorMessage>>> = Mutex::new(None);
+
+#[derive(Default)]
+struct DesktopBackgroundMenuState {
+    active: bool,
+    item: Option<Retained<NSMenuItem>>,
+}
+
+thread_local! {
+    static DESKTOP_BACKGROUND_MENU: RefCell<DesktopBackgroundMenuState> =
+        RefCell::new(DesktopBackgroundMenuState::default());
+}
+
+/// Sync only after the event loop knows the actual mode state, including a
+/// cancelled/failed toggle or pre-close restore. Preserved across menu reloads.
+pub fn set_desktop_background_active(active: bool) {
+    if MainThreadMarker::new().is_none() {
+        log::error!("Desktop background menu state requires the AppKit main thread");
+        return;
+    }
+    DESKTOP_BACKGROUND_MENU.with(|state| {
+        let mut state = state.borrow_mut();
+        state.active = active;
+        if let Some(item) = state.item.as_ref() {
+            unsafe {
+                let _: () = msg_send![&**item, setState: isize::from(active)];
+            }
+        }
+    });
+}
 
 fn send(msg: CompositorMessage) {
     if let Ok(g) = SENDER.lock() {
@@ -84,6 +113,16 @@ declare_class!(
         #[method(showDefaultDisplay:)]
         fn show_default_display(&self, _sender: &AnyObject) {
             send(CompositorMessage::ShowDefaultDisplay);
+        }
+
+        #[method(toggleDesktopBackground:)]
+        fn toggle_desktop_background(&self, _sender: &AnyObject) {
+            send(CompositorMessage::ToggleDesktopBackground);
+        }
+
+        #[method(restoreDesktopWindow:)]
+        fn restore_desktop_window(&self, _sender: &AnyObject) {
+            send(CompositorMessage::RestoreDesktopWindow);
         }
 
         #[method(startContainerSession:)]
@@ -493,6 +532,34 @@ pub fn setup_menu(
         let _: () = msg_send![&*hidpi, setState: 0isize]; // unchecked: Normal 1x is default
         let _: () = msg_send![&*hidpi, setTarget: &*handler];
         view_menu.addItem(&hidpi);
+        view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let desktop_background = NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc::<NSMenuItem>(),
+            &NSString::from_str("Use Desktop Background (Experimental)"),
+            Some(sel!(toggleDesktopBackground:)),
+            &NSString::from_str(""),
+        );
+        let _: () = msg_send![&*desktop_background, setTarget: &*handler];
+        DESKTOP_BACKGROUND_MENU.with(|state| {
+            let mut state = state.borrow_mut();
+            let _: () = msg_send![&*desktop_background, setState: isize::from(state.active)];
+            state.item = Some(desktop_background.clone());
+        });
+        view_menu.addItem(&desktop_background);
+        let restore_desktop = NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc::<NSMenuItem>(),
+            &NSString::from_str("Restore Desktop Window"),
+            Some(sel!(restoreDesktopWindow:)),
+            &NSString::from_str("b"),
+        );
+        restore_desktop.setKeyEquivalentModifierMask(
+            NSEventModifierFlags::NSEventModifierFlagCommand
+                | NSEventModifierFlags::NSEventModifierFlagOption,
+        );
+        let _: () = msg_send![&*restore_desktop, setTarget: &*handler];
+        // Keep the escape action available even when desktop mode is off.
+        let _: () = msg_send![&*restore_desktop, setEnabled: true];
+        view_menu.addItem(&restore_desktop);
         view_item.setSubmenu(Some(&view_menu));
         root.addItem(&view_item);
 
