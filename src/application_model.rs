@@ -5,6 +5,7 @@ use serde::Serialize;
 pub enum ProfileStatus {
     Ready,
     Invalid,
+    Blocked,
 }
 
 impl ProfileStatus {
@@ -12,6 +13,7 @@ impl ProfileStatus {
         match self {
             Self::Ready => "Ready",
             Self::Invalid => "Invalid profile",
+            Self::Blocked => "Blocked",
         }
     }
 }

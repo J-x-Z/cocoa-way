@@ -2,9 +2,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::mpsc::Sender;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -442,7 +442,7 @@ fn runtimes_snapshot() -> Value {
             .collect::<Vec<_>>(),
         "apple_container": {
             "cli": command_probe("container", &["--version"], &child_path),
-            "system": command_probe("container", &["system", "status"], &child_path),
+            "system": command_probe("container", &["system", "status", "--format", "json"], &child_path),
         },
         "docker_compatible": {
             "cli": command_probe("docker", &["--version"], &child_path),
@@ -474,7 +474,7 @@ fn environment_snapshot(path: &Path) -> Value {
         },
         "commands": {
             "apple_container": command_probe("container", &["--version"], &child_path),
-            "apple_container_system": command_probe("container", &["system", "status"], &child_path),
+            "apple_container_system": command_probe("container", &["system", "status", "--format", "json"], &child_path),
             "waypipe": command_probe("waypipe", &["--version"], &child_path),
             "docker": command_probe("docker", &["--version"], &child_path),
             "orbstack": command_probe("orbctl", &["version"], &child_path),
@@ -588,14 +588,19 @@ fn command_snapshot(command: &str, args: &[&str], child_path: &str) -> Value {
         return json!({ "available": false, "error": format!("{command} command not found") });
     };
     match run_command(&path, args, child_path, Duration::from_secs(3)) {
-        Ok(output) => json!({
-            "available": true,
-            "success": output.status.success(),
-            "stdout": String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
-            "stderr": String::from_utf8_lossy(&output.stderr).lines().collect::<Vec<_>>(),
-        }),
+        Ok(output) => command_output_snapshot(&output),
         Err(error) => json!({ "available": true, "success": false, "error": error }),
     }
+}
+
+fn command_output_snapshot(output: &Output) -> Value {
+    json!({
+        "available": true,
+        "success": output.status.success(),
+        "data": serde_json::from_slice::<Value>(&output.stdout).ok(),
+        "stdout": String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        "stderr": String::from_utf8_lossy(&output.stderr).lines().collect::<Vec<_>>(),
+    })
 }
 
 fn run_command(
@@ -604,32 +609,29 @@ fn run_command(
     child_path: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
-    let mut child = Command::new(path)
-        .env("PATH", child_path)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("command timed out after {}ms", timeout.as_millis()));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
+    let mut command = Command::new(path);
+    command.env("PATH", child_path).args(args);
+    crate::runtime_commands::capture(command, timeout).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn structured_command_data_is_preserved_even_when_the_service_is_stopped() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: br#"{"status":"not running","paths":{"appRoot":"/tmp/container"}}"#.to_vec(),
+            stderr: Vec::new(),
+        };
+        let snapshot = command_output_snapshot(&output);
+        assert_eq!(snapshot["success"], false);
+        assert_eq!(snapshot["data"]["status"], "not running");
+        assert_eq!(snapshot["stdout"].as_array().unwrap().len(), 1);
+    }
 
     #[test]
     fn control_socket_is_private_to_the_runtime_directory() {

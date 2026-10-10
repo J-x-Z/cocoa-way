@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::{LazyLock, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::runtime_paths::{build_child_path, find_command_path};
+use crate::runtime_paths::{apple_container_data_root, build_child_path, find_command_path};
 
 const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
@@ -212,7 +212,6 @@ fn sample_resources(
     sample_started: Instant,
 ) -> ResourceSnapshot {
     let child_path = build_child_path();
-    let disk_available_bytes = available_disk_bytes();
     let Some(container) = find_command_path("container", &child_path) else {
         return ResourceSnapshot {
             available: false,
@@ -222,9 +221,27 @@ fn sample_resources(
             total_cpu_percent: None,
             total_memory_usage_bytes: 0,
             total_memory_limit_bytes: 0,
-            disk_available_bytes,
+            disk_available_bytes: available_disk_bytes(),
         };
     };
+    if let Ok(output) = run_command(
+        &container,
+        &["system", "status", "--format", "json"],
+        &child_path,
+        COMMAND_TIMEOUT,
+    ) && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+    {
+        crate::runtime_paths::remember_apple_container_status(&status);
+        if let Some(state) = status.get("status").and_then(serde_json::Value::as_str)
+            && state != "running"
+        {
+            return resource_error(
+                &format!("Apple Container service is {state}; start it from Runtimes."),
+                available_disk_bytes(),
+            );
+        }
+    }
+    let disk_available_bytes = available_disk_bytes();
     let output = match run_command(
         &container,
         &["stats", "--no-stream", "--format", "json"],
@@ -354,26 +371,9 @@ fn run_command(
     child_path: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
-    let mut child = Command::new(path)
-        .env("PATH", child_path)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{} timed out", path.display()));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
+    let mut command = Command::new(path);
+    command.env("PATH", child_path).args(args);
+    crate::runtime_commands::capture(command, timeout).map_err(|error| error.to_string())
 }
 
 fn filesystem_available_bytes(path: &Path) -> Option<u64> {
@@ -384,13 +384,6 @@ fn filesystem_available_bytes(path: &Path) -> Option<u64> {
     }
     let stats = unsafe { stats.assume_init() };
     Some((stats.f_bavail as u64).saturating_mul(stats.f_bsize as u64))
-}
-
-fn apple_container_data_root() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/Users"))
-        .join("Library/Application Support/com.apple.container")
 }
 
 fn unix_time_ms() -> u128 {

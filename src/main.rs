@@ -28,6 +28,7 @@ mod metal_renderer;
 mod network;
 mod presentation;
 mod render;
+mod runtime_commands;
 mod runtime_paths;
 mod state;
 
@@ -1067,8 +1068,9 @@ fn complete_container_session_launch(
 }
 
 fn container_data_root() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".into());
-    format!("{}/Library/Application Support/com.apple.container", home)
+    runtime_paths::apple_container_data_root()
+        .display()
+        .to_string()
 }
 
 fn available_disk_gib(path: &str) -> Option<f64> {
@@ -2495,37 +2497,12 @@ fn runtime_detail_output(
     timeout: std::time::Duration,
     max_lines: usize,
 ) -> (Vec<String>, Option<String>) {
-    let mut child = match std::process::Command::new(command)
-        .env("PATH", child_path)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => return (Vec::new(), Some(error.to_string())),
-    };
-    let deadline = std::time::Instant::now() + timeout;
-    let output = loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break child.wait_with_output().map_err(|error| error.to_string()),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(40));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return (
-                    Vec::new(),
-                    Some(format!("command timed out after {}ms", timeout.as_millis())),
-                );
-            }
-            Err(error) => return (Vec::new(), Some(error.to_string())),
-        }
-    };
+    let mut process = std::process::Command::new(command);
+    process.env("PATH", child_path).args(args);
+    let output = runtime_commands::capture(process, timeout);
     let output = match output {
         Ok(output) => output,
-        Err(error) => return (Vec::new(), Some(error)),
+        Err(error) => return (Vec::new(), Some(error.to_string())),
     };
     let mut lines = if args.first().is_some_and(|arg| arg == "inspect") {
         apple_inspect_summary(&output.stdout).unwrap_or_default()

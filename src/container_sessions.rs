@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::network::{HostProxyBridge, has_proxy_environment};
+use crate::runtime_commands::CommandError as RuntimeCommandError;
 use crate::runtime_paths::{build_child_path, resolve_command_path, shell_single_quote};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -358,9 +359,8 @@ fn run_stdio_relay(
     for arg in relay_env_list(RELAY_RUNTIME_ARGS_ENV) {
         cmd.arg(arg);
     }
-    cmd.arg(image)
-        .arg("perl")
-        .arg("-e")
+    append_guest_command(&mut cmd, image, "perl");
+    cmd.arg("-e")
         .arg(guest_relay_perl())
         .arg(&relay.remote_socket)
         .args(&relay.remote_command);
@@ -453,9 +453,8 @@ fn run_publish_socket_relay(
     for arg in relay_env_list(RELAY_RUNTIME_ARGS_ENV) {
         cmd.arg(arg);
     }
-    cmd.arg(image)
-        .arg("perl")
-        .arg("-e")
+    append_guest_command(&mut cmd, image, "perl");
+    cmd.arg("-e")
         .arg(guest_publish_socket_relay_perl())
         .arg(&relay.remote_socket)
         .arg(&guest_transport)
@@ -1511,14 +1510,13 @@ pub fn launch_checked_session(
             for arg in &session.runtime_args {
                 cmd.arg(arg);
             }
-            cmd.arg("-v")
-                .arg(format!(
-                    "{}:{}",
-                    socket_parent.display(),
-                    socket_parent.display()
-                ))
-                .arg(&session.image)
-                .args(["sh", "-lc", &server_command]);
+            cmd.arg("-v").arg(format!(
+                "{}:{}",
+                socket_parent.display(),
+                socket_parent.display()
+            ));
+            append_guest_command(&mut cmd, &session.image, "sh");
+            cmd.args(["-lc", &server_command]);
         }
     }
 
@@ -1683,45 +1681,11 @@ fn cleanup_named_runtime_container(
     }
 }
 
-enum RuntimeCommandError {
-    Io(std::io::Error),
-    TimedOut,
-}
-
 fn command_output_with_timeout(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
 ) -> Result<Output, RuntimeCommandError> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(RuntimeCommandError::Io)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().map_err(RuntimeCommandError::Io)? {
-            Some(status) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    pipe.read_to_end(&mut stdout)
-                        .map_err(RuntimeCommandError::Io)?;
-                }
-                if let Some(mut pipe) = child.stderr.take() {
-                    pipe.read_to_end(&mut stderr)
-                        .map_err(RuntimeCommandError::Io)?;
-                }
-                return Ok(Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RuntimeCommandError::TimedOut);
-            }
-            None => thread::sleep(Duration::from_millis(100)),
-        }
-    }
+    crate::runtime_commands::capture(command, timeout)
 }
 
 fn runtime_output_message(output: &[u8]) -> Option<String> {
@@ -1986,9 +1950,13 @@ fn verify_gui_tools_in_image(
         for arg in &session.runtime_args {
             cmd.arg(arg);
         }
-        let script = probes.join(" && ");
-        cmd.args([image, "sh", "-lc", &script]);
-        cmd.output()
+        let script = format!(
+            "printf '%s\\n' COCOA_WAY_IMAGE_PROBE_STARTED; {}",
+            probes.join(" && ")
+        );
+        append_guest_command(&mut cmd, image, "sh");
+        cmd.args(["-lc", &script]);
+        command_output_with_timeout(cmd, Duration::from_secs(60))
     };
 
     let mut required_probes = vec!["command -v waypipe >/dev/null".to_string()];
@@ -2002,47 +1970,78 @@ fn verify_gui_tools_in_image(
         ));
     }
 
-    match run_probes(&required_probes) {
-        Ok(output) if output.status.success() => {}
-        Ok(_) => {
-            return Err(LaunchError::ImageNotGuiReady {
-            runtime: runtime_label.into(),
-            image: image.into(),
-            hint: "Install waypipe, Apple relay dependencies, and the configured GUI command in the image, then rebuild/tag it for Cocoa-Way.".into(),
-            });
-        }
-        Err(source) => {
-            return Err(LaunchError::StartContainer {
-                session: format!("{} GUI readiness check", runtime_label),
-                source,
-            });
-        }
+    let audio_probe = matches!(runtime, ContainerRuntime::Apple) && session.audio;
+    const AUDIO_READY: &str = "COCOA_WAY_AUDIO_TOOLS_READY";
+    if audio_probe {
+        let tools = [
+            "cocoa-way-audio-relay",
+            "pipewire",
+            "pipewire-pulse",
+            "wireplumber",
+            "pactl",
+            "parec",
+        ];
+        let probe = tools
+            .iter()
+            .map(|tool| format!("command -v {tool} >/dev/null"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        required_probes.push(format!("if {probe}; then printf '%s\\n' {AUDIO_READY}; fi"));
     }
 
-    if matches!(runtime, ContainerRuntime::Apple) && session.audio {
-        let audio_probes = [
-            "command -v cocoa-way-audio-relay >/dev/null".into(),
-            "command -v pipewire >/dev/null".into(),
-            "command -v pipewire-pulse >/dev/null".into(),
-            "command -v wireplumber >/dev/null".into(),
-            "command -v pactl >/dev/null".into(),
-            "command -v parec >/dev/null".into(),
-        ];
-        match run_probes(&audio_probes) {
-            Ok(output) if output.status.success() => {}
-            Ok(_) => log::warn!(
-                "Apple Container image '{}' has no complete Cocoa-Way audio stack; GUI launch will continue without audio",
-                image
-            ),
-            Err(source) => log::warn!(
-                "Could not inspect optional audio tools in Apple Container image '{}': {}",
-                image,
-                source
-            ),
+    match run_probes(&required_probes) {
+        Ok(output) if output.status.success() => {
+            if audio_probe
+                && !String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == AUDIO_READY)
+            {
+                log::warn!(
+                    "Apple Container image '{}' has no complete Cocoa-Way audio stack; GUI launch will continue without audio",
+                    image
+                );
+            }
+        }
+        Ok(output) => return Err(image_probe_failure(runtime_label, image, &output)),
+        Err(error) => {
+            return Err(LaunchError::RuntimeNotReady {
+                runtime: runtime_label.into(),
+                hint: format!(
+                    "Image '{}' dependency check failed: {}. Check runtime status and initial kernel/init-image downloads, then retry before rebuilding the image.",
+                    image, error
+                ),
+            });
         }
     }
 
     Ok(())
+}
+
+fn append_guest_command(command: &mut Command, image: &str, program: &str) {
+    command.args(["--entrypoint", program, image]);
+}
+
+fn image_probe_failure(runtime: &str, image: &str, output: &Output) -> LaunchError {
+    let guest_started = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line == "COCOA_WAY_IMAGE_PROBE_STARTED");
+    if guest_started {
+        LaunchError::ImageNotGuiReady {
+            runtime: runtime.into(),
+            image: image.into(),
+            hint: "Install waypipe, Apple relay dependencies, and the configured GUI command in the image, then rebuild/tag it for Cocoa-Way.".into(),
+        }
+    } else {
+        let detail = runtime_output_message(&output.stderr)
+            .or_else(|| runtime_output_message(&output.stdout))
+            .unwrap_or_else(|| format!("runtime exited with {}", output.status));
+        LaunchError::RuntimeNotReady {
+            runtime: runtime.into(),
+            hint: format!(
+                "Image '{image}' could not start its dependency check: {detail}. Check runtime status and initial kernel/init-image downloads before rebuilding the image."
+            ),
+        }
+    }
 }
 
 fn runtime_binary_name(runtime: &str) -> &str {
@@ -2381,6 +2380,44 @@ fn spawn_waypipe_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_probe_distinguishes_bootstrap_errors_from_missing_tools() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut output = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"Error: init-image download failed".to_vec(),
+        };
+        assert!(matches!(
+            image_probe_failure("Apple Container", "gui:latest", &output),
+            LaunchError::RuntimeNotReady { .. }
+        ));
+        output.stdout = b"COCOA_WAY_IMAGE_PROBE_STARTED\n".to_vec();
+        assert!(matches!(
+            image_probe_failure("Apple Container", "gui:latest", &output),
+            LaunchError::ImageNotGuiReady { .. }
+        ));
+    }
+
+    #[test]
+    fn guest_command_overrides_an_images_entrypoint() {
+        let mut command = Command::new("container");
+        command.arg("run");
+        append_guest_command(&mut command, "custom/gui:latest", "perl");
+        command.args(["-e", "relay"]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "run",
+                "--entrypoint",
+                "perl",
+                "custom/gui:latest",
+                "-e",
+                "relay"
+            ]
+        );
+    }
 
     #[test]
     fn slugify_keeps_container_names_stable() {

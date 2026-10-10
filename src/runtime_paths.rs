@@ -1,7 +1,34 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 const XKB_CONFIG_ROOT_ENV: &str = "XKB_CONFIG_ROOT";
+
+static APPLE_DATA_ROOT: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+
+pub(crate) fn remember_apple_container_status(status: &serde_json::Value) {
+    if let Some(path) = apple_data_root_from_status(status) {
+        *APPLE_DATA_ROOT.lock().unwrap() = Some(path);
+    }
+}
+
+pub(crate) fn apple_container_data_root() -> PathBuf {
+    APPLE_DATA_ROOT.lock().unwrap().clone().unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users"))
+            .join("Library/Application Support/com.apple.container")
+    })
+}
+
+fn apple_data_root_from_status(status: &serde_json::Value) -> Option<PathBuf> {
+    status
+        .pointer("/paths/appRoot")
+        .or_else(|| status.get("appRoot"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
 
 pub(crate) fn configure_xkb_config_root() -> Result<PathBuf, String> {
     let configured = std::env::var_os(XKB_CONFIG_ROOT_ENV).map(PathBuf::from);
@@ -194,6 +221,26 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_storage_paths_from_current_and_legacy_status() {
+        for status in [
+            serde_json::json!({"paths": {"appRoot": "/Volumes/Data/container"}}),
+            serde_json::json!({"appRoot": "/Volumes/Data/container"}),
+        ] {
+            assert_eq!(
+                apple_data_root_from_status(&status),
+                Some(PathBuf::from("/Volumes/Data/container"))
+            );
+        }
+        assert!(
+            apple_data_root_from_status(&serde_json::json!({"paths": {"appRoot": "relative"}}))
+                .is_none()
+        );
+        assert!(
+            apple_data_root_from_status(&serde_json::json!({"status": "unregistered"})).is_none()
+        );
+    }
 
     #[test]
     fn resolves_xkb_data_next_to_an_app_executable() {

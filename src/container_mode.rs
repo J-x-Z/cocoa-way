@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -1436,7 +1436,8 @@ fn state_from_legacy_label(label: &str) -> (ProfileStatus, Option<InstanceStatus
         "Running" => (ProfileStatus::Ready, Some(InstanceStatus::Running)),
         "Stopping" => (ProfileStatus::Ready, Some(InstanceStatus::Stopping)),
         "Stopped" | "Exited" => (ProfileStatus::Ready, Some(InstanceStatus::Exited)),
-        "Error" | "Blocked" | "Failed" => (ProfileStatus::Invalid, Some(InstanceStatus::Failed)),
+        "Blocked" => (ProfileStatus::Blocked, None),
+        "Error" | "Failed" => (ProfileStatus::Invalid, Some(InstanceStatus::Failed)),
         _ => (ProfileStatus::Ready, None),
     }
 }
@@ -1628,11 +1629,10 @@ pub fn record_check_failure(index: usize, error: &container_sessions::LaunchErro
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let detail = format!("{} check failed: {}", name, error);
-    *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-    *SELECTED_SESSION.lock().unwrap() = Some(index);
+    let profile_status = check_failure_profile_status(error);
     let label = if error.is_container_already_running() {
         "Running"
-    } else if error.is_unsupported_display() {
+    } else if profile_status == ProfileStatus::Blocked {
         "Blocked"
     } else {
         "Error"
@@ -1644,7 +1644,7 @@ pub fn record_check_failure(index: usize, error: &container_sessions::LaunchErro
         .iter_mut()
         .find(|(stored, _)| *stored == index)
     {
-        state.profile = ProfileStatus::Invalid;
+        state.profile = profile_status;
         state.instance = None;
         state.failed_step = Some(LaunchStep::ValidateProfile);
     }
@@ -1655,6 +1655,20 @@ pub fn record_check_failure(index: usize, error: &container_sessions::LaunchErro
     push_activity(detail);
     unsafe {
         rebuild_window();
+    }
+}
+
+fn check_failure_profile_status(error: &container_sessions::LaunchError) -> ProfileStatus {
+    if error.is_unsupported_display()
+        || matches!(
+            error,
+            container_sessions::LaunchError::RuntimeNotReady { .. }
+                | container_sessions::LaunchError::ContainerAlreadyRunning { .. }
+        )
+    {
+        ProfileStatus::Blocked
+    } else {
+        ProfileStatus::Invalid
     }
 }
 
@@ -1669,7 +1683,7 @@ pub fn record_launch_failure(index: usize, error: &container_sessions::LaunchErr
     *SELECTED_SESSION.lock().unwrap() = Some(index);
     let label = if error.is_container_already_running() {
         "Running"
-    } else if error.is_unsupported_display() {
+    } else if check_failure_profile_status(error) == ProfileStatus::Blocked {
         "Blocked"
     } else {
         "Error"
@@ -2578,6 +2592,216 @@ unsafe fn show_raw_session_profile(index: usize) {
         let _: () = msg_send![&*alert, layout];
         let _: isize = msg_send![&*alert, runModal];
     }
+}
+
+unsafe fn show_session_resources_dialog(index: usize) {
+    let sessions = container_sessions::load_sessions();
+    let Some(mut session) = sessions.get(index).cloned() else {
+        show_error_alert("Application profile no longer exists.");
+        return;
+    };
+    if matches!(session.runtime.as_str(), "orb" | "orbstack") {
+        show_error_alert(
+            "Configure Linux machine resources in OrbStack. Docker containers can use this resource editor.",
+        );
+        return;
+    }
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
+    unsafe {
+        let _: () =
+            msg_send![&*alert, setMessageText: &*NSString::from_str("Application Resources")];
+        let _: () = msg_send![&*alert, setInformativeText:
+            &*NSString::from_str("Saved for the next launch. Empty fields use runtime defaults; unrelated runtime arguments are preserved.")];
+    }
+    let view: Retained<NSView> =
+        unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 420.0, 250.0)] };
+    let mut fields = Vec::new();
+    for (row, (label, flag, placeholder)) in [
+        ("CPUs", "--cpus", "4"),
+        ("Memory", "--memory", "4G"),
+        ("Shared memory", "--shm-size", "512M"),
+        ("Platform", "--platform", "linux/arm64 or linux/amd64"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let y = 215.0 - row as f64 * 40.0;
+        add_label(
+            &view,
+            label,
+            rect(0.0, y + 5.0, 116.0, 18.0),
+            mtm,
+            TextStyle::Caption,
+        );
+        fields.push(add_text_field(
+            &view,
+            rect(116.0, y, 304.0, 26.0),
+            placeholder,
+            &resource_arg_value(&session.runtime_args, flag, &session.runtime).unwrap_or_default(),
+            mtm,
+        ));
+    }
+    add_label(
+        &view,
+        "Rosetta",
+        rect(0.0, 60.0, 116.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    let rosetta = add_popup(
+        &view,
+        rect(116.0, 55.0, 304.0, 28.0),
+        &["Off", "On (Apple Container only)"],
+        usize::from(session.runtime_args.iter().any(|arg| arg == "--rosetta")),
+        mtm,
+    );
+    add_label(
+        &view,
+        "Rosetta translates x86 CPU instructions; it does not provide GPU acceleration.",
+        rect(0.0, 0.0, 420.0, 38.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    unsafe {
+        let _: () = msg_send![&*alert, setAccessoryView: &*view];
+        let _: Retained<NSObject> =
+            msg_send_id![&*alert, addButtonWithTitle: &*NSString::from_str("Save")];
+        let _: Retained<NSObject> =
+            msg_send_id![&*alert, addButtonWithTitle: &*NSString::from_str("Cancel")];
+        let _: () = msg_send![&*alert, layout];
+    }
+    let response: isize = unsafe { msg_send![&*alert, runModal] };
+    if response != 1000 {
+        return;
+    }
+    let values = fields
+        .iter()
+        .map(|field| field_string(field))
+        .collect::<Vec<_>>();
+    match configured_resource_args(
+        &session.runtime_args,
+        &session.runtime,
+        [&values[0], &values[1], &values[2], &values[3]],
+        popup_index(&rosetta) == 1,
+    ) {
+        Ok(arguments) => session.runtime_args = arguments,
+        Err(error) => {
+            show_error_alert(&error);
+            return;
+        }
+    }
+    match container_sessions::replace_session(index, &session) {
+        Ok(()) => {
+            invalidate_profile_validation(index);
+            push_activity(format!(
+                "Saved resource settings for {}; effective on the next launch.",
+                session.name
+            ));
+        }
+        Err(error) => show_error_alert(&format!("Failed to save resource settings: {error}")),
+    }
+    unsafe {
+        rebuild_window();
+    }
+}
+
+fn resource_arg_value(arguments: &[String], flag: &str, runtime: &str) -> Option<String> {
+    runtime_arg_value(arguments, flag).or_else(|| match flag {
+        "--cpus" if runtime != "docker" => runtime_arg_value(arguments, "-c"),
+        "--memory" => runtime_arg_value(arguments, "-m"),
+        _ => None,
+    })
+}
+
+fn configured_resource_args(
+    original: &[String],
+    runtime: &str,
+    values: [&str; 4],
+    rosetta: bool,
+) -> Result<Vec<String>, String> {
+    let [cpus, memory, shm, platform] = values.map(str::trim);
+    let valid_cpus = if runtime == "docker" {
+        cpus.parse::<f64>()
+            .ok()
+            .is_some_and(|count| count.is_finite() && count > 0.0)
+    } else {
+        cpus.parse::<u32>().ok().is_some_and(|count| count > 0)
+    };
+    if !cpus.is_empty() && !valid_cpus {
+        return Err("CPUs must be positive (whole numbers for Apple Container), or empty for the runtime default.".into());
+    }
+    for (name, value) in [("Memory", memory), ("Shared memory", shm)] {
+        if !value.is_empty() && resource_size_bytes(value).is_none() {
+            return Err(format!(
+                "{name} must be a positive size such as 512M or 4G."
+            ));
+        }
+    }
+    if let (Some(memory), Some(shm)) = (resource_size_bytes(memory), resource_size_bytes(shm))
+        && shm > memory
+    {
+        return Err("Shared memory cannot exceed the container memory limit.".into());
+    }
+    if !platform.is_empty() && !matches!(platform, "linux/arm64" | "linux/amd64") {
+        return Err("Select linux/arm64, linux/amd64, or leave Platform empty.".into());
+    }
+    if rosetta && !matches!(runtime, "container" | "apple" | "apple-container") {
+        return Err("Rosetta requires Apple Container; it is not a Docker runtime flag.".into());
+    }
+    let mut arguments = Vec::new();
+    let mut index = 0;
+    while index < original.len() {
+        let flag = original[index].split('=').next().unwrap_or_default();
+        let controlled = matches!(
+            flag,
+            "--cpus" | "--memory" | "-m" | "--shm-size" | "--platform"
+        ) || (flag == "-c" && runtime != "docker");
+        if controlled {
+            let split_value = !original[index].contains('=')
+                && original
+                    .get(index + 1)
+                    .is_some_and(|value| !value.starts_with('-'));
+            index += 1 + usize::from(split_value);
+        } else {
+            if flag != "--rosetta" {
+                arguments.push(original[index].clone());
+            }
+            index += 1;
+        }
+    }
+    for (flag, value) in ["--cpus", "--memory", "--shm-size", "--platform"]
+        .into_iter()
+        .zip([cpus, memory, shm, platform])
+    {
+        if !value.is_empty() {
+            arguments.extend([flag.into(), value.into()]);
+        }
+    }
+    if rosetta {
+        arguments.push("--rosetta".into());
+    }
+    Ok(arguments)
+}
+
+fn resource_size_bytes(value: &str) -> Option<u128> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = value[..split]
+        .parse::<u128>()
+        .ok()
+        .filter(|number| *number > 0)?;
+    let power = match value[split..].to_ascii_uppercase().as_str() {
+        "" => 0,
+        "K" => 1,
+        "M" => 2,
+        "G" => 3,
+        "T" => 4,
+        "P" => 5,
+        _ => return None,
+    };
+    number.checked_mul(1024u128.pow(power))
 }
 
 fn defaults_from_session(session: &ContainerSession) -> AddSessionDefaults {
@@ -4237,6 +4461,7 @@ declare_class!(
                 2 => unsafe { export_session_profile(index) },
                 3 => unsafe { show_raw_session_profile(index) },
                 4 => unsafe { delete_container_session(index) },
+                5 => unsafe { show_session_resources_dialog(index) },
                 _ => {}
             }
             unsafe { rebuild_window(); }
@@ -4938,7 +5163,7 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     let row_height = 180.0;
     let content_w = list_w - 16.0;
     let min_page_height = match selected_nav {
-        NAV_APPLE_CONTAINER => 1860.0,
+        NAV_APPLE_CONTAINER => 1892.0,
         NAV_ORBSTACK => 1520.0,
         NAV_DOCKER => 1760.0,
         NAV_IMAGES => 1800.0,
@@ -6810,7 +7035,7 @@ fn add_runtime_list(
         y -= 156.0;
 
         let compatibility = apple_container_compatibility(&command_path, &child_path);
-        add_card(parent, rect(24.0, y - 160.0, width - 48.0, 190.0), mtm);
+        add_card(parent, rect(24.0, y - 192.0, width - 48.0, 222.0), mtm);
         add_label(
             parent,
             "Compatibility",
@@ -6848,12 +7073,19 @@ fn add_runtime_list(
         );
         add_label(
             parent,
+            &format!("Data: {}", apple_container_data_root()),
+            rect(38.0, y - 104.0, width - 76.0, 20.0),
+            mtm,
+            TextStyle::Mono,
+        );
+        add_label(
+            parent,
             &compatibility.detail,
-            rect(38.0, y - 142.0, width - 76.0, 54.0),
+            rect(38.0, y - 174.0, width - 76.0, 54.0),
             mtm,
             TextStyle::Caption,
         );
-        y -= 206.0;
+        y -= 238.0;
 
         let publish_socket_ready = compatibility.publish_socket;
 
@@ -7979,16 +8211,7 @@ fn runtime_overview(
     let (live_status, detail, resources, provider) = match selected_nav {
         NAV_APPLE_CONTAINER => {
             let compatibility = apple_container_compatibility(command_path, child_path);
-            let system = compatibility.system_status.to_ascii_lowercase();
-            let status = if system.contains("running") {
-                RuntimeStatus::Ready
-            } else if system.contains("stop") || system.contains("not running") {
-                RuntimeStatus::Unavailable
-            } else if system.contains("fail") || system.contains("error") {
-                RuntimeStatus::Failed
-            } else {
-                RuntimeStatus::Degraded
-            };
+            let status = apple_runtime_status(&compatibility.system_status);
             let running = apple_container_rows(command_path, child_path)
                 .iter()
                 .filter(|row| row.name.is_some() && row.running)
@@ -8157,6 +8380,15 @@ struct RuntimeCheck {
     args: &'static [&'static str],
 }
 
+fn apple_runtime_status(status: &str) -> RuntimeStatus {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "running" => RuntimeStatus::Ready,
+        "not running" | "stopped" | "unregistered" | "unavailable" => RuntimeStatus::Unavailable,
+        "failed" | "error" => RuntimeStatus::Failed,
+        _ => RuntimeStatus::Degraded,
+    }
+}
+
 impl RuntimeCheck {
     fn new(label: &'static str, args: &'static [&'static str]) -> Self {
         Self { label, args }
@@ -8230,28 +8462,9 @@ fn execute_ui_command(
     args: &[String],
     timeout: Duration,
 ) -> Result<Output, String> {
-    let mut child = Command::new(command)
-        .env("PATH", child_path)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("Command timed out after {}ms", timeout.as_millis()));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
+    let mut process = Command::new(command);
+    process.env("PATH", child_path).args(args);
+    crate::runtime_commands::capture(process, timeout).map_err(|error| error.to_string())
 }
 
 fn invalidate_ui_command_cache() {
@@ -8317,6 +8530,9 @@ fn apple_container_compatibility(
     .ok()
     // A stopped or unregistered service returns valid status JSON with exit 1.
     .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok());
+    if let Some(status) = status_json.as_ref() {
+        crate::runtime_paths::remember_apple_container_status(status);
+    }
     let system_status = status_json
         .as_ref()
         .and_then(|value| value.get("status"))
@@ -8367,6 +8583,10 @@ fn apple_container_compatibility(
     } else if !publish_socket {
         "Cocoa-Way can use its compatibility relay, but Transport V2 requires `container run --publish-socket`."
             .into()
+    } else if system_status != "running" {
+        format!(
+            "Apple Container is {system_status}. Use Start System before launching applications."
+        )
     } else if transport_v2_version {
         "Apple Container 1.4.1+ satisfies Cocoa-Way's current security and Transport V2 compatibility baseline."
             .into()
@@ -9616,6 +9836,7 @@ fn add_session_detail(
             "Export Profile",
             "View Raw Configuration",
             "Delete Profile",
+            "Resources & Platform...",
         ],
         0,
         mtm,
@@ -9933,7 +10154,10 @@ fn add_session_info(
         add_application_task_card(parent, task, x, task_y, width, handler, mtm);
         supporting_card_y = task_y - 114.0;
     } else if state.is_some_and(|state| {
-        state.profile == ProfileStatus::Invalid || state.instance == Some(InstanceStatus::Failed)
+        matches!(
+            state.profile,
+            ProfileStatus::Invalid | ProfileStatus::Blocked
+        ) || state.instance == Some(InstanceStatus::Failed)
     }) {
         let error_y = actions_y - 130.0;
         add_application_error_card(
@@ -11496,8 +11720,9 @@ fn apple_gui_transport_diagnostic(child_path: &str) -> RuntimeDiagnostic {
 }
 
 fn apple_container_data_root() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".into());
-    format!("{}/Library/Application Support/com.apple.container", home)
+    crate::runtime_paths::apple_container_data_root()
+        .display()
+        .to_string()
 }
 
 unsafe fn add_session_row(
@@ -11709,6 +11934,7 @@ unsafe fn add_session_row(
             "Export Profile",
             "View Raw Configuration",
             "Delete Profile",
+            "Resources & Platform...",
         ],
         0,
         mtm,
@@ -12174,6 +12400,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unavailable_runtime_blocks_a_profile_without_marking_its_configuration_invalid() {
+        let error = container_sessions::LaunchError::RuntimeNotReady {
+            runtime: "Apple Container".into(),
+            hint: "init-image download failed".into(),
+        };
+        assert_eq!(check_failure_profile_status(&error), ProfileStatus::Blocked);
+        assert_eq!(
+            state_from_legacy_label("Blocked"),
+            (ProfileStatus::Blocked, None)
+        );
+        let missing = container_sessions::LaunchError::ImageNotGuiReady {
+            runtime: "Apple Container".into(),
+            image: "gui:latest".into(),
+            hint: "waypipe is missing".into(),
+        };
+        assert_eq!(
+            check_failure_profile_status(&missing),
+            ProfileStatus::Invalid
+        );
+    }
+
+    #[test]
+    fn apple_service_states_do_not_confuse_not_running_with_running() {
+        assert_eq!(apple_runtime_status("running"), RuntimeStatus::Ready);
+        for state in ["not running", "unregistered", "unavailable", "stopped"] {
+            assert_eq!(apple_runtime_status(state), RuntimeStatus::Unavailable);
+        }
+        assert_eq!(apple_runtime_status("error"), RuntimeStatus::Failed);
+        assert_eq!(apple_runtime_status("checking"), RuntimeStatus::Degraded);
+    }
+
+    #[test]
     fn registry_sources_build_canonical_image_references() {
         assert_eq!(
             normalize_registry_reference(0, "ubuntu:24.04"),
@@ -12367,6 +12625,95 @@ mod tests {
         assert_eq!(
             format_runtime_arguments(&arguments),
             "--memory 4G\n--cpus=4\n--read-only"
+        );
+    }
+
+    #[test]
+    fn resource_editor_preserves_unrelated_flags_and_replaces_aliases() {
+        let original = [
+            "-c",
+            "2",
+            "--memory=1G",
+            "--shm-size",
+            "256M",
+            "--dns",
+            "1.1.1.1",
+            "--read-only",
+            "--rosetta",
+        ]
+        .map(str::to_string);
+        let edited = configured_resource_args(
+            &original,
+            "container",
+            ["4", "4G", "512M", "linux/arm64"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            edited,
+            [
+                "--dns",
+                "1.1.1.1",
+                "--read-only",
+                "--cpus",
+                "4",
+                "--memory",
+                "4G",
+                "--shm-size",
+                "512M",
+                "--platform",
+                "linux/arm64"
+            ]
+        );
+        assert_eq!(
+            resource_arg_value(&original, "--cpus", "container"),
+            Some("2".into())
+        );
+    }
+
+    #[test]
+    fn docker_cpu_shares_are_not_treated_as_apple_cpu_counts() {
+        let original = ["-c", "512", "--cpus", "0.5"].map(str::to_string);
+        assert_eq!(resource_arg_value(&original[..2], "--cpus", "docker"), None);
+        assert_eq!(
+            configured_resource_args(&original, "docker", ["1.5", "", "", ""], false).unwrap(),
+            ["-c", "512", "--cpus", "1.5"]
+        );
+    }
+
+    #[test]
+    fn resource_editor_rejects_invalid_limits_and_rosetta_combinations() {
+        for values in [
+            ["0", "4G", "512M", ""],
+            ["4", "0G", "512M", ""],
+            ["4", "1G", "2G", ""],
+            ["4", "4G", "512M", "windows/amd64"],
+        ] {
+            assert!(configured_resource_args(&[], "container", values, false).is_err());
+        }
+        assert!(
+            configured_resource_args(&[], "docker", ["4", "4G", "512M", "linux/amd64"], true)
+                .is_err()
+        );
+        let arguments =
+            configured_resource_args(&[], "container", ["", "", "", "linux/amd64"], true).unwrap();
+        assert_eq!(arguments, ["--platform", "linux/amd64", "--rosetta"]);
+        assert!(
+            configured_resource_args(&[], "container", ["4", "4G", "512M", "linux/arm64"], true)
+                .is_ok()
+        );
+        assert!(configured_resource_args(&[], "docker", ["0.5", "1G", "128M", ""], false).is_ok());
+        assert!(
+            configured_resource_args(&[], "container", ["0.5", "1G", "128M", ""], false).is_err()
+        );
+    }
+
+    #[test]
+    fn empty_resource_fields_restore_runtime_defaults_without_removing_dns() {
+        let original = ["--cpus=4", "--memory", "4G", "--dns=1.1.1.1"].map(str::to_string);
+        assert_eq!(
+            configured_resource_args(&original, "container", ["", "", "", ""], false).unwrap(),
+            ["--dns=1.1.1.1"]
         );
     }
 
