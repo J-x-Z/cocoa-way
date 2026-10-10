@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CW Pointer Test | unlocked</title>
+<style>
+  :root { color-scheme: dark; background: #172b35; color: #e8eff0; font: 18px monospace; }
+  body { margin: 32px; max-width: 900px; }
+  button { padding: 16px 24px; border: 1px solid #74bac9; border-radius: 6px;
+    background: #275765; color: inherit; font: inherit; cursor: pointer; }
+  pre { padding: 24px; background: #203c48; white-space: pre-wrap; }
+  canvas { width: 100%; height: 180px; background: #12222b; }
+</style>
+<h1>Local Pointer Lock Regression</h1>
+<p>Click Lock Pointer, move the mouse, type keys, then press Escape to unlock.
+Switch focus while holding a key or button to check cleanup. No network, timer,
+or continuous rendering is used. These are event counts, not latency measurements.</p>
+<button id="lock">Lock Pointer</button>
+<button id="reset">Reset Counts</button>
+<pre id="status"></pre>
+<canvas id="view" width="900" height="180"></canvas>
+<script>
+  const view = document.querySelector('#view');
+  const context = view.getContext('2d');
+  const status = document.querySelector('#status');
+  const heldKeys = new Set();
+  const heldButtons = new Set();
+  let counts;
+  let x = 450;
+  let y = 90;
+  let failure = '';
+  function update() {
+    const locked = document.pointerLockElement === view;
+    document.title = `CW Pointer Test | ${locked ? 'locked' : 'unlocked'} | keys ${counts.down}/${counts.up} | buttons ${counts.buttonDown}/${counts.buttonUp} | relative ${counts.relative} | dup ${counts.duplicate} | unmatched ${counts.unmatched}`;
+    status.textContent = JSON.stringify({ locked, ...counts,
+      heldKeys: [...heldKeys], heldButtons: [...heldButtons], failure }, null, 2);
+    context.clearRect(0, 0, 900, 180);
+    context.fillStyle = '#9bdded';
+    context.fillRect(x - 6, y - 6, 12, 12);
+  }
+  function reset() {
+    counts = { down: 0, up: 0, repeat: 0, buttonDown: 0, buttonUp: 0,
+      relative: 0, duplicate: 0, unmatched: 0, focusLoss: 0 };
+    heldKeys.clear();
+    heldButtons.clear();
+    failure = '';
+    update();
+  }
+  document.querySelector('#lock').onclick = async () => {
+    try { await view.requestPointerLock(); }
+    catch (error) { failure = String(error); update(); }
+  };
+  document.querySelector('#reset').onclick = reset;
+  document.addEventListener('pointerlockchange', update);
+  document.addEventListener('pointerlockerror', () => {
+    failure = 'pointerlockerror'; update();
+  });
+  window.addEventListener('keydown', event => {
+    if (event.repeat) counts.repeat++;
+    else {
+      counts.down++;
+      if (heldKeys.has(event.code)) counts.duplicate++;
+      heldKeys.add(event.code);
+    }
+    update();
+  });
+  window.addEventListener('keyup', event => {
+    counts.up++;
+    if (!heldKeys.delete(event.code)) counts.unmatched++;
+    update();
+  });
+  window.addEventListener('mousedown', event => {
+    counts.buttonDown++;
+    if (heldButtons.has(event.button)) counts.duplicate++;
+    heldButtons.add(event.button);
+    update();
+  });
+  window.addEventListener('mouseup', event => {
+    counts.buttonUp++;
+    if (!heldButtons.delete(event.button)) counts.unmatched++;
+    update();
+  });
+  window.addEventListener('mousemove', event => {
+    if (document.pointerLockElement !== view) return;
+    if (event.movementX || event.movementY) counts.relative++;
+    x = (x + event.movementX + 900) % 900;
+    y = (y + event.movementY + 180) % 180;
+    update();
+  });
+  window.addEventListener('blur', () => {
+    counts.focusLoss++;
+    heldKeys.clear();
+    heldButtons.clear();
+    update();
+  });
+  reset();
+</script>
+</html>

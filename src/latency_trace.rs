@@ -105,6 +105,7 @@ pub struct Tags<'a> {
     pub source_event_serial: Option<Tag<'a>>,
     pub source_event_time: Option<Tag<'a>>,
     pub window_id: Option<Tag<'a>>,
+    pub probe_marker: Option<[u8; 120]>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +133,8 @@ struct Event {
     source_event_serial: Option<OwnedTag>,
     source_event_time: Option<OwnedTag>,
     window_id: Option<OwnedTag>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_marker: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -240,6 +243,7 @@ impl LatencyTrace {
             source_event_serial: tags.source_event_serial.map(Into::into),
             source_event_time: tags.source_event_time.map(Into::into),
             window_id: tags.window_id.map(Into::into),
+            probe_marker: tags.probe_marker.map(|marker| marker.to_vec()),
         };
         if inner.tx.try_send(event).is_err() {
             inner.counts.dropped.fetch_add(1, Relaxed);
@@ -410,6 +414,7 @@ mod tests {
                     source_event_serial: Some(Tag::U64(u64::MAX)),
                     source_event_time: Some(Tag::String("native:1.25s")),
                     window_id: None,
+                    probe_marker: None,
                 }
             ));
             let mut bytes = Vec::new();

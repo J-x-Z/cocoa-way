@@ -27,6 +27,13 @@ const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIPBOARD_IMAGE_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CLIPBOARD_IMAGE_PIXELS: usize = 32 * 1024 * 1024;
 
+type PointerOriginPart = (
+    smithay::reexports::wayland_server::backend::ObjectId,
+    (i32, i32),
+    Option<(i32, i32)>,
+    Option<(i32, i32)>,
+);
+
 struct HostPasteboardSnapshot {
     change_count: isize,
     text: Option<Arc<str>>,
@@ -71,6 +78,12 @@ pub struct AppState {
     _relative_pointer_state: smithay::wayland::relative_pointer::RelativePointerManagerState,
     _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     native_cursor: native_cursor::NativeCursor,
+    pub pointer_input: crate::pointer_input::PointerInput<winit::window::WindowId, WlSurface>,
+    pointer_origin_stamp: Vec<PointerOriginPart>,
+    pointer_surface_buffers: std::collections::HashMap<
+        smithay::reexports::wayland_server::backend::ObjectId,
+        (i32, i32),
+    >,
     _output_state: smithay::wayland::output::OutputManagerState,
     pub output: smithay::output::Output,
     pub toplevels: Vec<smithay::wayland::shell::xdg::ToplevelSurface>,
@@ -110,6 +123,8 @@ pub struct AppState {
     /// performance diagnostics in Container Mode.
     pub commit_counter: u64,
     pub latency_trace: crate::latency_trace::LatencyTrace,
+    pub trace_input: Option<u64>,
+    pub trace_forwarded: Option<(u64, u32, u32)>,
     trace_frames:
         std::collections::HashMap<smithay::reexports::wayland_server::backend::ObjectId, u64>,
     host_clipboard_text: Option<Arc<str>>,
@@ -344,6 +359,9 @@ impl AppState {
                 display_handle,
             ),
             native_cursor: native_cursor::NativeCursor::default(),
+            pointer_input: crate::pointer_input::PointerInput::default(),
+            pointer_origin_stamp: Vec::new(),
+            pointer_surface_buffers: std::collections::HashMap::new(),
             _output_state: output_state,
             output,
             toplevels: Vec::new(),
@@ -367,6 +385,8 @@ impl AppState {
             needs_redraw: true,
             rootless_dirty_surfaces: std::collections::HashSet::new(),
             latency_trace: crate::latency_trace::LatencyTrace::default(),
+            trace_input: None,
+            trace_forwarded: None,
             trace_frames: std::collections::HashMap::new(),
             commit_counter: 0,
             host_clipboard_text: None,
@@ -409,7 +429,151 @@ impl AppState {
     }
 
     pub fn native_cursor_diagnostics(&self) -> serde_json::Value {
-        self.native_cursor.diagnostics()
+        let mut diagnostics = self.native_cursor.diagnostics();
+        diagnostics["pointer_lock"] = serde_json::json!({
+            "status": format!("{:?}", self.pointer_input.status()),
+            "native_grab": self.pointer_input.native_grab().is_some(),
+            "unsupported_confinement_requests": self.pointer_input.unsupported_confinement_requests(),
+            "confinement_supported": false,
+            "raw_hardware_verified": false,
+            "relative_source": "winit_nsevent_not_verified_raw_hardware",
+        });
+        diagnostics
+    }
+
+    pub fn pointer_lock_region(
+        &self,
+        surface: &WlSurface,
+        local: smithay::utils::Point<f64, smithay::utils::Logical>,
+        region: Option<&smithay::wayland::compositor::RegionAttributes>,
+    ) -> (bool, bool) {
+        if !surface.is_alive() {
+            return (false, false);
+        }
+        let Some((buffer_width, buffer_height)) = self.pointer_surface_buffers.get(&surface.id())
+        else {
+            return (false, false);
+        };
+        let mapped_root = self
+            .root_toplevel_id_for_surface(surface)
+            .is_some_and(|root| self.pointer_surface_buffers.contains_key(&root));
+        if !mapped_root {
+            return (false, false);
+        }
+        let inside = smithay::wayland::compositor::with_states(surface, |states| {
+            use smithay::reexports::wayland_server::protocol::wl_output::Transform;
+            use smithay::wayland::compositor::SurfaceAttributes;
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let current = attributes.current();
+            let destination = states
+                .cached_state
+                .get::<smithay::wayland::viewporter::ViewportCachedState>()
+                .current()
+                .size();
+            let (width, height) = match current.buffer_transform {
+                Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
+                    (*buffer_height, *buffer_width)
+                }
+                _ => (*buffer_width, *buffer_height),
+            };
+            let scale = f64::from(current.buffer_scale.max(1));
+            let width = destination.map_or(f64::from(width) / scale, |size| f64::from(size.w));
+            let height = destination.map_or(f64::from(height) / scale, |size| f64::from(size.h));
+            let point = (local.x.floor() as i32, local.y.floor() as i32);
+            crate::pointer_input::inside_surface((local.x, local.y), (width, height))
+                && current
+                    .input_region
+                    .as_ref()
+                    .is_none_or(|input| input.contains(point))
+                && region.is_none_or(|region| region.contains(point))
+        });
+        (true, inside)
+    }
+
+    pub fn record_pointer_motion(
+        &mut self,
+        owner: winit::window::WindowId,
+        candidate: Option<(
+            WlSurface,
+            smithay::utils::Point<f64, smithay::utils::Logical>,
+        )>,
+        actual: Option<WlSurface>,
+    ) {
+        let grab_focus = self
+            .seat
+            .get_pointer()
+            .and_then(|pointer| pointer.grab_start_data())
+            .and_then(|grab| grab.focus)
+            .filter(|(surface, _)| actual.as_ref() == Some(surface));
+        let (owner, candidate) = if let Some(grab_focus) = grab_focus {
+            let Some(known) = self
+                .pointer_input
+                .focus()
+                .filter(|known| actual.as_ref() == Some(&known.surface))
+            else {
+                self.pointer_input.clear_focus();
+                self.pointer_origin_stamp.clear();
+                return;
+            };
+            (known.owner, Some(grab_focus))
+        } else {
+            (owner, candidate)
+        };
+        let captured = candidate
+            .as_ref()
+            .is_some_and(|(surface, _)| actual.as_ref() == Some(surface));
+        self.pointer_input.record_motion(
+            owner,
+            candidate.map(|(surface, origin)| (surface, (origin.x, origin.y))),
+            actual.as_ref(),
+        );
+        if captured {
+            self.pointer_origin_stamp = self.pointer_origin_parts(actual.as_ref().unwrap());
+        } else if self.pointer_input.focus().is_none() {
+            self.pointer_origin_stamp.clear();
+        }
+    }
+
+    pub fn pointer_focus_origin_current(&self) -> bool {
+        self.pointer_input.focus().is_some_and(|focus| {
+            focus.surface.is_alive()
+                && self.pointer_origin_stamp == self.pointer_origin_parts(&focus.surface)
+        })
+    }
+
+    fn pointer_origin_parts(&self, surface: &WlSurface) -> Vec<PointerOriginPart> {
+        let mut parts = Vec::new();
+        let mut surface = Some(surface.clone());
+        while let Some(current) = surface {
+            let (offset, geometry) =
+                smithay::wayland::compositor::with_states(&current, |states| {
+                    let offset = states
+                        .cached_state
+                        .get::<smithay::wayland::compositor::SubsurfaceCachedState>()
+                        .current()
+                        .location;
+                    let geometry = states
+                        .cached_state
+                        .get::<smithay::wayland::shell::xdg::SurfaceCachedState>()
+                        .current()
+                        .geometry
+                        .map(|geometry| (geometry.loc.x, geometry.loc.y));
+                    ((offset.x, offset.y), geometry)
+                });
+            let popup = self
+                .popups
+                .iter()
+                .find(|popup| popup.wl_surface() == &current);
+            let popup_origin = popup.and_then(|popup| {
+                popup.with_committed_state(|state| {
+                    state.map(|state| (state.geometry.loc.x, state.geometry.loc.y))
+                })
+            });
+            parts.push((current.id(), offset, geometry, popup_origin));
+            surface = smithay::wayland::compositor::get_parent(&current)
+                .or_else(|| popup.and_then(|popup| popup.get_parent_surface()));
+        }
+        parts
     }
 
     /// Cheap when unchanged; call after pointer motion (before dispatch) to
@@ -927,6 +1091,9 @@ impl AppState {
             log::warn!("Ignoring invalid window scale factor: {}", scale);
             1.0
         };
+        if self.scale_factor != scale && !self.presentation.is_rootless() {
+            self.pointer_input.clear_focus();
+        }
         self.scale_factor = scale;
         self.output.change_current_state(
             None,
@@ -976,11 +1143,24 @@ impl CompositorHandler for AppState {
         // mutex during traversal, so calling get_parent from the visitor deadlocks.
         let root_surface = self.root_toplevel_id_for_surface(surface);
         if self.latency_trace.enabled() {
-            let id = self.commit_counter.saturating_add(1);
+            let id = crate::latency_trace::next_id();
             self.latency_trace.record(
                 crate::latency_trace::Stage::SurfaceCommit,
                 crate::latency_trace::Tags {
                     correlation_id: Some(crate::latency_trace::Tag::U64(id)),
+                    probe_marker: smithay::wayland::compositor::with_states(surface, |states| {
+                        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                        match attributes.current().buffer.as_ref() {
+                            Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(
+                                buffer,
+                            )) => crate::render::with_buffer_pixels(
+                                buffer,
+                                |width, _, _, pixels, _| crate::probe_marker::decode(width, pixels),
+                            )
+                            .flatten(),
+                            _ => None,
+                        }
+                    }),
                     ..Default::default()
                 },
             );
@@ -991,12 +1171,28 @@ impl CompositorHandler for AppState {
             }
         }
         let mut new_cbs = Vec::new();
+        let mut input_buffers = Vec::new();
         with_surface_tree_downward(
             surface,
             (),
             |_, _, _| TraversalAction::DoChildren(()),
             |callback_surface, states, _| {
                 let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                match guard.current().buffer.as_ref() {
+                    Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buffer)) => {
+                        let size =
+                            smithay::wayland::shm::with_buffer_contents(buffer, |_, _, data| {
+                                (data.width, data.height)
+                            })
+                            .ok()
+                            .filter(|(width, height)| *width > 0 && *height > 0);
+                        input_buffers.push((callback_surface.id(), size));
+                    }
+                    Some(smithay::wayland::compositor::BufferAssignment::Removed) => {
+                        input_buffers.push((callback_surface.id(), None));
+                    }
+                    None => {}
+                }
                 new_cbs.extend(guard.current().frame_callbacks.drain(..).map(|callback| {
                     PendingFrameCallback {
                         root_surface: root_surface.clone(),
@@ -1007,6 +1203,13 @@ impl CompositorHandler for AppState {
             },
             |_, _, _| true,
         );
+        for (surface, size) in input_buffers {
+            if let Some(size) = size {
+                self.pointer_surface_buffers.insert(surface, size);
+            } else {
+                self.pointer_surface_buffers.remove(&surface);
+            }
+        }
         self.pending_frame_callbacks.extend(new_cbs);
         self.commit_counter = self.commit_counter.saturating_add(1);
         if self.presentation.is_rootless() {
@@ -1027,6 +1230,8 @@ impl CompositorHandler for AppState {
             return;
         }
         let surface_id = surface.id();
+        self.pointer_surface_buffers.remove(&surface_id);
+        self.pointer_input.forget_surface(surface);
         let affected_root = self.root_toplevel_id_for_surface(surface);
         let was_toplevel = self
             .toplevels
@@ -1062,19 +1267,9 @@ impl CompositorHandler for AppState {
                 self.native_cursor_left();
                 // Wayland destruction can remove the native window before winit's
                 // CursorLeft/Destroyed events, so release its pointer here.
-                let location = pointer.current_location();
                 let time = self.start_time.elapsed().as_millis() as u32;
                 self.cancel_pointer_gesture(&pointer, time);
-                pointer.motion(
-                    self,
-                    None,
-                    &smithay::input::pointer::MotionEvent {
-                        location,
-                        serial: smithay::utils::SERIAL_COUNTER.next_serial(),
-                        time,
-                    },
-                );
-                pointer.frame(self);
+                crate::clear_pointer_focus(self, time);
             }
         }
 
@@ -1306,6 +1501,9 @@ impl XdgShellHandler for AppState {
         _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
         _serial: smithay::utils::Serial,
     ) {
+        if self.pointer_input.freezes_absolute() {
+            return;
+        }
         log::info!(
             "XDG Move Request received for surface {:?}",
             surface.wl_surface().id()
@@ -1535,10 +1733,29 @@ smithay::delegate_fractional_scale!(AppState);
 impl smithay::wayland::pointer_constraints::PointerConstraintsHandler for AppState {
     fn new_constraint(
         &mut self,
-        _surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-        _pointer: &smithay::input::pointer::PointerHandle<Self>,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
     ) {
-        self.refresh_native_cursor();
+        let kind = smithay::wayland::pointer_constraints::with_pointer_constraint::<Self, _, _>(
+            surface,
+            pointer,
+            |constraint| match constraint.as_deref() {
+                Some(smithay::wayland::pointer_constraints::PointerConstraint::Locked(_)) => {
+                    crate::pointer_input::ConstraintKind::Locked
+                }
+                Some(smithay::wayland::pointer_constraints::PointerConstraint::Confined(_)) => {
+                    crate::pointer_input::ConstraintKind::Confined
+                }
+                None => crate::pointer_input::ConstraintKind::None,
+            },
+        );
+        self.pointer_input.constraint_created(kind);
+        if kind == crate::pointer_input::ConstraintKind::Confined {
+            log::warn!(
+                "Pointer confinement for {:?} remains inactive: unsupported by the macOS Winit backend",
+                surface.id()
+            );
+        }
     }
     fn cursor_position_hint(
         &mut self,

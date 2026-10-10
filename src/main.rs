@@ -8,7 +8,7 @@ use smithay::utils::SERIAL_COUNTER;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 mod application_model;
 mod audio;
@@ -20,6 +20,7 @@ mod control_protocol;
 mod diagnostics;
 mod event_loop_signal;
 mod frame_clock;
+mod input_policy;
 mod keymap;
 mod latency_trace;
 mod layout;
@@ -28,7 +29,9 @@ mod menu_bar;
 mod messages;
 mod metal_renderer;
 mod network;
+mod pointer_input;
 mod presentation;
+mod probe_marker;
 mod render;
 mod runtime_commands;
 mod runtime_paths;
@@ -3120,7 +3123,13 @@ fn activate_toplevel(
     }
 }
 
-fn forward_keyboard_event(state: &mut AppState, event: KeyEvent, time: u32) {
+fn forward_keyboard_event(
+    state: &mut AppState,
+    keys: &mut input_policy::KeyTransitionReducer<winit::window::WindowId>,
+    window: winit::window::WindowId,
+    event: KeyEvent,
+    time: u32,
+) {
     let Some(scancode) = crate::keymap::map_key(event.physical_key) else {
         return;
     };
@@ -3130,15 +3139,403 @@ fn forward_keyboard_event(state: &mut AppState, event: KeyEvent, time: u32) {
     };
     let keycode = smithay::input::keyboard::Keycode::from(scancode + 8);
     if let Some(keyboard) = state.seat.get_keyboard() {
-        keyboard.input(
+        if keyboard.current_focus().is_none()
+            || !keys.key(
+                window,
+                scancode,
+                match event.state {
+                    ElementState::Pressed => input_policy::KeyTransition::Pressed,
+                    ElementState::Released => input_policy::KeyTransition::Released,
+                },
+                event.repeat,
+            )
+        {
+            return;
+        }
+        let serial = SERIAL_COUNTER.next_serial();
+        keyboard.input(state, keycode, key_state, serial, time, |_, _, _| {
+            FilterResult::<()>::Forward
+        });
+        if let Some(id) = state.trace_input {
+            state.trace_forwarded = Some((id, u32::from(serial), time));
+        }
+    }
+}
+
+fn set_keyboard_owner(
+    state: &mut AppState,
+    keys: &mut input_policy::KeyTransitionReducer<winit::window::WindowId>,
+    owner: Option<winit::window::WindowId>,
+    time: u32,
+) {
+    if keys.owner() != owner {
+        release_pressed_keys(state, time);
+        let _ = keys.set_owner(owner);
+    }
+}
+
+fn clear_pointer_focus(state: &mut AppState, time: u32) {
+    if let Some(pointer) = state.seat.get_pointer() {
+        if let Some(surface) = pointer.current_focus() {
+            smithay::wayland::pointer_constraints::with_pointer_constraint::<AppState, _, _>(
+                &surface,
+                &pointer,
+                |constraint| {
+                    if let Some(constraint) = constraint {
+                        constraint.deactivate();
+                    }
+                },
+            );
+        }
+        for button in state.pointer_input.take_buttons() {
+            pointer.button(
+                state,
+                &ButtonEvent {
+                    button,
+                    state: smithay::backend::input::ButtonState::Released,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+        }
+        pointer.unset_grab(state, SERIAL_COUNTER.next_serial(), time);
+        pointer.motion(
             state,
-            keycode,
-            key_state,
-            SERIAL_COUNTER.next_serial(),
-            time,
-            |_, _, _| FilterResult::<()>::Forward,
+            None,
+            &MotionEvent {
+                location: pointer.current_location(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(state);
+    }
+    state.pointer_input.clear_focus();
+    state.drag_state = None;
+    state.start_drag_request = None;
+    state.refresh_native_cursor();
+}
+
+fn pointer_owner_window<'a>(
+    owner: winit::window::WindowId,
+    desktop: &'a winit::window::Window,
+    rootless: &'a HashMap<winit::window::WindowId, presentation::RootlessWindow>,
+) -> Option<&'a winit::window::Window> {
+    if owner == desktop.id() {
+        Some(desktop)
+    } else {
+        rootless
+            .get(&owner)
+            .map(|rootless| &rootless.renderer.window)
+    }
+}
+
+fn release_pointer_lock(state: &mut AppState, window: &winit::window::Window) -> bool {
+    let Some(grab) = state.pointer_input.native_grab().cloned() else {
+        return true;
+    };
+    if let Some(pointer) = state.seat.get_pointer() {
+        smithay::wayland::pointer_constraints::with_pointer_constraint::<AppState, _, _>(
+            &grab.surface,
+            &pointer,
+            |constraint| {
+                if let Some(constraint) = constraint {
+                    constraint.deactivate();
+                }
+            },
         );
     }
+    // macOS association is application-wide, so any surviving window can
+    // restore it when the original owner was already destroyed.
+    let result = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+    if let Err(error) = &result
+        && state.pointer_input.status() != pointer_input::LockStatus::ReleaseFailed
+    {
+        log::warn!("Failed to release native pointer lock: {error}");
+    }
+    state.pointer_input.released(result.is_ok());
+    state.refresh_native_cursor();
+    result.is_ok()
+}
+
+fn reconcile_pointer_lock(
+    state: &mut AppState,
+    focused_owner: Option<winit::window::WindowId>,
+    desktop: &winit::window::Window,
+    rootless: &HashMap<winit::window::WindowId, presentation::RootlessWindow>,
+) {
+    use pointer_input::{ConstraintKind, ConstraintSnapshot, LockAction, LockStatus};
+    use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
+    // Two passes allow a destroyed/recreated constraint to release the old
+    // native grab before acquiring and activating the replacement.
+    for _ in 0..2 {
+        let actual = pointer.current_focus();
+        let focus = state.pointer_input.focus().cloned();
+        let window = focus
+            .as_ref()
+            .and_then(|focus| pointer_owner_window(focus.owner, desktop, rootless));
+        let location = pointer.current_location();
+        let local = focus
+            .as_ref()
+            .map(|focus| location - smithay::utils::Point::from(focus.origin));
+        let (mut snapshot, in_constraint_region) =
+            actual
+                .as_ref()
+                .map_or((ConstraintSnapshot::default(), false), |surface| {
+                    with_pointer_constraint::<AppState, _, _>(surface, &pointer, |constraint| {
+                        constraint.map_or((ConstraintSnapshot::default(), false), |constraint| {
+                            let kind = match *constraint {
+                                PointerConstraint::Locked(_) => ConstraintKind::Locked,
+                                PointerConstraint::Confined(_) => ConstraintKind::Confined,
+                            };
+                            (
+                                ConstraintSnapshot {
+                                    kind,
+                                    active: constraint.is_active(),
+                                    ..Default::default()
+                                },
+                                local.is_some_and(|local| {
+                                    constraint.region().is_none_or(|region| {
+                                        region.contains((
+                                            local.x.floor() as i32,
+                                            local.y.floor() as i32,
+                                        ))
+                                    })
+                                }),
+                            )
+                        })
+                    })
+                });
+        if snapshot.kind == ConstraintKind::None && state.pointer_input.native_grab().is_none() {
+            state.pointer_input.set_status(LockStatus::Idle);
+            return;
+        }
+        if let Some(focus) = &focus
+            && actual.as_ref() == Some(&focus.surface)
+            && let Some(window) = window
+        {
+            let local = local.unwrap();
+            let (live, in_region) = state.pointer_lock_region(&focus.surface, local, None);
+            let origin_current = focus.owner != desktop.id()
+                || state
+                    .layout
+                    .tile_for_surface(&focus.surface.id())
+                    .is_some_and(|tile| {
+                        focus.origin == (f64::from(tile.position.x), f64::from(tile.position.y))
+                    });
+            snapshot.live = live
+                && origin_current
+                && state.pointer_focus_origin_current()
+                && window.is_visible() != Some(false);
+            snapshot.in_region = in_region && in_constraint_region;
+        }
+        let owner = focused_owner.filter(|owner| {
+            window.is_some_and(|window| window.id() == *owner && window.has_focus())
+        });
+        match state.pointer_input.action(owner, actual.as_ref(), snapshot) {
+            LockAction::Release => {
+                let grab_owner = state.pointer_input.native_grab().unwrap().owner;
+                let window = pointer_owner_window(grab_owner, desktop, rootless).unwrap_or(desktop);
+                if !release_pointer_lock(state, window) {
+                    break;
+                }
+            }
+            LockAction::ConfinementUnsupported => {
+                if snapshot.active
+                    && let Some(surface) = actual.as_ref()
+                {
+                    with_pointer_constraint::<AppState, _, _>(surface, &pointer, |constraint| {
+                        if let Some(constraint) = constraint {
+                            constraint.deactivate();
+                        }
+                    });
+                }
+                state
+                    .pointer_input
+                    .set_status(LockStatus::ConfinementUnsupported);
+                break;
+            }
+            LockAction::Acquire => {
+                let focus = focus.unwrap();
+                let window = window.unwrap();
+                let result = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+                let eligibility = input_policy::PointerLockEligibility {
+                    focused: owner == Some(focus.owner),
+                    in_region: snapshot.in_region,
+                    live: snapshot.live,
+                    native_acquired: result.is_ok(),
+                };
+                if !eligibility.can_activate() {
+                    if state.pointer_input.status() != LockStatus::AcquisitionFailed {
+                        log::warn!("Native pointer lock acquisition failed: {result:?}");
+                    }
+                    state.pointer_input.acquisition_failed();
+                    break;
+                }
+                state.pointer_input.native_acquired(focus.clone());
+                let activated = with_pointer_constraint::<AppState, _, _>(
+                    &focus.surface,
+                    &pointer,
+                    |constraint| {
+                        if let Some(constraint) = constraint
+                            && matches!(*constraint, PointerConstraint::Locked(_))
+                        {
+                            constraint.activate();
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                );
+                if activated {
+                    state.pointer_input.activated();
+                    state.drag_state = None;
+                    state.start_drag_request = None;
+                    state.refresh_native_cursor();
+                } else {
+                    release_pointer_lock(state, window);
+                }
+                break;
+            }
+            LockAction::None => {
+                if state.pointer_input.native_grab().is_none() {
+                    if snapshot.active
+                        && let Some(surface) = actual.as_ref()
+                    {
+                        with_pointer_constraint::<AppState, _, _>(
+                            surface,
+                            &pointer,
+                            |constraint| {
+                                if let Some(constraint) = constraint {
+                                    constraint.deactivate();
+                                }
+                            },
+                        );
+                    }
+                    if snapshot.kind == ConstraintKind::None {
+                        state.pointer_input.set_status(LockStatus::Idle);
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn retire_input_window(
+    state: &mut AppState,
+    keys: &mut input_policy::KeyTransitionReducer<winit::window::WindowId>,
+    window: &winit::window::Window,
+    time: u32,
+) {
+    let owner = window.id();
+    if state
+        .pointer_input
+        .native_grab()
+        .is_some_and(|grab| grab.owner == owner)
+    {
+        release_pointer_lock(state, window);
+    }
+    if state
+        .pointer_input
+        .focus()
+        .is_some_and(|focus| focus.owner == owner)
+    {
+        clear_pointer_focus(state, time);
+    }
+    state.pointer_input.forget_window(owner);
+    if keys.owner() == Some(owner) {
+        set_keyboard_owner(state, keys, None, time);
+        if let Some(keyboard) = state.seat.get_keyboard() {
+            keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
+        }
+    }
+    state.native_cursor_left_window(owner);
+}
+
+fn prepare_pointer_focus(state: &mut AppState, window: &winit::window::Window, time: u32) {
+    if !state.pointer_input.needs_focus_reset(window.id()) {
+        return;
+    }
+    let old_owner = state.pointer_input.focus().map(|focus| focus.owner);
+    if state
+        .pointer_input
+        .native_grab()
+        .is_some_and(|grab| grab.owner != window.id())
+    {
+        release_pointer_lock(state, window);
+    }
+    clear_pointer_focus(state, time);
+    if let Some(old_owner) = old_owner {
+        state.native_cursor_left_window(old_owner);
+    }
+}
+
+fn invalidate_pointer_window(state: &mut AppState, window: &winit::window::Window, time: u32) {
+    if state
+        .pointer_input
+        .native_grab()
+        .is_some_and(|grab| grab.owner == window.id())
+    {
+        release_pointer_lock(state, window);
+        clear_pointer_focus(state, time);
+    }
+}
+
+fn forward_relative_motion(
+    state: &mut AppState,
+    focused_owner: Option<winit::window::WindowId>,
+    desktop: &winit::window::Window,
+    rootless: &HashMap<winit::window::WindowId, presentation::RootlessWindow>,
+    delta: (f64, f64),
+    utime: u64,
+) -> bool {
+    let Some(pointer) = state.seat.get_pointer() else {
+        return false;
+    };
+    let actual = pointer.current_focus();
+    let Some(focus) = state
+        .pointer_input
+        .relative_focus(focused_owner, actual.as_ref())
+        .cloned()
+    else {
+        return false;
+    };
+    let Some(window) = pointer_owner_window(focus.owner, desktop, rootless) else {
+        return false;
+    };
+    let local = pointer.current_location() - smithay::utils::Point::from(focus.origin);
+    if !window.has_focus()
+        || window.is_visible() == Some(false)
+        || !state.pointer_focus_origin_current()
+        || !state.pointer_lock_region(&focus.surface, local, None).0
+    {
+        return false;
+    }
+    let points_per_logical = if focus.owner == desktop.id() {
+        state.scale_factor / desktop.scale_factor()
+    } else {
+        1.0
+    };
+    let Some(delta) = pointer_input::relative_delta(delta, points_per_logical) else {
+        return false;
+    };
+    pointer.relative_motion(
+        state,
+        Some((focus.surface, focus.origin.into())),
+        &smithay::input::pointer::RelativeMotionEvent {
+            delta: delta.into(),
+            // Winit exposes one NSEvent-derived delta. This is an approximation,
+            // not independently measured sensitivity-free hardware motion.
+            delta_unaccel: delta.into(),
+            utime,
+        },
+    );
+    pointer.frame(state);
+    true
 }
 
 fn rootless_pointer_motion(
@@ -3147,52 +3544,32 @@ fn rootless_pointer_motion(
     position: winit::dpi::PhysicalPosition<f64>,
     time: u32,
 ) {
-    let logical = position.to_logical::<f64>(rootless.scale_factor);
-    let location =
-        smithay::utils::Point::<f64, smithay::utils::Logical>::from((logical.x, logical.y));
-    let delta = location - rootless.last_pointer;
-    let focus = presentation::surface_under(rootless, &state.popups, location)
-        .or_else(|| Some((rootless.toplevel.wl_surface().clone(), (0.0, 0.0).into())));
     let pointer = state
         .seat
         .get_pointer()
         .expect("pointer seat is configured");
-    if delta.x != 0.0 || delta.y != 0.0 {
-        pointer.relative_motion(
-            state,
-            focus.clone(),
-            &smithay::input::pointer::RelativeMotionEvent {
-                delta,
-                delta_unaccel: delta,
-                utime: u64::from(time) * 1000,
-            },
-        );
+    if state.pointer_input.freezes_absolute() {
+        return;
     }
-    let locked = pointer.current_focus().is_some_and(|surface| {
-        smithay::wayland::pointer_constraints::with_pointer_constraint::<AppState, _, _>(
-            &surface,
-            &pointer,
-            |constraint| {
-                constraint.is_some_and(|constraint| {
-                    matches!(
-                        *constraint,
-                        smithay::wayland::pointer_constraints::PointerConstraint::Locked(_)
-                    ) && constraint.is_active()
-                })
-            },
-        )
-    });
-    if !locked {
-        pointer.motion(
-            state,
-            focus,
-            &MotionEvent {
-                location,
-                serial: SERIAL_COUNTER.next_serial(),
-                time,
-            },
-        );
-    }
+    let logical = position.to_logical::<f64>(rootless.scale_factor);
+    let location =
+        smithay::utils::Point::<f64, smithay::utils::Logical>::from((logical.x, logical.y));
+    let focus = presentation::surface_under(rootless, &state.popups, location)
+        .or_else(|| Some((rootless.toplevel.wl_surface().clone(), (0.0, 0.0).into())));
+    pointer.motion(
+        state,
+        focus.clone(),
+        &MotionEvent {
+            location,
+            serial: SERIAL_COUNTER.next_serial(),
+            time,
+        },
+    );
+    state.record_pointer_motion(
+        rootless.renderer.window.id(),
+        focus,
+        pointer.current_focus(),
+    );
     pointer.frame(state);
     state.refresh_native_cursor();
     rootless.last_pointer = location;
@@ -3256,6 +3633,9 @@ fn rootless_pointer_button(
         .seat
         .get_pointer()
         .expect("pointer seat is configured");
+    state
+        .pointer_input
+        .button(button, element_state == ElementState::Pressed);
     pointer.button(
         state,
         &ButtonEvent {
@@ -3454,7 +3834,7 @@ fn create_event_handler(
     let mut pending_input_sample: Option<(std::time::Instant, u64)> = None;
     let mut input_to_present_ms: Option<f64> = None;
     let mut last_parent_check = std::time::Instant::now();
-    let mut traced_input_sequence = 1_u64 << 63;
+    let mut key_transitions = input_policy::KeyTransitionReducer::default();
     Ok(move |event: Event<()>, target: &ActiveEventLoop| {
         let input_trace = if state.latency_trace.enabled()
             && matches!(
@@ -3465,10 +3845,12 @@ fn create_event_handler(
                         | WindowEvent::CursorMoved { .. }
                         | WindowEvent::MouseWheel { .. },
                     ..
+                } | Event::DeviceEvent {
+                    event: DeviceEvent::MouseMotion { .. },
+                    ..
                 }
             ) {
-            let id = traced_input_sequence;
-            traced_input_sequence = traced_input_sequence.wrapping_add(1);
+            let id = latency_trace::next_id();
             state.latency_trace.record(
                 latency_trace::Stage::HostNativeInput,
                 latency_trace::Tags {
@@ -3480,6 +3862,8 @@ fn create_event_handler(
         } else {
             None
         };
+        state.trace_input = input_trace;
+        state.trace_forwarded = None;
         // Winit delivers pending redraws before AboutToWait. Drain ready commits
         // before rendering so an already-arrived update is not delayed a frame.
         if matches!(
@@ -3494,6 +3878,12 @@ fn create_event_handler(
                 log::debug!("Wayland dispatch failed: {error}");
             }
             state.request_pending_guest_clipboard();
+            reconcile_pointer_lock(
+                &mut state,
+                key_transitions.owner(),
+                &renderer.window,
+                &rootless_windows,
+            );
             state.refresh_native_cursor();
             flush_wayland_output(&mut display, &wayland_source);
             wayland_source.rearm();
@@ -3509,6 +3899,9 @@ fn create_event_handler(
                     | WindowEvent::RotationGesture { .. }
                     | WindowEvent::Focused(_)
                     | WindowEvent::CursorLeft { .. },
+                ..
+            } | Event::DeviceEvent {
+                event: DeviceEvent::MouseMotion { .. },
                 ..
             }
         );
@@ -3674,6 +4067,17 @@ fn create_event_handler(
                         .filter(|window| window.surface_id() == surface_id)
                         .filter_map(|window| macos_gestures::window_number(&window.renderer.window))
                         .collect::<Vec<_>>();
+                    for window in rootless_windows
+                        .values()
+                        .filter(|window| window.surface_id() == surface_id)
+                    {
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &window.renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
+                    }
                     rootless_windows.retain(|_, window| window.surface_id() != surface_id);
                     for window_number in removed_window_numbers {
                         macos_gestures::uninstall_swipe_recognizer(window_number);
@@ -3734,19 +4138,31 @@ fn create_event_handler(
                         .values()
                         .find(|window| window.surface_id() == surface)
                     {
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &window.renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
                         window.renderer.window.set_minimized(true);
                     }
                 }
                 CompositorMessage::RootlessBeginMove(surface) => {
-                    if let Some(window) = rootless_windows
-                        .values()
-                        .find(|window| window.surface_id() == surface)
+                    if !state.pointer_input.freezes_absolute()
+                        && let Some(window) = rootless_windows
+                            .values()
+                            .find(|window| window.surface_id() == surface)
                         && let Err(error) = window.renderer.window.drag_window()
                     {
                         log::debug!("Native rootless window drag was rejected: {}", error);
                     }
                 }
                 CompositorMessage::ToggleHiDpi => {
+                    invalidate_pointer_window(
+                        &mut state,
+                        &renderer.window,
+                        start_time.elapsed().as_millis() as u32,
+                    );
                     hidpi_enabled = !hidpi_enabled;
                     // Two modes:
                     //  • HiDPI (scale=2): configure clients at logical (800×600).
@@ -4724,7 +5140,29 @@ fn create_event_handler(
                 }
             }
         }
+        reconcile_pointer_lock(
+            &mut state,
+            key_transitions.owner(),
+            &renderer.window,
+            &rootless_windows,
+        );
         match event {
+            Event::DeviceEvent {
+                event: DeviceEvent::MouseMotion { delta },
+                ..
+            } => {
+                if forward_relative_motion(
+                    &mut state,
+                    key_transitions.owner(),
+                    &renderer.window,
+                    &rootless_windows,
+                    delta,
+                    start_time.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                ) && pending_input_sample.is_none()
+                {
+                    pending_input_sample = Some((std::time::Instant::now(), state.commit_counter));
+                }
+            }
             Event::WindowEvent { window_id, event }
                 if rootless_windows.contains_key(&window_id) =>
             {
@@ -4735,6 +5173,11 @@ fn create_event_handler(
                 let event_time = start_time.elapsed().as_millis() as u32;
                 match event {
                     WindowEvent::Resized(size) => {
+                        invalidate_pointer_window(
+                            &mut state,
+                            &rootless.renderer.window,
+                            event_time,
+                        );
                         rootless_clocks
                             .entry(window_id)
                             .or_default()
@@ -4763,6 +5206,11 @@ fn create_event_handler(
                         state.needs_redraw = true;
                     }
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        invalidate_pointer_window(
+                            &mut state,
+                            &rootless.renderer.window,
+                            event_time,
+                        );
                         rootless_clocks
                             .entry(window_id)
                             .or_default()
@@ -4792,25 +5240,44 @@ fn create_event_handler(
                             ));
                     }
                     WindowEvent::CloseRequested => {
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &rootless.renderer.window,
+                            event_time,
+                        );
                         rootless.toplevel.send_close();
                         rootless.renderer.window.set_visible(false);
                     }
                     WindowEvent::Destroyed => {
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &rootless.renderer.window,
+                            event_time,
+                        );
                         keep_window = false;
                     }
                     WindowEvent::Focused(true) => {
+                        prepare_pointer_focus(&mut state, &rootless.renderer.window, event_time);
+                        state.pointer_input.request_reconcile();
+                        set_keyboard_owner(
+                            &mut state,
+                            &mut key_transitions,
+                            Some(window_id),
+                            event_time,
+                        );
                         activate_toplevel(&mut state, Some(rootless.toplevel.wl_surface()));
                     }
                     WindowEvent::Focused(false) => {
-                        state.native_cursor_left_window(window_id);
-                        release_pressed_keys(&mut state, event_time);
-                        if state
-                            .seat
-                            .get_keyboard()
-                            .and_then(|keyboard| keyboard.current_focus())
-                            .as_ref()
-                            == Some(rootless.toplevel.wl_surface())
-                        {
+                        let owned_keyboard = key_transitions.owner() == Some(window_id);
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &rootless.renderer.window,
+                            event_time,
+                        );
+                        if owned_keyboard {
                             activate_toplevel(&mut state, None);
                         }
                     }
@@ -4819,9 +5286,17 @@ fn create_event_handler(
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
                         }
-                        forward_keyboard_event(&mut state, event, event_time);
+                        forward_keyboard_event(
+                            &mut state,
+                            &mut key_transitions,
+                            window_id,
+                            event,
+                            event_time,
+                        );
                     }
-                    WindowEvent::CursorEntered { .. } => {
+                    WindowEvent::CursorEntered { .. }
+                        if state.pointer_input.native_grab().is_none() =>
+                    {
                         rootless.renderer.window.set_cursor_visible(true);
                         cursor_clock.set_refresh_millihertz(Some(
                             rootless_clocks
@@ -4834,20 +5309,24 @@ fn create_event_handler(
                     }
                     WindowEvent::CursorLeft { .. } => {
                         state.native_cursor_left_window(window_id);
-                        if let Some(pointer) = state.seat.get_pointer() {
-                            pointer.motion(
-                                &mut state,
-                                None,
-                                &MotionEvent {
-                                    location: rootless.last_pointer,
-                                    serial: SERIAL_COUNTER.next_serial(),
-                                    time: event_time,
-                                },
-                            );
-                            pointer.frame(&mut state);
+                        if state
+                            .pointer_input
+                            .native_grab()
+                            .is_some_and(|grab| grab.owner == window_id)
+                        {
+                            release_pointer_lock(&mut state, &rootless.renderer.window);
+                        }
+                        if state
+                            .pointer_input
+                            .focus()
+                            .is_some_and(|focus| focus.owner == window_id)
+                        {
+                            clear_pointer_focus(&mut state, event_time);
                         }
                     }
-                    WindowEvent::CursorMoved { position, .. } => {
+                    WindowEvent::CursorMoved { position, .. }
+                        if !state.pointer_input.freezes_absolute() =>
+                    {
                         if pending_input_sample.is_none() {
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
@@ -4859,7 +5338,11 @@ fn create_event_handler(
                         state: press,
                         button,
                         ..
-                    } => {
+                    } if state
+                        .pointer_input
+                        .native_grab()
+                        .is_none_or(|grab| grab.owner == window_id) =>
+                    {
                         if pending_input_sample.is_none() {
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
@@ -4978,6 +5461,11 @@ fn create_event_handler(
             Event::WindowEvent { window_id, event } if window_id == renderer.window.id() => {
                 match event {
                     WindowEvent::Resized(size) => {
+                        invalidate_pointer_window(
+                            &mut state,
+                            &renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
                         desktop_clock
                             .set_refresh_millihertz(window_refresh_millihertz(&renderer.window));
                         renderer.resize(size.width, size.height);
@@ -5018,6 +5506,11 @@ fn create_event_handler(
                         state.needs_redraw = true;
                     }
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        invalidate_pointer_window(
+                            &mut state,
+                            &renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
                         desktop_clock
                             .set_refresh_millihertz(window_refresh_millihertz(&renderer.window));
                         log::info!("ScaleFactorChanged: {}", scale_factor);
@@ -5040,19 +5533,31 @@ fn create_event_handler(
                         }
                     }
                     WindowEvent::CloseRequested => {
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
                         if display_worker_slot.is_some() {
                             target.exit();
                         } else {
-                            release_pressed_keys(
-                                &mut state,
-                                start_time.elapsed().as_millis() as u32,
-                            );
                             state.native_cursor_left_window(window_id);
                             renderer.window.set_cursor_visible(true);
                             renderer.window.set_visible(false);
                         }
                     }
-                    WindowEvent::CursorEntered { .. } => {
+                    WindowEvent::Destroyed => {
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
+                    }
+                    WindowEvent::CursorEntered { .. }
+                        if state.pointer_input.native_grab().is_none() =>
+                    {
                         renderer.window.set_cursor_visible(true);
                         cursor_clock
                             .set_refresh_millihertz(Some(desktop_clock.refresh_millihertz()));
@@ -5064,101 +5569,62 @@ fn create_event_handler(
                     WindowEvent::CursorLeft { .. } => {
                         state.native_cursor_left_window(window_id);
                         renderer.window.set_cursor_visible(true);
-                        if let Some(pointer) = state.seat.get_pointer() {
-                            pointer.motion(
+                        if state
+                            .pointer_input
+                            .native_grab()
+                            .is_some_and(|grab| grab.owner == window_id)
+                        {
+                            release_pointer_lock(&mut state, &renderer.window);
+                        }
+                        if state
+                            .pointer_input
+                            .focus()
+                            .is_some_and(|focus| focus.owner == window_id)
+                        {
+                            clear_pointer_focus(
                                 &mut state,
-                                None,
-                                &MotionEvent {
-                                    location: last_mouse_pos,
-                                    serial: SERIAL_COUNTER.next_serial(),
-                                    time: start_time.elapsed().as_millis() as u32,
-                                },
+                                start_time.elapsed().as_millis() as u32,
                             );
-                            pointer.frame(&mut state);
                         }
                     }
                     WindowEvent::Focused(false) => {
-                        state.native_cursor_left_window(window_id);
-                        if let Some(keyboard) = state.seat.get_keyboard() {
-                            let pressed_keys = keyboard.pressed_keys();
-                            if !pressed_keys.is_empty() {
-                                log::info!(
-                                    "Releasing {} held key(s) after the Cocoa-Way window lost focus",
-                                    pressed_keys.len()
-                                );
-                            }
-                            for keycode in pressed_keys {
-                                keyboard.input(
-                                    &mut state,
-                                    keycode,
-                                    smithay::backend::input::KeyState::Released,
-                                    SERIAL_COUNTER.next_serial(),
-                                    start_time.elapsed().as_millis() as u32,
-                                    |_, _, _| FilterResult::<()>::Forward,
-                                );
-                            }
-                        }
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
                     }
-                    WindowEvent::Focused(true) => {}
-                    WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                state: el_state,
-                                physical_key,
-                                ..
-                            },
-                        ..
-                    } => {
+                    WindowEvent::Focused(true) => {
+                        prepare_pointer_focus(
+                            &mut state,
+                            &renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
+                        state.pointer_input.request_reconcile();
+                        set_keyboard_owner(
+                            &mut state,
+                            &mut key_transitions,
+                            Some(window_id),
+                            start_time.elapsed().as_millis() as u32,
+                        );
+                    }
+                    WindowEvent::KeyboardInput { event, .. } => {
                         if pending_input_sample.is_none() {
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
                         }
-                        if let winit::keyboard::PhysicalKey::Code(key_code) = physical_key {
-                            match key_code {
-                                _ => {
-                                    use smithay::backend::input::KeyState;
-                                    use smithay::input::keyboard::Keycode;
-                                    let serial = SERIAL_COUNTER.next_serial();
-                                    let time = start_time.elapsed().as_millis() as u32;
-                                    if let Some(keyboard) = state.seat.get_keyboard() {
-                                        if let Some(scancode) = crate::keymap::map_key(physical_key)
-                                        {
-                                            let key_state = match el_state {
-                                                ElementState::Pressed => KeyState::Pressed,
-                                                ElementState::Released => KeyState::Released,
-                                            };
-                                            let keycode = Keycode::from(scancode + 8);
-                                            keyboard.input(
-                                                &mut state,
-                                                keycode,
-                                                key_state,
-                                                serial,
-                                                time,
-                                                |_, modifiers, _| {
-                                                    if el_state == ElementState::Pressed
-                                                        && matches!(
-                                                            key_code,
-                                                            winit::keyboard::KeyCode::KeyC
-                                                                | winit::keyboard::KeyCode::KeyV
-                                                        )
-                                                        && modifiers.ctrl
-                                                        && modifiers.shift
-                                                    {
-                                                        log::info!(
-                                                            "Forwarding Ctrl+Shift+{:?} to the focused Wayland client",
-                                                            key_code
-                                                        );
-                                                    }
-                                                    FilterResult::<()>::Forward
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        forward_keyboard_event(
+                            &mut state,
+                            &mut key_transitions,
+                            window_id,
+                            event,
+                            start_time.elapsed().as_millis() as u32,
+                        );
                     }
-                    WindowEvent::CursorMoved { position, .. } => {
+                    WindowEvent::CursorMoved { position, .. }
+                        if !state.pointer_input.freezes_absolute() =>
+                    {
                         if pending_input_sample.is_none() {
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
@@ -5178,7 +5644,6 @@ fn create_event_handler(
                                 logical_pos.x,
                                 logical_pos.y,
                             ));
-                        let delta = cursor_logical_point - last_mouse_pos;
                         if let Some(target_id) = state.start_drag_request.take() {
                             let (cur_x, cur_y) = state
                                 .layout
@@ -5231,37 +5696,13 @@ fn create_event_handler(
                             );
                         }
                         let time = start_time.elapsed().as_millis() as u32;
-                        // Send relative motion if the focused surface has an active lock constraint.
-                        let is_locked = focus.as_ref().map(|(surface, _)| {
-                            smithay::wayland::pointer_constraints::with_pointer_constraint::<crate::state::AppState, _, _>(
-                                surface,
-                                &pointer,
-                                |constraint| {
-                                    constraint.map(|c| {
-                                        matches!(*c, smithay::wayland::pointer_constraints::PointerConstraint::Locked(_)) && c.is_active()
-                                    }).unwrap_or(false)
-                                },
-                            )
-                        }).unwrap_or(false);
-                        if delta.x != 0.0 || delta.y != 0.0 {
-                            pointer.relative_motion(
-                                &mut state,
-                                focus.clone(),
-                                &smithay::input::pointer::RelativeMotionEvent {
-                                    delta,
-                                    delta_unaccel: delta,
-                                    utime: time as u64 * 1000,
-                                },
-                            );
-                        }
-                        if !is_locked {
-                            let event = MotionEvent {
-                                location: cursor_logical_point,
-                                serial,
-                                time,
-                            };
-                            pointer.motion(&mut state, focus, &event);
-                        }
+                        let event = MotionEvent {
+                            location: cursor_logical_point,
+                            serial,
+                            time,
+                        };
+                        pointer.motion(&mut state, focus.clone(), &event);
+                        state.record_pointer_motion(window_id, focus, pointer.current_focus());
                         pointer.frame(&mut state);
                         state.refresh_native_cursor();
                         last_mouse_pos = cursor_logical_point;
@@ -5270,7 +5711,11 @@ fn create_event_handler(
                         state: el_state,
                         button,
                         ..
-                    } => {
+                    } if state
+                        .pointer_input
+                        .native_grab()
+                        .is_none_or(|grab| grab.owner == window_id) =>
+                    {
                         if pending_input_sample.is_none() {
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
@@ -5322,6 +5767,7 @@ fn create_event_handler(
                         }
                         if p_state == smithay::backend::input::ButtonState::Pressed
                             && button == winit::event::MouseButton::Left
+                            && !state.pointer_input.freezes_absolute()
                         {
                             if let Some(target_id) = state.start_drag_request.take() {
                                 let (cur_x, cur_y) = state
@@ -5347,6 +5793,9 @@ fn create_event_handler(
                             serial,
                             time,
                         };
+                        state
+                            .pointer_input
+                            .button(button_code, el_state == ElementState::Pressed);
                         pointer.button(&mut state, &event);
                         pointer.frame(&mut state);
                     }
@@ -5552,6 +6001,12 @@ fn create_event_handler(
                 match display.dispatch_clients(&mut state) {
                     Ok(_) => {
                         state.request_pending_guest_clipboard();
+                        reconcile_pointer_lock(
+                            &mut state,
+                            key_transitions.owner(),
+                            &renderer.window,
+                            &rootless_windows,
+                        );
                         flush_wayland_output(&mut display, &wayland_source);
                     }
                     Err(error) => log::debug!("Wayland dispatch failed: {error}"),
@@ -5707,6 +6162,7 @@ fn create_event_handler(
                 }
             }
             Event::LoopExiting => {
+                release_pointer_lock(&mut state, &renderer.window);
                 if let Some(writer) = trace_writer.take() {
                     std::thread::spawn(move || {
                         let _ = writer.finish();
@@ -5738,6 +6194,12 @@ fn create_event_handler(
             }
             _ => {}
         }
+        reconcile_pointer_lock(
+            &mut state,
+            key_transitions.owner(),
+            &renderer.window,
+            &rootless_windows,
+        );
         if input_event {
             flush_wayland_output(&mut display, &wayland_source);
             if let Some(id) = input_trace {
@@ -5745,6 +6207,12 @@ fn create_event_handler(
                     latency_trace::Stage::Forwarded,
                     latency_trace::Tags {
                         correlation_id: Some(latency_trace::Tag::U64(id)),
+                        source_event_serial: state
+                            .trace_forwarded
+                            .map(|(_, serial, _)| latency_trace::Tag::U64(u64::from(serial))),
+                        source_event_time: state
+                            .trace_forwarded
+                            .map(|(_, _, time)| latency_trace::Tag::U64(u64::from(time))),
                         ..Default::default()
                     },
                 );
