@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-2.0.3-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
+[![Version](https://img.shields.io/badge/version-2.1.0-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
 [![Build Status](https://github.com/J-x-Z/cocoa-way/actions/workflows/release.yml/badge.svg)](https://github.com/J-x-Z/cocoa-way/actions)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
@@ -22,13 +22,13 @@
 
 Cocoa-Way receives the Wayland protocol on macOS and presents Linux applications through a Metal renderer. It can connect to an existing Linux machine with Waypipe or manage local GUI applications through Apple Container, Docker, and OrbStack.
 
-Version 2.0 models the product around three explicit objects:
+Applications are modeled around three objects:
 
 - **Application profile**: saved image, command, runtime, presentation, audio, mounts, and environment settings.
 - **Application instance**: one running profile with its own process, logs, transport, and lifecycle state.
 - **Display**: the default compositor window or an isolated display worker assigned to an instance.
 
-This keeps classic SSH and local-socket workflows available while making Apple Container a first-class runtime.
+Version 2.1 reduces dependency maintenance: pinned upstream Smithay with a small, reproducible patch set, no unused Pixman linkage, and pinned native window bindings. Existing SSH, container, Desktop, and Rootless workflows remain available.
 
 ## Demo
 
@@ -36,7 +36,7 @@ This keeps classic SSH and local-socket workflows available while making Apple C
 
 ## Highlights
 
-| Area | Cocoa-Way 2.0 |
+| Area | Cocoa-Way 2.1 |
 | --- | --- |
 | Rendering | Native Metal renderer with Retina scaling and damage-aware SHM uploads |
 | Presentation | Desktop mode for compositors and rootless mode for individual xdg-shell applications |
@@ -57,15 +57,7 @@ Apple Container is a separate Apple runtime and is not bundled with Cocoa-Way. A
 2. Open Cocoa-Way and select **Container > Apple Container**.
 3. Use **Start System**, then confirm that the Compatibility card reports a running service.
 
-Use the latest official Apple Container release (currently [1.5.0](https://github.com/apple/container/releases/tag/1.5.0)). Cocoa-Way retains a compatibility relay for older releases, but [1.4.1](https://github.com/apple/container/releases/tag/1.4.1) is the current security baseline because it fixes OCI image loading and Unix-socket vulnerabilities. Transport V2 support is detected separately. You can verify or update the runtime manually with:
-
-```bash
-container --version
-container system stop
-/usr/local/bin/update-container.sh
-container system start
-container system status
-```
+Use the latest official release; the managed workflow has been validated with [1.5.0](https://github.com/apple/container/releases/tag/1.5.0). Avoid versions older than [1.4.1](https://github.com/apple/container/releases/tag/1.4.1), which fixes OCI image loading and Unix-socket vulnerabilities. Cocoa-Way checks runtime capabilities separately from the version number.
 
 This runtime is optional when Cocoa-Way is used only with SSH, Docker, OrbStack, or an existing local Waypipe socket.
 
@@ -84,7 +76,7 @@ Download the current `.dmg` or `.zip` from [GitHub Releases](https://github.com/
 ### Build from source
 
 ```bash
-brew install libxkbcommon pixman pkg-config
+brew install libxkbcommon pkg-config
 git clone https://github.com/J-x-Z/cocoa-way.git
 cd cocoa-way
 cargo build --release
@@ -123,15 +115,8 @@ The first check or launch after installing or updating Apple Container may downl
 
 ## Presentation modes
 
-### Desktop
-
-Desktop presentation maps Linux windows into one Cocoa-Way compositor window. Use it for nested compositors such as niri or Hyprland and for workflows that intentionally share one Linux desktop surface.
-
-### Rootless
-
-Rootless presentation maps each xdg-toplevel to a separate native macOS window. Native move, resize, minimize, maximize, fullscreen, title updates, popups, and per-surface input are forwarded to the Linux application.
-
-Use Rootless for ordinary Wayland applications such as Foot or Firefox. A desktop compositor is not a rootless application and should remain in Desktop mode.
+- **Desktop** maps Linux windows into one compositor window. Use it for nested compositors such as niri or Hyprland, or a shared Linux desktop.
+- **Rootless** maps each xdg-toplevel to a native macOS window, forwarding move, resize, minimize, maximize, fullscreen, titles, popups, and per-surface input. Use it for ordinary Wayland applications such as Foot or Firefox, not nested desktop compositors.
 
 ## Container mode
 
@@ -145,7 +130,7 @@ The runtime panels expose system state, machines or contexts, containers, images
 
 ### Apple Container transport
 
-On Apple Container 1.0 and newer, Cocoa-Way prefers Transport V2. It publishes a host Unix socket into the container, multiplexes Waypipe streams over that channel, and ties the relay lifetime to the application instance. If socket publishing is unavailable or fails during startup, Cocoa-Way can fall back to the older stdio relay.
+When socket publishing is available, Cocoa-Way prefers Transport V2. It publishes a host Unix socket into the container, multiplexes Waypipe streams over that channel, and ties the relay lifetime to the application instance. If publishing is unavailable or fails during startup, it can fall back to the stdio relay. Both paths still need Waypipe to reconstruct cross-system shared memory and file descriptors; publishing a raw Wayland socket alone is not sufficient.
 
 Clipboard and audio use dedicated local relays. If the Mac uses a loopback HTTP proxy, Cocoa-Way can expose that proxy to the Apple Container subnet without changing global network settings.
 
@@ -189,30 +174,7 @@ The bundled `skills/cocoa-way-onboarding` workflow guides new users through imag
 
 ## Architecture
 
-```mermaid
-graph LR
-    subgraph macOS
-        UI[Applications and runtime UI]
-        API[cocoa-wayctl and MCP]
-        CW[Cocoa-Way compositor]
-        Metal[Metal renderer]
-        Audio[CoreAudio]
-    end
-
-    subgraph Linux
-        App[Wayland application]
-        WPServer[Waypipe server]
-        Helpers[Clipboard and audio relays]
-    end
-
-    UI --> CW
-    API --> CW
-    App --> WPServer
-    WPServer <-->|SSH, Unix socket, or Transport V2| CW
-    Helpers <-->|local relay sockets| CW
-    CW --> Metal
-    CW --> Audio
-```
+Linux Wayland clients connect through Waypipe over SSH, a Unix socket, or Transport V2. On macOS, Smithay handles protocol state, Cocoa-Way presents SHM buffers through Metal, and AppKit/winit manage windows and input. Clipboard and CoreAudio forwarding use dedicated relays. The GUI, CLI, and MCP share the same local control plane.
 
 Dedicated displays run as isolated Cocoa-Way worker processes. A rootless worker may own several native application windows while retaining one runtime/display assignment. Worker telemetry is published back to the control plane without forcing the GUI to redraw continuously.
 
@@ -248,20 +210,24 @@ waypipe ssh -o StreamLocalBindUnlink=yes user@host application
 
 - Continue refining GUI behavior and improving Cocoa-Way's responsiveness and runtime efficiency.
 - Continue closing the remaining integration gaps toward a WSLg-like experience for Linux applications on macOS.
+- Evaluate a Vulkan-oriented architecture for 3.0. Guest GPU acceleration and game compatibility are research goals, not current features.
 
 ## Development
 
 ```bash
-cargo check --release --all-targets
-cargo test --release --all-targets
-cargo build --release
+cargo fmt --all --check
+python3 scripts/vendor-smithay.py
+cargo test --workspace --locked
+cargo build --release --bins --locked
 ```
 
-The repository vendors the Smithay Universal integration used by Cocoa-Way. `waypipe-darwin` remains a separately maintained dependency so its Darwin transport fixes can be tested and released independently.
+Smithay is vendored from a pinned official upstream revision with proven frontend backports, one Darwin read-only keymap-file patch, and standalone packaging metadata. Sources and checksums are recorded in [`vendor/sources.toml`](vendor/sources.toml); normal builds are offline and do not need a separately maintained Smithay Universal checkout. To reproduce the vendor tree from a local upstream clone containing the pinned commits, run `python3 scripts/vendor-smithay.py --source /path/to/smithay` (Python 3.11+).
+
+`waypipe-darwin` remains an external upstream-based port for Darwin FD/SHM and lifecycle compatibility. Winit and the native Objective-C bindings remain pinned; replacing the event loop or renderer is outside this maintenance release.
 
 ## Contributing
 
-Bug reports should include the application profile, presentation mode, runtime, Cocoa-Way diagnostics, and the relevant launch log. Please discuss large architectural changes in an issue before opening a pull request.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for reproduction and validation requirements. AI-assisted changes are welcome, but the author remains responsible for understanding, testing, and reporting the actual results of their changes.
 
 ## License
 
