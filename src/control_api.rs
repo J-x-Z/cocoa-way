@@ -436,6 +436,10 @@ fn volumes_snapshot() -> Value {
 
 fn runtimes_snapshot() -> Value {
     let child_path = build_child_path();
+    let orbstack_status = command_probe("orbctl", &["status"], &child_path);
+    let orbstack_machines = orbstack_machines_snapshot(&orbstack_status, || {
+        command_snapshot("orbctl", &["list", "--format", "json"], &child_path)
+    });
     json!({
         "operations": container_mode::control_runtime_states()
             .into_iter()
@@ -456,10 +460,35 @@ fn runtimes_snapshot() -> Value {
         },
         "orbstack_provider": {
             "cli": command_probe("orbctl", &["version"], &child_path),
-            "status": command_probe("orbctl", &["status"], &child_path),
-            "machines": command_snapshot("orbctl", &["list", "--format", "json"], &child_path),
+            "status": orbstack_status,
+            "machines": orbstack_machines,
         },
     })
+}
+
+fn orbstack_machines_snapshot(status: &Value, list_machines: impl FnOnce() -> Value) -> Value {
+    let running = status["result"]["success"].as_bool() == Some(true)
+        && status["result"]["stdout"]
+            .as_array()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .is_some_and(|stdout| stdout.trim().eq_ignore_ascii_case("running"));
+    // `orbctl list` starts a stopped OrbStack, unlike the safe status probe.
+    if running {
+        list_machines()
+    } else {
+        json!({
+            "available": status["available"],
+            "success": false,
+            "skipped": true,
+            "reason": "OrbStack is stopped or its running state is unconfirmed; machine listing was skipped to avoid starting it.",
+        })
+    }
 }
 
 fn environment_snapshot(path: &Path) -> Value {
@@ -636,6 +665,62 @@ mod tests {
         assert_eq!(snapshot["success"], false);
         assert_eq!(snapshot["data"]["status"], "not running");
         assert_eq!(snapshot["stdout"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn orbstack_machine_listing_is_skipped_unless_running_is_confirmed() {
+        for status in [
+            json!({ "available": false, "error": "orbctl command not found" }),
+            json!({ "available": true, "result": { "success": false, "error": "timeout" } }),
+            json!({ "available": true, "result": { "success": false, "stdout": ["Running"] } }),
+            json!({ "available": true, "result": { "success": true, "stdout": ["Stopped"] } }),
+            json!({ "available": true, "result": { "success": true, "stdout": ["OrbStack is not running"] } }),
+            json!({ "available": true, "result": { "success": true, "stdout": ["Unknown"] } }),
+            json!({ "available": true, "result": { "success": true, "stdout": ["Checking whether OrbStack is running"] } }),
+            json!({ "available": true, "result": { "success": true, "stdout": [] } }),
+            json!({ "available": true, "result": { "success": true } }),
+        ] {
+            let snapshot = orbstack_machines_snapshot(&status, || {
+                panic!("machine listing must not run for status {status}")
+            });
+            assert_eq!(snapshot["available"], status["available"]);
+            assert_eq!(snapshot["success"], false);
+            assert_eq!(snapshot["skipped"], true);
+            assert!(
+                snapshot["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("avoid starting")
+            );
+        }
+    }
+
+    #[test]
+    fn orbstack_machine_listing_preserves_inventory_when_running() {
+        let inventory = json!({
+            "available": true,
+            "success": true,
+            "data": [{ "name": "ubuntu" }],
+            "stdout": ["[{\"name\":\"ubuntu\"}]"],
+            "stderr": [],
+        });
+        for stdout in [
+            json!(["Running"]),
+            json!(["  RUNNING  "]),
+            json!(["", "running", ""]),
+        ] {
+            let status = json!({
+                "available": true,
+                "result": { "success": true, "stdout": stdout },
+            });
+            let mut listed = false;
+            let snapshot = orbstack_machines_snapshot(&status, || {
+                listed = true;
+                inventory.clone()
+            });
+            assert!(listed);
+            assert_eq!(snapshot, inventory);
+        }
     }
 
     #[test]

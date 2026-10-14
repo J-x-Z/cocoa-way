@@ -3141,24 +3141,24 @@ fn forward_keyboard_event(
     };
     let keycode = smithay::input::keyboard::Keycode::from(scancode + 8);
     if let Some(keyboard) = state.seat.get_keyboard() {
-        if keyboard.current_focus().is_none()
-            || !keys.key(
-                window,
-                scancode,
-                match event.state {
-                    ElementState::Pressed => input_policy::KeyTransition::Pressed,
-                    ElementState::Released => input_policy::KeyTransition::Released,
-                },
-                event.repeat,
-            )
-        {
+        let has_focus = keyboard.current_focus().is_some();
+        if !keys.key_with_focus(
+            window,
+            scancode,
+            match event.state {
+                ElementState::Pressed => input_policy::KeyTransition::Pressed,
+                ElementState::Released => input_policy::KeyTransition::Released,
+            },
+            event.repeat,
+            has_focus,
+        ) {
             return;
         }
         let serial = SERIAL_COUNTER.next_serial();
         keyboard.input(state, keycode, key_state, serial, time, |_, _, _| {
             FilterResult::<()>::Forward
         });
-        if let Some(id) = state.trace_input {
+        if has_focus && let Some(id) = state.trace_input {
             state.trace_forwarded = Some((id, u32::from(serial), time));
         }
     }
@@ -3845,6 +3845,7 @@ fn create_event_handler(
     let mut input_to_present_ms: Option<f64> = None;
     let mut last_parent_check = std::time::Instant::now();
     let mut key_transitions = input_policy::KeyTransitionReducer::default();
+    let mut desktop_keyboard_focus = None;
     Ok(move |event: Event<()>, target: &ActiveEventLoop| {
         let input_trace = if state.latency_trace.enabled()
             && matches!(
@@ -5657,6 +5658,12 @@ fn create_event_handler(
                         }
                     }
                     WindowEvent::Focused(false) => {
+                        if key_transitions.owner() == Some(window_id) {
+                            desktop_keyboard_focus = state
+                                .seat
+                                .get_keyboard()
+                                .and_then(|keyboard| keyboard.current_focus());
+                        }
                         retire_input_window(
                             &mut state,
                             &mut key_transitions,
@@ -5677,6 +5684,23 @@ fn create_event_handler(
                             Some(window_id),
                             start_time.elapsed().as_millis() as u32,
                         );
+                        if let Some(keyboard) = state.seat.get_keyboard() {
+                            let selected = input_policy::resume_focus(
+                                &mut desktop_keyboard_focus,
+                                keyboard.current_focus().is_some(),
+                                |surface| {
+                                    surface.is_alive()
+                                        && state.layout.tile_for_surface(&surface.id()).is_some()
+                                },
+                            );
+                            if let Some(surface) = selected {
+                                keyboard.set_focus(
+                                    &mut state,
+                                    Some(surface),
+                                    SERIAL_COUNTER.next_serial(),
+                                );
+                            }
+                        }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if pending_input_sample.is_none() {

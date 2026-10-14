@@ -54,6 +54,21 @@ impl<Owner: Copy + Eq> KeyTransitionReducer<Owner> {
         self.set_owner(None)
     }
 
+    /// No target means no new presses, but accepted releases must still clear XKB.
+    pub fn key_with_focus(
+        &mut self,
+        owner: Owner,
+        evdev_key: u32,
+        transition: KeyTransition,
+        repeat: bool,
+        has_focus: bool,
+    ) -> bool {
+        if !has_focus && transition == KeyTransition::Pressed {
+            return false;
+        }
+        self.key(owner, evdev_key, transition, repeat)
+    }
+
     /// Returns true only when the caller should forward this transition.
     /// Rejects other owners, repeated/duplicate presses, and unmatched releases.
     /// A repeat flag never prevents releasing an accepted press.
@@ -73,6 +88,19 @@ impl<Owner: Copy + Eq> KeyTransitionReducer<Owner> {
             KeyTransition::Released => self.held_keys.remove(&evdev_key),
         }
     }
+}
+
+/// Consume a suspended selection without overriding a new click or reviving a dead target.
+pub fn resume_focus<Focus>(
+    saved: &mut Option<Focus>,
+    already_focused: bool,
+    live: impl FnOnce(&Focus) -> bool,
+) -> Option<Focus> {
+    let selected = saved.take();
+    if already_focused {
+        return None;
+    }
+    selected.filter(live)
 }
 
 /// Caller-supplied prerequisites for activating a pointer lock, not a grab
@@ -97,7 +125,51 @@ impl PointerLockEligibility {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyTransition, KeyTransitionReducer, PointerLockEligibility};
+    use super::{KeyTransition, KeyTransitionReducer, PointerLockEligibility, resume_focus};
+
+    #[test]
+    fn held_modifier_can_be_released_after_its_surface_loses_focus() {
+        let mut keys = KeyTransitionReducer::<u64>::default();
+        assert!(keys.set_owner(Some(1)).is_empty());
+        assert!(keys.key_with_focus(1, 42, KeyTransition::Pressed, false, true));
+        assert!(keys.key_with_focus(1, 42, KeyTransition::Released, false, false));
+        assert!(keys.key_with_focus(1, 42, KeyTransition::Pressed, false, true));
+        assert_eq!(keys.set_owner(None), vec![42]);
+    }
+
+    #[test]
+    fn unfocused_presses_do_not_create_held_keys() {
+        let mut keys = KeyTransitionReducer::<u64>::default();
+        assert!(keys.set_owner(Some(1)).is_empty());
+        assert!(!keys.key_with_focus(1, 42, KeyTransition::Pressed, false, false));
+        assert!(!keys.key_with_focus(1, 42, KeyTransition::Released, false, false));
+        assert!(!keys.key_with_focus(2, 42, KeyTransition::Released, false, false));
+        assert!(keys.set_owner(None).is_empty());
+    }
+
+    #[test]
+    fn reactivation_restores_only_a_live_suspended_target() {
+        let mut saved = Some(7);
+        assert_eq!(
+            resume_focus(&mut saved, false, |target| *target == 7),
+            Some(7)
+        );
+        assert!(saved.is_none());
+        saved = Some(7);
+        assert_eq!(resume_focus(&mut saved, false, |_| false), None);
+        assert!(saved.is_none());
+    }
+
+    #[test]
+    fn reactivation_does_not_override_new_or_deliberately_empty_focus() {
+        let mut saved = Some(7);
+        assert_eq!(
+            resume_focus(&mut saved, true, |_| panic!("already focused")),
+            None
+        );
+        assert!(saved.is_none());
+        assert_eq!(resume_focus(&mut saved, false, |_| true), None);
+    }
     use KeyTransition::{Pressed, Released};
 
     const A: u64 = 1;

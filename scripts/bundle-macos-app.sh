@@ -155,6 +155,29 @@ while [[ ${index} -lt ${#QUEUE[@]} ]]; do
     done < <(otool -L "${current}" | tail -n +2 | awk '{print $1}')
 done
 
+# Homebrew bottles can require a newer macOS than the Rust deployment target.
+# Declare the strictest bundled requirement before signing the app.
+version_number() {
+    local major minor patch
+    IFS=. read -r major minor patch <<< "$1"
+    printf '%s\n' "$((10#${major:-0} * 1000000 + 10#${minor:-0} * 1000 + 10#${patch:-0}))"
+}
+
+MIN_MACOS=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${APP_DIR}/Contents/Info.plist")
+for current in "${QUEUE[@]}"; do
+    while IFS= read -r required; do
+        [[ -n "${required}" ]] || continue
+        if [[ $(version_number "${required}") -gt $(version_number "${MIN_MACOS}") ]]; then
+            MIN_MACOS=${required}
+        fi
+    done < <(otool -l "${current}" | awk '
+        $1 == "cmd" { minimum = ($2 == "LC_BUILD_VERSION" || $2 == "LC_VERSION_MIN_MACOSX") }
+        minimum && ($1 == "minos" || $1 == "version") { print $2; minimum = 0 }
+    ')
+done
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion ${MIN_MACOS}" "${APP_DIR}/Contents/Info.plist"
+printf 'Bundled app requires macOS %s or later\n' "${MIN_MACOS}"
+
 # install_name_tool invalidates the ad-hoc signatures Cargo places on Mach-O
 # binaries. Re-sign nested code first so macOS can launch the bundled helpers.
 if command -v codesign >/dev/null 2>&1; then
