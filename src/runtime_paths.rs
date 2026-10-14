@@ -39,6 +39,12 @@ pub(crate) fn configure_xkb_config_root() -> Result<PathBuf, String> {
         log::info!("Using XKB configuration from {}", root.display());
         return Ok(root.to_path_buf());
     }
+    if let Some(root) = &configured {
+        log::warn!(
+            "Configured XKB_CONFIG_ROOT '{}' is incomplete or unreadable; looking for bundled keyboard data instead.",
+            root.display()
+        );
+    }
 
     let executable = std::env::current_exe()
         .map_err(|error| format!("failed to locate the Cocoa-Way executable: {error}"))?;
@@ -76,9 +82,12 @@ fn bundled_xkb_config_root_for(executable: &Path) -> Option<PathBuf> {
 }
 
 fn is_xkb_config_root(path: &Path) -> bool {
-    path.join("rules/evdev").is_file()
-        && path.join("keycodes/evdev").is_file()
-        && path.join("symbols/us").is_file()
+    ["rules/evdev", "keycodes/evdev", "symbols/us"]
+        .iter()
+        .all(|name| {
+            let file = path.join(name);
+            file.is_file() && std::fs::File::open(file).is_ok()
+        })
 }
 
 pub(crate) fn resolve_command_path(

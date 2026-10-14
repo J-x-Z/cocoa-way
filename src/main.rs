@@ -37,6 +37,7 @@ mod probe_marker;
 mod render;
 mod runtime_commands;
 mod runtime_paths;
+mod startup;
 mod state;
 mod wayland_source;
 
@@ -125,6 +126,7 @@ const DISPLAY_WORKER_RUNTIME_ENV: &str = "COCOA_WAY_DISPLAY_RUNTIME_DIR";
 const DISPLAY_WORKER_READY_ENV: &str = "COCOA_WAY_DISPLAY_READY_FILE";
 const DISPLAY_WORKER_PARENT_ENV: &str = "COCOA_WAY_DISPLAY_PARENT_PID";
 const DISPLAY_WORKER_PANIC_LOG: &str = "worker-panic.log";
+const DISPLAY_WORKER_STARTUP_ERROR_LOG: &str = "worker-startup-error.log";
 const DISPLAY_WORKER_PID_FILE: &str = "display.worker";
 static DISPLAY_WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static APPLICATION_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -133,6 +135,7 @@ static APPLICATION_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 enum CommandLineRequest {
     Help,
     Version,
+    Environment,
 }
 
 fn command_line_request(arguments: &[String]) -> Option<CommandLineRequest> {
@@ -143,6 +146,7 @@ fn command_line_request(arguments: &[String]) -> Option<CommandLineRequest> {
         [argument] if matches!(argument.as_str(), "-V" | "--version") => {
             Some(CommandLineRequest::Version)
         }
+        [argument] if argument == "--check-environment" => Some(CommandLineRequest::Environment),
         _ => None,
     }
 }
@@ -150,10 +154,24 @@ fn command_line_request(arguments: &[String]) -> Option<CommandLineRequest> {
 fn print_command_line_request(request: CommandLineRequest) {
     match request {
         CommandLineRequest::Help => println!(
-            "cocoa-way {}\n\nUsage: cocoa-way\n       cocoa-way --help\n       cocoa-way --version\n\nThe GUI exposes the local Wayland compositor, saved connections, and container control panel.",
+            "cocoa-way {}\n\nUsage: cocoa-way\n       cocoa-way --help\n       cocoa-way --version\n       cocoa-way --check-environment\n\nStartup opens the application panel and installs a menu bar control. Display windows open when needed. Environment checks do not start containers.",
             env!("CARGO_PKG_VERSION")
         ),
         CommandLineRequest::Version => println!("cocoa-way {}", env!("CARGO_PKG_VERSION")),
+        CommandLineRequest::Environment => {
+            let keyboard = runtime_paths::configure_xkb_config_root();
+            let home = startup::validate_home(std::env::var_os("HOME").as_deref());
+            println!("{}", startup::environment_report());
+            if let Err(error) = &keyboard {
+                println!("\nRequired keyboard data check FAILED: {error}");
+            }
+            if let Err(error) = &home {
+                println!("\nRequired user environment check FAILED: {error}");
+            }
+            if keyboard.is_err() || home.is_err() {
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -302,6 +320,20 @@ fn display_worker_panic_detail(runtime_dir: &std::path::Path) -> Option<String> 
     }
 }
 
+fn report_startup_failure(error: &str, worker: bool) {
+    log::error!("Cocoa-Way startup failed: {error}");
+    if worker {
+        if let Some(directory) = std::env::var_os(DISPLAY_WORKER_RUNTIME_ENV) {
+            let _ = std::fs::write(
+                std::path::PathBuf::from(directory).join(DISPLAY_WORKER_STARTUP_ERROR_LOG),
+                error,
+            );
+        }
+    } else if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+        menu_bar::show_startup_error(error, mtm);
+    }
+}
+
 fn install_display_worker_panic_report() {
     let Some(runtime_dir) = std::env::var_os(DISPLAY_WORKER_RUNTIME_ENV) else {
         return;
@@ -400,13 +432,23 @@ fn spawn_display_worker(
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                let startup_detail =
+                    std::fs::read_to_string(runtime_dir.join(DISPLAY_WORKER_STARTUP_ERROR_LOG))
+                        .ok()
+                        .map(|detail| {
+                            format!(
+                                "; startup: {}",
+                                detail.chars().take(1500).collect::<String>()
+                            )
+                        })
+                        .unwrap_or_default();
                 let panic_detail = display_worker_panic_detail(&runtime_dir)
                     .map(|detail| format!("; panic: {}", detail))
                     .unwrap_or_default();
                 let _ = std::fs::remove_dir_all(&runtime_dir);
                 return Err(format!(
-                    "dedicated display '{}' exited before becoming ready: {}{}",
-                    slot, status, panic_detail
+                    "dedicated display '{}' exited before becoming ready: {}{}{}",
+                    slot, status, startup_detail, panic_detail
                 ));
             }
             Ok(None) => {}
@@ -2719,40 +2761,58 @@ fn main() {
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         "cocoa_way=info,smithay=warn,wayland_server=warn,wayland_client=warn".into()
     });
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let is_display_worker = std::env::var_os(DISPLAY_WORKER_SLOT_ENV).is_some();
+    startup::initialize_logging(&filter, is_display_worker);
+    if let Err(error) = startup::validate_home(std::env::var_os("HOME").as_deref()) {
+        report_startup_failure(&error, is_display_worker);
+        std::process::exit(1);
+    }
     if let Err(error) = runtime_paths::configure_xkb_config_root() {
-        log::error!("{error}");
+        report_startup_failure(&error, is_display_worker);
+        std::process::exit(1);
     }
     if std::env::var_os(DISPLAY_WORKER_SLOT_ENV).is_none() {
         cleanup_stale_display_runtime_dirs();
     }
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = match EventLoop::new() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            let error = format!("Could not initialize the macOS event loop: {error}");
+            report_startup_failure(&error, is_display_worker);
+            std::process::exit(1);
+        }
+    };
     macos_gestures::set_event_loop_proxy(event_loop.create_proxy());
     let event_proxy = event_loop.create_proxy();
     let mut event_handler = None;
-    event_loop
-        .run(move |event, target| {
-            if event_handler.is_none() {
-                if !matches!(event, Event::Resumed) {
+    let startup_failed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let startup_failed_in_loop = startup_failed.clone();
+    if let Err(error) = event_loop.run(move |event, target| {
+        if event_handler.is_none() {
+            if !matches!(event, Event::Resumed) {
+                return;
+            }
+            match create_event_handler(target, event_proxy.clone()) {
+                Ok(handler) => event_handler = Some(handler),
+                Err(error) => {
+                    startup_failed_in_loop.set(true);
+                    report_startup_failure(&error, is_display_worker);
+                    target.exit();
                     return;
                 }
-                match create_event_handler(target, event_proxy.clone()) {
-                    Ok(handler) => event_handler = Some(handler),
-                    Err(error) => {
-                        log::error!("Cocoa-Way startup failed: {error}");
-                        // SAFETY: Resumed is delivered on the AppKit main thread.
-                        let mtm = unsafe { objc2_foundation::MainThreadMarker::new_unchecked() };
-                        menu_bar::show_startup_error(&error, mtm);
-                        target.exit();
-                        return;
-                    }
-                }
             }
-            if let Some(handler) = event_handler.as_mut() {
-                handler(event, target);
-            }
-        })
-        .unwrap();
+        }
+        if let Some(handler) = event_handler.as_mut() {
+            handler(event, target);
+        }
+    }) {
+        let error = format!("The macOS event loop stopped unexpectedly: {error}");
+        report_startup_failure(&error, is_display_worker);
+        std::process::exit(1);
+    }
+    if startup_failed.get() {
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -3023,6 +3083,10 @@ mod display_slot_tests {
             Some(CommandLineRequest::Version)
         );
         assert_eq!(command_line_request(&[]), None);
+        assert_eq!(
+            command_line_request(&["--check-environment".into()]),
+            Some(CommandLineRequest::Environment)
+        );
     }
 
     #[test]
@@ -3665,6 +3729,12 @@ fn create_event_handler(
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|pid| *pid > 1);
+    let runtime_dir = std::env::var_os(DISPLAY_WORKER_RUNTIME_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("cocoa-way"));
+    startup::prepare_private_directory(&runtime_dir).map_err(|error| {
+        format!("Could not prepare the private Wayland runtime directory '{}': {error}. Check its ownership, permissions, and available disk space.", runtime_dir.display())
+    })?;
     let window_title = display_worker_slot
         .as_ref()
         .map(|slot| format!("Cocoa-Way - {}", slot))
@@ -3672,7 +3742,10 @@ fn create_event_handler(
     // winit 0.30 requires macOS windows to be created after the first Resumed event.
     let window_attributes = winit::window::Window::default_attributes()
         .with_title(window_title)
-        .with_visible(!presentation_mode.is_rootless())
+        .with_visible(startup::show_display_at_startup(
+            display_worker_slot.is_some(),
+            presentation_mode.is_rootless(),
+        ))
         .with_inner_size(winit::dpi::LogicalSize::new(800.0f64, 600.0f64));
     let window = target
         .create_window(window_attributes)
@@ -3697,16 +3770,11 @@ fn create_event_handler(
     let (raw_signal, loop_receiver) = std::sync::mpsc::channel::<CompositorMessage>();
     let loop_signal = Sender::new(raw_signal, event_proxy.clone());
     let control_socket_path = if display_worker_slot.is_none() {
-        match control_api::start(loop_signal.clone()) {
-            Ok(path) => {
-                log::info!("Local control API listening on {}", path.display());
-                Some(path)
-            }
-            Err(error) => {
-                log::error!("Local control API is unavailable: {}", error);
-                None
-            }
-        }
+        let path = control_api::start(loop_signal.clone()).map_err(|error| format!(
+            "Could not start Cocoa-Way's local control service: {error}. Close any other running copy of Cocoa-Way, or check the socket directory permissions."
+        ))?;
+        log::info!("Local control API listening on {}", path.display());
+        Some(path)
     } else {
         None
     };
@@ -3743,17 +3811,6 @@ fn create_event_handler(
         Some((0, 0).into()),
     );
     state.output.set_preferred(initial_mode);
-    let runtime_dir = std::env::var_os(DISPLAY_WORKER_RUNTIME_ENV)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("cocoa-way"));
-    if !runtime_dir.exists() {
-        std::fs::create_dir_all(&runtime_dir).map_err(|error| {
-            format!(
-                "failed to create the Wayland runtime directory '{}': {error}",
-                runtime_dir.display()
-            )
-        })?;
-    }
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
     }
@@ -3846,6 +3903,8 @@ fn create_event_handler(
     let mut last_parent_check = std::time::Instant::now();
     let mut key_transitions = input_policy::KeyTransitionReducer::default();
     let mut desktop_keyboard_focus = None;
+    let mut reveal_first_desktop_client =
+        display_worker_slot.is_none() && !presentation_mode.is_rootless();
     Ok(move |event: Event<()>, target: &ActiveEventLoop| {
         let input_trace = if state.latency_trace.enabled()
             && matches!(
@@ -3982,12 +4041,37 @@ fn create_event_handler(
                 }
                 CompositorMessage::ShowDefaultDisplay => {
                     if display_worker_slot.is_none() {
+                        reveal_first_desktop_client = false;
                         if let Err(error) = desktop_background.restore(&renderer.window) {
                             log::warn!("Could not restore the desktop window: {error}");
                         }
                         menu_bar::set_desktop_background_active(desktop_background.is_active());
                         renderer.window.set_visible(true);
                         renderer.window.focus_window();
+                    }
+                }
+                CompositorMessage::HideDefaultDisplay => {
+                    if display_worker_slot.is_none() {
+                        reveal_first_desktop_client = false;
+                        retire_input_window(
+                            &mut state,
+                            &mut key_transitions,
+                            &renderer.window,
+                            start_time.elapsed().as_millis() as u32,
+                        );
+                        if let Err(error) = desktop_background.restore(&renderer.window) {
+                            log::warn!("Could not restore desktop role before hiding: {error}");
+                        }
+                        menu_bar::set_desktop_background_active(desktop_background.is_active());
+                        renderer.window.set_visible(false);
+                    }
+                }
+                CompositorMessage::DesktopToplevelCreated => {
+                    if reveal_first_desktop_client {
+                        reveal_first_desktop_client = false;
+                        renderer.window.set_visible(true);
+                        renderer.window.request_redraw();
+                        state.needs_redraw = true;
                     }
                 }
                 CompositorMessage::ToggleDesktopBackground => {
@@ -5612,6 +5696,7 @@ fn create_event_handler(
                         if display_worker_slot.is_some() {
                             target.exit();
                         } else {
+                            reveal_first_desktop_client = false;
                             state.native_cursor_left_window(window_id);
                             renderer.window.set_cursor_visible(true);
                             renderer.window.set_visible(false);
@@ -6249,9 +6334,10 @@ fn create_event_handler(
                     menu_bar::setup_menu(
                         &connections_for_menu,
                         &container_sessions_for_menu,
-                        sender,
+                        sender.clone(),
                         mtm,
                     );
+                    container_mode::show(sender, mtm);
                     // Disable macOS tab bar via NSView -> NSWindow
                     {
                         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -6288,6 +6374,11 @@ fn create_event_handler(
                 }
             }
             Event::LoopExiting => {
+                if display_worker_slot.is_none() {
+                    if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+                        menu_bar::remove_status_item(mtm);
+                    }
+                }
                 if let Err(error) = desktop_background.restore(&renderer.window) {
                     log::warn!("Could not restore desktop role during shutdown: {error}");
                 }

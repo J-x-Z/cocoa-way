@@ -21,6 +21,8 @@ pub enum CompositorMessage {
     RootlessMinimize(smithay::reexports::wayland_server::backend::ObjectId),
     RootlessBeginMove(smithay::reexports::wayland_server::backend::ObjectId),
     ShowDefaultDisplay,
+    HideDefaultDisplay,
+    DesktopToplevelCreated,
     ToggleHiDpi,
     ToggleDesktopBackground,
     RestoreDesktopWindow,

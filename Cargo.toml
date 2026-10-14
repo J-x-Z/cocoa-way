@@ -27,6 +27,7 @@ objc2-app-kit = { version = "=0.2.2", default-features = false, features = [
     "NSWindow", "NSAlert", "NSView", "NSGraphics",
     "NSControl", "NSText", "NSTextField", "NSSecureTextField",
     "NSButton", "NSPopUpButton", "NSScrollView", "NSTextView", "NSFont", "NSBox", "NSColor",
+    "NSStatusBar", "NSStatusItem", "NSStatusBarButton",
     "NSOpenPanel", "NSSavePanel", "NSPanel",
     "NSPasteboard",
     "NSBitmapImageRep", "NSImageRep",

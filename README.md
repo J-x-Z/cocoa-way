@@ -103,6 +103,8 @@ Start Cocoa-Way:
 cocoa-way
 ```
 
+Startup opens the application panel, not an empty compositor window. The Cocoa-Way icon on the right side of the macOS menu bar provides applications, saved connections, displays, environment checks, and diagnostic logs. Closing the panel keeps Cocoa-Way running; use **Quit Cocoa-Way** to exit. A Desktop display opens when a client connects, or through **Show Default Display**. Rootless applications still open their own native windows.
+
 Connect to an SSH host with the compatibility script:
 
 ```bash
@@ -221,6 +223,8 @@ Use the GUI diagnostics page or:
 cocoa-wayctl --json diagnostics "Application Name"
 cocoa-wayctl --json logs "Application Name"
 ```
+
+For startup and dependency troubleshooting without opening windows, run `cocoa-way --check-environment`. Warnings and errors are kept in bounded, private logs under `~/Library/Logs/Cocoa-Way`; the menu bar's **Open Diagnostic Logs** action reveals them. Environment checks do not start containers, and missing optional runtimes do not prevent other connection types from working.
 
 For classic SSH socket conflicts, `run_waypipe.sh` adds `StreamLocalBindUnlink=yes`. The equivalent manual command is:
 

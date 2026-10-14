@@ -75,13 +75,19 @@ pub struct CheckReport {
     pub image: String,
     pub command: String,
     pub waypipe: String,
+    pub waypipe_version: String,
     pub runtime_binary: String,
     pub container_name: String,
     pub running: bool,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
 pub enum LaunchError {
+    InvalidSession {
+        session: String,
+        hint: String,
+    },
     MissingCommand {
         command: String,
         hint: String,
@@ -126,13 +132,21 @@ pub enum LaunchError {
     StartWaypipe {
         source: std::io::Error,
     },
+    ProcessExited {
+        program: String,
+        status: std::process::ExitStatus,
+        hint: String,
+    },
 }
 
 impl fmt::Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LaunchError::InvalidSession { session, hint } => {
+                write!(f, "Invalid container session '{}'. {}", session, hint)
+            }
             LaunchError::MissingCommand { command, hint } => {
-                write!(f, "Missing command '{}'. {}", command, hint)
+                write!(f, "Required command '{}' is unavailable. {}", command, hint)
             }
             LaunchError::InvalidSocketPath { host_socket } => {
                 write!(
@@ -194,12 +208,27 @@ impl fmt::Display for LaunchError {
             LaunchError::SocketTimeout { host_socket } => {
                 write!(
                     f,
-                    "Timed out waiting for container socket at '{}'",
+                    "Timed out waiting for the Waypipe client socket at '{}'. Check Waypipe stderr, the selected display, and socket directory permissions, then retry.",
                     host_socket
                 )
             }
             LaunchError::StartWaypipe { source } => {
-                write!(f, "Failed to start waypipe client: {}", source)
+                write!(
+                    f,
+                    "Failed to start waypipe client: {}. Check waypipe_path, executable permissions, and the binary's macOS compatibility; reinstall Waypipe if necessary.",
+                    source
+                )
+            }
+            LaunchError::ProcessExited {
+                program,
+                status,
+                hint,
+            } => {
+                write!(
+                    f,
+                    "{} exited before startup completed ({}). {}",
+                    program, status, hint
+                )
             }
         }
     }
@@ -257,8 +286,13 @@ fn run_container_relay(args: Vec<String>) -> Result<(), String> {
     let container_name =
         std::env::var(RELAY_NAME_ENV).unwrap_or_else(|_| "cocoa-way-apple-relay".into());
     let child_path = build_child_path();
-    let container = resolve_command_path("container", None, "container", &child_path)
-        .ok_or_else(|| "missing command `container`".to_string())?;
+    let container = require_session_command(
+        "container",
+        None,
+        &child_path,
+        "Install Apple Container for this relay, then retry.",
+    )
+    .map_err(|error| error.to_string())?;
 
     let preference = std::env::var(RELAY_TRANSPORT_ENV)
         .unwrap_or_else(|_| "auto".into())
@@ -302,7 +336,7 @@ fn run_container_relay(args: Vec<String>) -> Result<(), String> {
                     "cocoa-way transport v2 startup failed: {}; falling back to stdio relay",
                     error
                 );
-                cleanup_named_runtime_container(
+                let _ = cleanup_named_runtime_container(
                     ContainerRuntime::Apple,
                     &container,
                     &child_path,
@@ -1457,11 +1491,24 @@ pub fn load_sessions() -> Vec<ContainerSession> {
 
 pub fn load_sessions_report() -> SessionLoadReport {
     let path = config_path();
+    load_sessions_report_from_path(&path)
+}
+
+fn load_sessions_report_from_path(path: &Path) -> SessionLoadReport {
+    let failure = |action: &str, error: &std::io::Error| SessionLoadReport {
+        sessions: vec![],
+        error: Some(format!(
+            "Failed to {action} {}: {error}. Check the path and file/directory permissions; existing configuration was not replaced.",
+            path.display()
+        )),
+    };
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
-        Err(_) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    return failure("create the configuration directory for", &error);
+                }
             }
             let example = r#"# cocoa-way container sessions
 # Container Mode owns local Linux GUI sessions. Classic SSH/OrbStack entries
@@ -1485,13 +1532,21 @@ pub fn load_sessions_report() -> SessionLoadReport {
 # profile = "single-app"
 # app = "foot"
 "#;
-            let _ = std::fs::write(&path, example);
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(example.as_bytes()));
+            if let Err(error) = result {
+                return failure("create example configuration at", &error);
+            }
             log::info!("Created example container-sessions.toml at {:?}", path);
             return SessionLoadReport {
                 sessions: vec![],
                 error: None,
             };
         }
+        Err(error) => return failure("read", &error),
     };
 
     match toml::from_str::<Config>(&content) {
@@ -1503,7 +1558,11 @@ pub fn load_sessions_report() -> SessionLoadReport {
             log::warn!("Failed to parse container-sessions.toml: {}", e);
             SessionLoadReport {
                 sessions: vec![],
-                error: Some(format!("Failed to parse {}: {}", path.display(), e)),
+                error: Some(format!(
+                    "Failed to parse {}: {}. Correct the TOML/session fields and retry; the file was not changed.",
+                    path.display(),
+                    e
+                )),
             }
         }
     }
@@ -1515,11 +1574,15 @@ pub fn append_session(session: &ContainerSession) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut content = std::fs::read_to_string(&path).unwrap_or_else(|_| {
-        "# cocoa-way container sessions\n\
+    let mut content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "# cocoa-way container sessions\n\
          # Container Mode owns local Linux GUI sessions.\n"
-            .into()
-    });
+                .into()
+        }
+        Err(error) => return Err(error),
+    };
     if !content.ends_with('\n') {
         content.push('\n');
     }
@@ -1681,40 +1744,40 @@ pub(crate) fn session_to_toml(session: &ContainerSession) -> String {
 }
 
 pub fn check_session(session: &ContainerSession) -> Result<CheckReport, LaunchError> {
+    validate_session(session)?;
     let child_path = build_child_path();
-    let waypipe = resolve_command_path(
+    let waypipe = require_session_command(
         "waypipe",
         session.waypipe_path.as_deref(),
-        "waypipe",
         &child_path,
-    )
-    .ok_or_else(|| LaunchError::MissingCommand {
-        command: "waypipe".into(),
-        hint: "Install waypipe or set waypipe_path in container-sessions.toml.".into(),
-    })?;
+        "Install Waypipe or correct waypipe_path in container-sessions.toml.",
+    )?;
     let runtime_binary_name = runtime_binary_name(&session.runtime);
     let runtime_kind = normalize_container_runtime(&session.runtime);
-    let runtime_binary =
-        resolve_command_path(runtime_binary_name, None, runtime_binary_name, &child_path)
-            .ok_or_else(|| LaunchError::MissingCommand {
-                command: runtime_binary_name.into(),
-                hint: format!(
-                    "Install {} or choose another runtime for this session.",
-                    runtime_label(&session.runtime)
-                ),
-            })?;
-    preflight_session(session, runtime_kind, &runtime_binary, &child_path)?;
+    let runtime_binary = require_session_command(
+        runtime_binary_name,
+        None,
+        &child_path,
+        &format!(
+            "Install {} or choose another runtime for this session.",
+            runtime_label(&session.runtime)
+        ),
+    )?;
+    let waypipe_version = preflight_waypipe(&waypipe, &child_path)?;
+    let warnings = preflight_session(session, runtime_kind, &runtime_binary, &child_path)?;
     let container_name = container_name(session);
     let running =
-        runtime_container_is_running(runtime_kind, &runtime_binary, &child_path, &container_name);
+        runtime_container_is_running(runtime_kind, &runtime_binary, &child_path, &container_name)?;
     Ok(CheckReport {
         runtime: runtime_label(&session.runtime).into(),
         image: session.image.clone(),
         command: session_command(session),
         waypipe: waypipe.display().to_string(),
+        waypipe_version,
         runtime_binary: runtime_binary.display().to_string(),
         container_name,
         running,
+        warnings,
     })
 }
 
@@ -1727,19 +1790,25 @@ pub fn launch_checked_session(
 ) -> Result<LaunchReport, LaunchError> {
     use crate::application_model::LaunchStep;
 
+    validate_session(session)?;
     let child_path = build_child_path();
     let waypipe = std::path::PathBuf::from(&check.waypipe);
+    require_executable(
+        &waypipe,
+        "waypipe",
+        "Correct waypipe_path or reinstall Waypipe, then validate the profile again.",
+    )?;
     let runtime_binary_name = runtime_binary_name(&session.runtime);
     let runtime_kind = normalize_container_runtime(&session.runtime);
-    let runtime_binary =
-        resolve_command_path(runtime_binary_name, None, runtime_binary_name, &child_path)
-            .ok_or_else(|| LaunchError::MissingCommand {
-                command: runtime_binary_name.into(),
-                hint: format!(
-                    "Install {} or choose another runtime for this session.",
-                    runtime_label(&session.runtime)
-                ),
-            })?;
+    let runtime_binary = require_session_command(
+        runtime_binary_name,
+        None,
+        &child_path,
+        &format!(
+            "Install {} or choose another runtime for this session.",
+            runtime_label(&session.runtime)
+        ),
+    )?;
     let host_socket = session
         .socket
         .clone()
@@ -1749,7 +1818,7 @@ pub fn launch_checked_session(
         .clone()
         .unwrap_or_else(|| default_container_socket_path(&host_socket, runtime_kind));
     let container_name = container_name(session);
-    if runtime_container_is_running(runtime_kind, &runtime_binary, &child_path, &container_name) {
+    if runtime_container_is_running(runtime_kind, &runtime_binary, &child_path, &container_name)? {
         if matches!(runtime_kind, ContainerRuntime::Apple) {
             progress(
                 LaunchStep::CreateContainer,
@@ -1760,10 +1829,18 @@ pub fn launch_checked_session(
                 &runtime_binary,
                 &child_path,
                 &container_name,
-            );
+            )
+            .map_err(|hint| LaunchError::RuntimeNotReady {
+                runtime: runtime_label(&session.runtime).into(),
+                hint,
+            })?;
         }
-        if runtime_container_is_running(runtime_kind, &runtime_binary, &child_path, &container_name)
-        {
+        if runtime_container_is_running(
+            runtime_kind,
+            &runtime_binary,
+            &child_path,
+            &container_name,
+        )? {
             return Err(LaunchError::ContainerAlreadyRunning {
                 runtime: runtime_label(&session.runtime).into(),
                 container_name,
@@ -1836,7 +1913,11 @@ pub fn launch_checked_session(
                 &runtime_binary,
                 &child_path,
                 &container_name,
-            );
+            )
+            .map_err(|hint| LaunchError::RuntimeNotReady {
+                runtime: runtime_label(&session.runtime).into(),
+                hint,
+            })?;
             progress(
                 LaunchStep::StartWaypipe,
                 "Starting the native socket transport and Waypipe client",
@@ -1855,7 +1936,7 @@ pub fn launch_checked_session(
             )?;
             progress(
                 LaunchStep::StartCommand,
-                "The application command was handed to Apple Container",
+                "The Apple Container relay was started; guest command readiness is not yet confirmed",
             );
             (None, waypipe_child)
         }
@@ -1872,10 +1953,12 @@ pub fn launch_checked_session(
                 &host_socket,
                 &waypipe_tuning_args(session, runtime_kind),
             )?;
-            if !wait_for_socket(&host_socket, Duration::from_secs(8)) {
+            if let Err(error) =
+                wait_for_socket(&host_socket, &mut waypipe_child, Duration::from_secs(8))
+            {
                 let _ = waypipe_child.kill();
                 let _ = waypipe_child.wait();
-                return Err(LaunchError::SocketTimeout { host_socket });
+                return Err(error);
             }
             let container_child = match cmd.spawn() {
                 Ok(child) => child,
@@ -1890,7 +1973,7 @@ pub fn launch_checked_session(
             };
             progress(
                 LaunchStep::StartCommand,
-                "The application command was started inside the container",
+                "The container process was started; guest command readiness is not yet confirmed",
             );
             (Some(container_child), waypipe_child)
         }
@@ -1931,6 +2014,16 @@ pub fn terminal_command(session: &ContainerSession) -> String {
 }
 
 pub fn cleanup_named_session(session: &ContainerSession) -> Result<(), String> {
+    // A broken image/command must not prevent stopping an existing named session.
+    if !matches!(
+        session.runtime.trim(),
+        "container" | "apple" | "apple-container" | "docker" | "orb" | "orbstack"
+    ) {
+        return Err(format!(
+            "Unknown runtime '{}'; correct this profile's runtime before cleanup.",
+            session.runtime
+        ));
+    }
     let runtime_kind = normalize_container_runtime(&session.runtime);
     if matches!(runtime_kind, ContainerRuntime::OrbStack) {
         return Ok(());
@@ -1941,8 +2034,7 @@ pub fn cleanup_named_session(session: &ContainerSession) -> Result<(), String> {
     let binary = resolve_command_path(binary_name, None, binary_name, &child_path)
         .ok_or_else(|| format!("Missing command `{}`.", binary_name))?;
     let name = container_name(session);
-    cleanup_named_runtime_container(runtime_kind, &binary, &child_path, &name);
-    Ok(())
+    cleanup_named_runtime_container(runtime_kind, &binary, &child_path, &name)
 }
 
 fn cleanup_named_runtime_container(
@@ -1950,32 +2042,43 @@ fn cleanup_named_runtime_container(
     binary: &Path,
     child_path: &str,
     name: &str,
-) {
+) -> Result<(), String> {
     let args: Vec<&str> = match runtime_kind {
         ContainerRuntime::Apple => vec!["delete", "--force", name],
         ContainerRuntime::Docker => vec!["rm", "-f", name],
-        ContainerRuntime::OrbStack => return,
+        ContainerRuntime::OrbStack => return Ok(()),
     };
     let mut command = Command::new(binary);
     command.env("PATH", child_path).args(args);
     match command_output_with_timeout(command, Duration::from_secs(6)) {
-        Ok(output) if output.status.success() => {}
-        Ok(output) if runtime_output_is_not_found(&output.stderr) => {}
-        Ok(output) if runtime_output_is_not_found(&output.stdout) => {}
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) if runtime_output_is_not_found(&output.stderr, name) => Ok(()),
+        Ok(output) if runtime_output_is_not_found(&output.stdout, name) => Ok(()),
         Ok(output) => {
-            let message = runtime_output_message(&output.stderr)
-                .or_else(|| runtime_output_message(&output.stdout))
-                .unwrap_or_else(|| "runtime cleanup failed".into());
+            let message = format!(
+                "Could not remove stale container '{}': {}. Check the runtime service and permissions, remove it manually if safe, then retry.",
+                name,
+                runtime_failure_detail(&output)
+            );
             log::warn!("Failed to cleanup stale container '{}': {}", name, message);
+            Err(message)
         }
         Err(RuntimeCommandError::TimedOut) => {
             log::warn!(
                 "Timed out cleaning up stale container '{}'; runtime may still be wedged",
                 name
             );
+            Err(format!(
+                "Timed out removing stale container '{}'. Check runtime status and remove it manually if safe, then retry.",
+                name
+            ))
         }
         Err(RuntimeCommandError::Io(error)) => {
             log::warn!("Failed to cleanup stale container '{}': {}", name, error);
+            Err(format!(
+                "Failed to remove stale container '{}': {}. Check the runtime executable/service and retry.",
+                name, error
+            ))
         }
     }
 }
@@ -1992,12 +2095,24 @@ fn runtime_output_message(output: &[u8]) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .map(str::to_string)
+        .map(|line| line.chars().take(512).collect())
 }
 
-fn runtime_output_is_not_found(output: &[u8]) -> bool {
+fn runtime_failure_detail(output: &Output) -> String {
+    let detail = runtime_output_message(&output.stderr)
+        .or_else(|| runtime_output_message(&output.stdout))
+        .unwrap_or_else(|| "no diagnostic output".into());
+    format!("{}: {}", output.status, detail)
+}
+
+fn runtime_output_is_not_found(output: &[u8], name: &str) -> bool {
     let text = String::from_utf8_lossy(output).to_lowercase();
-    text.contains("not found") || text.contains("no such container")
+    text.contains("no such container")
+        || text.contains("no such object")
+        || (text.contains(&name.to_lowercase())
+            && (text.contains("not found")
+                || text.contains("notfound")
+                || text.contains("does not exist")))
 }
 
 fn runtime_container_is_running(
@@ -2005,37 +2120,53 @@ fn runtime_container_is_running(
     binary: &Path,
     child_path: &str,
     name: &str,
-) -> bool {
+) -> Result<bool, LaunchError> {
+    // Even an inventory command can wake OrbStack. Do not probe this runtime here.
+    if matches!(runtime_kind, ContainerRuntime::OrbStack) {
+        return Ok(false);
+    }
     let mut command = Command::new(binary);
     command.env("PATH", child_path);
+    let label = match runtime_kind {
+        ContainerRuntime::Apple => {
+            command.args(["list", "--all"]);
+            "Apple Container"
+        }
+        ContainerRuntime::Docker => {
+            command.args(["inspect", "-f", "{{.State.Running}}", name]);
+            "Docker"
+        }
+        ContainerRuntime::OrbStack => unreachable!(),
+    };
+    let output = command_output_with_timeout(command, Duration::from_secs(6)).map_err(|error| LaunchError::RuntimeNotReady {
+        runtime: label.into(),
+        hint: format!("Container state check failed: {error}. Check the runtime service and retry; container state is unknown."),
+    })?;
+    if !output.status.success() {
+        if matches!(runtime_kind, ContainerRuntime::Docker)
+            && runtime_output_is_not_found(&output.stderr, name)
+        {
+            return Ok(false);
+        }
+        return Err(LaunchError::RuntimeNotReady {
+            runtime: label.into(),
+            hint: format!(
+                "Container state check failed ({}). Check the runtime service and retry; container state is unknown.",
+                runtime_failure_detail(&output)
+            ),
+        });
+    }
     match runtime_kind {
-        ContainerRuntime::Apple => command_output_with_timeout(
-            {
-                command.args(["list", "--all"]);
-                command
-            },
-            Duration::from_secs(6),
-        )
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| apple_container_list_has_running(&output.stdout, name))
-        .unwrap_or(false),
-        ContainerRuntime::Docker => command_output_with_timeout(
-            {
-                command.args(["inspect", "-f", "{{.State.Running}}", name]);
-                command
-            },
-            Duration::from_secs(6),
-        )
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line.trim() == "true")
-        })
-        .unwrap_or(false),
-        ContainerRuntime::OrbStack => false,
+        ContainerRuntime::Apple => Ok(apple_container_list_has_running(&output.stdout, name)),
+        ContainerRuntime::Docker => match String::from_utf8_lossy(&output.stdout).trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(LaunchError::RuntimeNotReady {
+                runtime: label.into(),
+                hint: "Container state check returned an unrecognized result. Check the Docker CLI/context and retry; container state is unknown.".into(),
+            }),
+        },
+        ContainerRuntime::OrbStack => unreachable!(),
     }
 }
 
@@ -2070,10 +2201,142 @@ fn toml_escape(value: &str) -> String {
 }
 
 fn normalize_container_runtime(runtime: &str) -> ContainerRuntime {
-    match runtime {
+    match runtime.trim() {
         "docker" => ContainerRuntime::Docker,
         "orb" | "orbstack" => ContainerRuntime::OrbStack,
         _ => ContainerRuntime::Apple,
+    }
+}
+
+fn validate_session(session: &ContainerSession) -> Result<(), LaunchError> {
+    let invalid = |hint: String| LaunchError::InvalidSession {
+        session: session.name.clone(),
+        hint,
+    };
+    if !matches!(
+        session.runtime.trim(),
+        "container" | "apple" | "apple-container" | "docker" | "orb" | "orbstack"
+    ) {
+        return Err(invalid(format!(
+            "Unknown runtime '{}'. Set runtime to container, docker, or orbstack in container-sessions.toml. SSH connections belong in connections.toml.",
+            session.runtime
+        )));
+    }
+    if session.name.trim().is_empty() || session.name.chars().any(char::is_control) {
+        return Err(invalid(
+            "Set a nonempty name without control characters in container-sessions.toml.".into(),
+        ));
+    }
+    if session.image.trim().is_empty()
+        || session
+            .image
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+        || session.image.starts_with('-')
+    {
+        return Err(invalid("Set image to a nonempty local image reference without whitespace or a leading '-' in container-sessions.toml.".into()));
+    }
+    if session_command(session).trim().is_empty() || session_command(session).contains('\0') {
+        return Err(invalid("Set command/app to a nonempty GUI command without NUL bytes in container-sessions.toml.".into()));
+    }
+    if session.waypipe_threads == Some(0) {
+        return Err(invalid(
+            "Set waypipe_threads to a positive integer, or remove it to use Waypipe's default."
+                .into(),
+        ));
+    }
+    if let Some(socket) = session.socket.as_deref() {
+        if !Path::new(socket).is_absolute()
+            || socket.contains('\0')
+            || socket.len() + WAYPIPE_CLIENT_SUFFIX_RESERVE > UNIX_SOCKET_PATH_BYTES
+        {
+            return Err(invalid(
+                "Set socket to a short absolute host socket path, or remove it to use the default."
+                    .into(),
+            ));
+        }
+    }
+    if let Some(socket) = session.container_socket.as_deref() {
+        if !Path::new(socket).is_absolute()
+            || socket.contains('\0')
+            || socket.len() > UNIX_SOCKET_PATH_BYTES
+        {
+            return Err(invalid("Set container_socket to a short absolute guest socket path, or remove it to use the default.".into()));
+        }
+    }
+    validate_display_slot(session)?;
+    validate_presentation_command(session)
+}
+
+fn require_executable(path: &Path, name: &str, remediation: &str) -> Result<(), LaunchError> {
+    use std::os::unix::fs::PermissionsExt;
+    let problem = match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => Some("not a regular file".into()),
+        Ok(metadata) if metadata.permissions().mode() & 0o111 == 0 => Some("executable permission is missing; restore it only if you trust/own this binary, or reinstall it".into()),
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    match problem {
+        None => Ok(()),
+        Some(problem) => Err(LaunchError::MissingCommand {
+            command: name.into(),
+            hint: format!("Path '{}': {problem}. {remediation}", path.display()),
+        }),
+    }
+}
+
+fn require_session_command(
+    name: &str,
+    configured: Option<&str>,
+    child_path: &str,
+    remediation: &str,
+) -> Result<std::path::PathBuf, LaunchError> {
+    if let Some(path) = resolve_command_path(name, configured, name, child_path) {
+        require_executable(&path, name, remediation)?;
+        return Ok(path);
+    }
+    let configured = configured.filter(|path| !path.trim().is_empty());
+    let candidate = configured
+        .map(|path| {
+            let path = path.trim();
+            if let Some(rest) = path.strip_prefix("~/") {
+                if let Some(home) = std::env::var_os("HOME") {
+                    return std::path::PathBuf::from(home).join(rest);
+                }
+            }
+            std::path::PathBuf::from(path)
+        })
+        .or_else(|| {
+            std::env::split_paths(child_path)
+                .map(|dir| dir.join(name))
+                .find(|path| path.exists())
+        });
+    if let Some(path) = candidate {
+        require_executable(&path, name, remediation)?;
+    }
+    Err(LaunchError::MissingCommand {
+        command: name.into(),
+        hint: format!("Not found in Cocoa-Way's child PATH. {remediation}"),
+    })
+}
+
+fn preflight_waypipe(binary: &Path, child_path: &str) -> Result<String, LaunchError> {
+    let mut command = Command::new(binary);
+    command.env("PATH", child_path).arg("--version");
+    let failure = |detail: String| LaunchError::MissingCommand {
+        command: "waypipe".into(),
+        hint: format!(
+            "Found at '{}', but its native version check failed: {}. Check this binary's Mac architecture, native libraries, and macOS security approval. Install a working waypipe-darwin build or correct waypipe_path, then retry. Use compatible host and guest Waypipe builds if a protocol/version mismatch is reported.",
+            binary.display(),
+            detail
+        ),
+    };
+    match command_output_with_timeout(command, Duration::from_secs(3)) {
+        Ok(output) if output.status.success() => Ok(runtime_output_message(&output.stdout)
+            .or_else(|| runtime_output_message(&output.stderr))
+            .unwrap_or_else(|| "unknown (version not reported)".into())),
+        Ok(output) => Err(failure(runtime_failure_detail(&output))),
+        Err(error) => Err(failure(error.to_string())),
     }
 }
 
@@ -2082,9 +2345,13 @@ fn preflight_session(
     runtime: ContainerRuntime,
     runtime_binary: &Path,
     child_path: &str,
-) -> Result<(), LaunchError> {
-    validate_display_slot(session)?;
-    validate_presentation_command(session)?;
+) -> Result<Vec<String>, LaunchError> {
+    validate_session(session)?;
+    let image_hint = if session.image.starts_with("localhost/") {
+        "This localhost/ image is machine-local; it is not bundled with Cocoa-Way or copied to another Mac automatically. Build it on this Mac, import a trusted image archive, or select an installed GUI-ready image in the profile. Do not assume a registry pull can supply this local image."
+    } else {
+        "Build/tag the image locally, import a trusted image archive, or select an installed GUI-ready image in the profile. Pull it only if the image is available from a registry you trust."
+    };
     match runtime {
         ContainerRuntime::Apple => {
             preflight_apple_container(runtime_binary, child_path)?;
@@ -2094,7 +2361,7 @@ fn preflight_session(
                 &["image", "inspect", &session.image],
                 "Apple Container",
                 &session.image,
-                "Run `container image pull <image>` or build/tag the image before launching.",
+                image_hint,
             )?;
             verify_gui_tools_in_image(
                 session,
@@ -2103,8 +2370,7 @@ fn preflight_session(
                 runtime,
                 "Apple Container",
                 &session.image,
-            )?;
-            Ok(())
+            )
         }
         ContainerRuntime::Docker => {
             inspect_image(
@@ -2113,7 +2379,7 @@ fn preflight_session(
                 &["image", "inspect", &session.image],
                 "Docker",
                 &session.image,
-                "Run `docker pull <image>` or build/tag the image before launching.",
+                image_hint,
             )?;
             verify_gui_tools_in_image(
                 session,
@@ -2124,7 +2390,7 @@ fn preflight_session(
                 &session.image,
             )
         }
-        ContainerRuntime::OrbStack => Ok(()),
+        ContainerRuntime::OrbStack => Ok(vec!["OrbStack service, image, guest tools, and running-container state were not checked, to avoid waking OrbStack. Start it explicitly and verify this profile there before launch.".into()]),
     }
 }
 
@@ -2180,6 +2446,7 @@ fn validate_display_slot(session: &ContainerSession) -> Result<(), LaunchError> 
 }
 
 fn preflight_apple_container(runtime_binary: &Path, child_path: &str) -> Result<(), LaunchError> {
+    const START_HINT: &str = "Use Container > Apple Container > Start System (or `container system start`) and wait until the service reports running. For older CLIs such as 1.0.0, install the latest supported official Apple Container release first.";
     let mut command = Command::new(runtime_binary);
     command
         .env("PATH", child_path)
@@ -2187,9 +2454,7 @@ fn preflight_apple_container(runtime_binary: &Path, child_path: &str) -> Result<
     let output = command_output_with_timeout(command, Duration::from_secs(6)).map_err(|error| {
         LaunchError::RuntimeNotReady {
             runtime: "Apple Container".into(),
-            hint: format!(
-                "System status check failed: {error}. Run `container system start` and retry."
-            ),
+            hint: format!("System status check failed: {error}. {START_HINT}"),
         }
     })?;
     if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
@@ -2201,7 +2466,10 @@ fn preflight_apple_container(runtime_binary: &Path, child_path: &str) -> Result<
         }
         return Err(LaunchError::RuntimeNotReady {
             runtime: "Apple Container".into(),
-            hint: "Run `container system start` and wait until the system reports running.".into(),
+            hint: format!(
+                "System status was not running ({}). {START_HINT}",
+                runtime_failure_detail(&output)
+            ),
         });
     }
     // Older CLI versions do not have structured system status.
@@ -2210,15 +2478,16 @@ fn preflight_apple_container(runtime_binary: &Path, child_path: &str) -> Result<
     let output = command_output_with_timeout(command, Duration::from_secs(6)).map_err(|error| {
         LaunchError::RuntimeNotReady {
             runtime: "Apple Container".into(),
-            hint: format!(
-                "System status check failed: {error}. Run `container system start` and retry."
-            ),
+            hint: format!("System status check failed: {error}. {START_HINT}"),
         }
     })?;
     if !output.status.success() {
         return Err(LaunchError::RuntimeNotReady {
             runtime: "Apple Container".into(),
-            hint: "Run `container system start` and try again.".into(),
+            hint: format!(
+                "System status check failed ({}). {START_HINT}",
+                runtime_failure_detail(&output)
+            ),
         });
     }
 
@@ -2226,7 +2495,10 @@ fn preflight_apple_container(runtime_binary: &Path, child_path: &str) -> Result<
     if !stdout.lines().any(is_apple_container_running_status) {
         return Err(LaunchError::RuntimeNotReady {
             runtime: "Apple Container".into(),
-            hint: "Run `container system start` and wait until `container system status` reports running.".into(),
+            hint: format!(
+                "System status did not report running ({}). {START_HINT}",
+                runtime_failure_detail(&output)
+            ),
         });
     }
     Ok(())
@@ -2249,11 +2521,34 @@ fn inspect_image(
     command.env("PATH", child_path).args(args);
     match command_output_with_timeout(command, Duration::from_secs(6)) {
         Ok(output) if output.status.success() => Ok(()),
-        Ok(_) => Err(LaunchError::ImageUnavailable {
-            runtime: runtime.into(),
-            image: image.into(),
-            hint: hint.into(),
-        }),
+        Ok(output) => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            )
+            .to_ascii_lowercase();
+            let missing = text.contains("no such image")
+                || text.contains("image not found")
+                || (text.contains(&image.to_ascii_lowercase())
+                    && (text.contains("not found") || text.contains("notfound"))
+                    && !text.contains("socket"));
+            if missing {
+                Err(LaunchError::ImageUnavailable {
+                    runtime: runtime.into(),
+                    image: image.into(),
+                    hint: format!("{} {hint}", runtime_failure_detail(&output)),
+                })
+            } else {
+                Err(LaunchError::RuntimeNotReady {
+                    runtime: runtime.into(),
+                    hint: format!(
+                        "Image inspection failed ({}). Check the runtime service/context and permissions; image availability is unknown. Do not rebuild or pull solely because this check failed.",
+                        runtime_failure_detail(&output)
+                    ),
+                })
+            }
+        }
         Err(error) => Err(LaunchError::RuntimeNotReady {
             runtime: runtime.into(),
             hint: format!("Image inspection failed: {error}. Check the runtime service and retry."),
@@ -2268,11 +2563,22 @@ fn verify_gui_tools_in_image(
     runtime: ContainerRuntime,
     runtime_label: &str,
     image: &str,
-) -> Result<(), LaunchError> {
+) -> Result<Vec<String>, LaunchError> {
     // Opening the panel can check many profiles at once. Only one probe VM may run at a time.
     static PROBE_LOCK: Mutex<()> = Mutex::new(());
     static PROBE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let _probe = PROBE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let _probe = loop {
+        match PROBE_LOCK.try_lock() {
+            Ok(lock) => break lock,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Err(_) => return Err(LaunchError::RuntimeNotReady {
+                runtime: runtime_label.into(),
+                hint: "Another image dependency check is still running. Wait for it to finish and retry; this image was not checked.".into(),
+            }),
+        }
+    };
     let run_probes = |probes: &[String]| {
         let name = format!(
             "cocoa-way-check-{}-{}",
@@ -2291,6 +2597,10 @@ fn verify_gui_tools_in_image(
         for arg in &session.runtime_args {
             cmd.arg(arg);
         }
+        if matches!(runtime, ContainerRuntime::Docker) {
+            // The preflight must not download images, even if profile arguments request a pull.
+            cmd.arg("--pull=never");
+        }
         let script = format!(
             "printf '%s\\n' COCOA_WAY_IMAGE_PROBE_STARTED; {}",
             probes.join(" && ")
@@ -2300,21 +2610,28 @@ fn verify_gui_tools_in_image(
         let result = command_output_with_timeout(cmd, Duration::from_secs(60));
         if result.is_err() {
             // Killing a CLI does not necessarily stop a VM owned by the runtime daemon.
-            cleanup_named_runtime_container(runtime, runtime_binary, child_path, &name);
+            let _ = cleanup_named_runtime_container(runtime, runtime_binary, child_path, &name);
         }
         result
     };
 
-    let mut required_probes = vec!["command -v waypipe >/dev/null".to_string()];
+    let mut tools = vec!["waypipe".to_string()];
     if matches!(runtime, ContainerRuntime::Apple) {
-        required_probes.push("command -v perl >/dev/null".into());
+        tools.push("perl".into());
     }
     if let Some(binary) = session_command_binary(session) {
-        required_probes.push(format!(
-            "command -v {} >/dev/null",
-            shell_single_quote(&binary)
-        ));
+        tools.push(binary);
     }
+    let mut required_probes = tools
+        .iter()
+        .map(|tool| {
+            format!(
+                "{{ command -v {} >/dev/null || {{ printf '%s\\n' {} >&2; exit 1; }}; }}",
+                shell_single_quote(tool),
+                shell_single_quote(&format!("COCOA_WAY_MISSING_TOOL: {tool}"))
+            )
+        })
+        .collect::<Vec<_>>();
 
     let audio_probe = matches!(runtime, ContainerRuntime::Apple) && session.audio;
     const AUDIO_READY: &str = "COCOA_WAY_AUDIO_TOOLS_READY";
@@ -2335,17 +2652,25 @@ fn verify_gui_tools_in_image(
         required_probes.push(format!("if {probe}; then printf '%s\\n' {AUDIO_READY}; fi"));
     }
 
+    let mut warnings = Vec::new();
     match run_probes(&required_probes) {
-        Ok(output) if output.status.success() => {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == "COCOA_WAY_IMAGE_PROBE_STARTED") =>
+        {
             if audio_probe
                 && !String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .any(|line| line == AUDIO_READY)
             {
-                log::warn!(
-                    "Apple Container image '{}' has no complete Cocoa-Way audio stack; GUI launch will continue without audio",
+                let warning = format!(
+                    "Apple Container image '{}' has no complete Cocoa-Way audio stack. Audio is optional; GUI launch can continue with audio unavailable or degraded. Install the Cocoa-Way audio relay/PipeWire tools in the image to enable audio.",
                     image
                 );
+                log::warn!("{}", warning);
+                warnings.push(warning);
             }
         }
         Ok(output) => return Err(image_probe_failure(runtime_label, image, &output)),
@@ -2360,7 +2685,7 @@ fn verify_gui_tools_in_image(
         }
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 fn append_guest_command(command: &mut Command, image: &str, program: &str) {
@@ -2371,27 +2696,33 @@ fn image_probe_failure(runtime: &str, image: &str, output: &Output) -> LaunchErr
     let guest_started = String::from_utf8_lossy(&output.stdout)
         .lines()
         .any(|line| line == "COCOA_WAY_IMAGE_PROBE_STARTED");
-    if guest_started {
+    let missing_tool = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find_map(|line| line.strip_prefix("COCOA_WAY_MISSING_TOOL: "))
+        .map(|tool| tool.chars().take(256).collect::<String>());
+    if guest_started && missing_tool.is_some() {
         LaunchError::ImageNotGuiReady {
             runtime: runtime.into(),
             image: image.into(),
-            hint: "Install waypipe, Apple relay dependencies, and the configured GUI command in the image, then rebuild/tag it for Cocoa-Way.".into(),
+            hint: format!(
+                "Required guest command '{}' was not found ({}). Install it in the image, then rebuild/tag it for Cocoa-Way. Audio tools are optional.",
+                missing_tool.unwrap(),
+                output.status
+            ),
         }
     } else {
-        let detail = runtime_output_message(&output.stderr)
-            .or_else(|| runtime_output_message(&output.stdout))
-            .unwrap_or_else(|| format!("runtime exited with {}", output.status));
+        let detail = runtime_failure_detail(output);
         LaunchError::RuntimeNotReady {
             runtime: runtime.into(),
             hint: format!(
-                "Image '{image}' could not start its dependency check: {detail}. Check runtime status and initial kernel/init-image downloads before rebuilding the image."
+                "Image '{image}' did not complete its dependency check: {detail}. Check runtime status, resource limits, and initial kernel/init-image setup before rebuilding the image."
             ),
         }
     }
 }
 
 fn runtime_binary_name(runtime: &str) -> &str {
-    match runtime {
+    match runtime.trim() {
         "docker" => "docker",
         "orb" | "orbstack" => "orb",
         _ => "container",
@@ -2399,7 +2730,7 @@ fn runtime_binary_name(runtime: &str) -> &str {
 }
 
 fn runtime_label(runtime: &str) -> &str {
-    match runtime {
+    match runtime.trim() {
         "docker" => "Docker",
         "orb" | "orbstack" => "OrbStack",
         _ => "Apple Container",
@@ -2408,8 +2739,8 @@ fn runtime_label(runtime: &str) -> &str {
 
 pub fn is_apple_container_session(session: &ContainerSession) -> bool {
     matches!(
-        normalize_container_runtime(&session.runtime),
-        ContainerRuntime::Apple
+        session.runtime.trim(),
+        "container" | "apple" | "apple-container"
     )
 }
 
@@ -2593,15 +2924,51 @@ fn shell_args(args: &[String]) -> String {
     }
 }
 
-fn wait_for_socket(host_socket: &str, timeout: Duration) -> bool {
+fn wait_for_socket(
+    host_socket: &str,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), LaunchError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileTypeExt;
+
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if Path::new(host_socket).exists() {
-            return true;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| LaunchError::StartWaypipe { source })?
+        {
+            let mut stderr = Vec::new();
+            if let Some(pipe) = child.stderr.as_mut() {
+                // A descendant can retain stderr after Waypipe exits. Never block on that pipe.
+                let fd = pipe.as_raw_fd();
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags >= 0
+                    && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0
+                {
+                    let _ = pipe.take(2048).read_to_end(&mut stderr);
+                }
+            }
+            return Err(LaunchError::ProcessExited {
+                program: "Waypipe client".into(),
+                status,
+                hint: format!(
+                    "{} Check Waypipe compatibility, the selected Wayland display, and socket directory permissions, then retry.",
+                    runtime_output_message(&stderr)
+                        .unwrap_or_else(|| "No stderr was captured.".into())
+                ),
+            });
+        }
+        if std::fs::metadata(host_socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(LaunchError::SocketTimeout {
+                host_socket: host_socket.into(),
+            });
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    false
 }
 
 fn spawn_apple_container_waypipe_ssh(
@@ -2736,6 +3103,445 @@ mod tests {
         (directory, binary)
     }
 
+    fn diagnostic_session(runtime: &str) -> ContainerSession {
+        toml::from_str(&format!(
+            "name = 'Diagnostics'\nimage = 'test:latest'\ncommand = 'foot'\nruntime = '{runtime}'"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_config_creates_an_optional_empty_example() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config/sessions.toml");
+        let report = load_sessions_report_from_path(&path);
+        assert!(report.error.is_none());
+        assert!(report.sessions.is_empty());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("# [[session]]")
+        );
+    }
+
+    #[test]
+    fn unreadable_or_invalid_config_is_reported_and_never_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.toml");
+        for content in [b"\xff".as_slice(), b"[[session]]\nname = [".as_slice()] {
+            std::fs::write(&path, content).unwrap();
+            let report = load_sessions_report_from_path(&path);
+            let error = report.error.unwrap();
+            assert!(error.contains(&path.display().to_string()));
+            assert!(error.contains("permissions") || error.contains("Correct the TOML"));
+            assert_eq!(std::fs::read(&path).unwrap(), content);
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(load_sessions_report_from_path(&path).error.is_some());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn config_creation_failures_are_not_reported_as_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("not-a-directory");
+        std::fs::write(&parent, "keep").unwrap();
+        let report = load_sessions_report_from_path(&parent.join("sessions.toml"));
+        assert!(report.error.is_some());
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "keep");
+    }
+
+    #[test]
+    fn invalid_profiles_fail_before_resolving_or_probing_runtimes() {
+        for runtime in ["dokcer", "ssh", ""] {
+            let error = check_session(&diagnostic_session(runtime)).unwrap_err();
+            assert!(matches!(error, LaunchError::InvalidSession { .. }));
+            assert!(error.to_string().contains("Unknown runtime"));
+        }
+        for image in ["", "bad image", "--help"] {
+            let mut session = diagnostic_session("docker");
+            session.image = image.into();
+            assert!(matches!(
+                check_session(&session),
+                Err(LaunchError::InvalidSession { .. })
+            ));
+        }
+        let mut session = diagnostic_session("docker");
+        session.command = Some(" ".into());
+        assert!(validate_session(&session).is_err());
+        session.command = Some("foot".into());
+        session.socket = Some("relative.sock".into());
+        assert!(validate_session(&session).is_err());
+        session.socket = None;
+        session.waypipe_threads = Some(0);
+        assert!(validate_session(&session).is_err());
+        for runtime in [
+            "container",
+            "apple",
+            "apple-container",
+            "docker",
+            "orb",
+            "orbstack",
+        ] {
+            assert!(validate_session(&diagnostic_session(runtime)).is_ok());
+        }
+    }
+
+    #[test]
+    fn executable_preflight_identifies_configured_path_and_permission_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, binary) = mock_runtime("exit 0");
+        let path = binary.to_str().unwrap();
+        assert!(require_session_command("waypipe", Some(path), "", "Reinstall Waypipe.").is_ok());
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = require_session_command("waypipe", Some(path), "", "Reinstall Waypipe.")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(path));
+        assert!(error.contains("executable permission"));
+        assert!(error.contains("Reinstall Waypipe"));
+        let missing = directory.path().join("missing");
+        assert!(
+            require_session_command(
+                "waypipe",
+                Some(missing.to_str().unwrap()),
+                "",
+                "Install it."
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("missing")
+        );
+        assert!(
+            require_executable(directory.path(), "waypipe", "Reinstall it.")
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+    }
+
+    #[test]
+    fn native_waypipe_check_preserves_version_and_reports_loader_failures() {
+        for version in ["0.9.2-darwin", "0.10.6"] {
+            let (_directory, binary) = mock_runtime(&format!("printf 'waypipe {version}\\n'"));
+            assert_eq!(
+                preflight_waypipe(&binary, "/usr/bin:/bin").unwrap(),
+                format!("waypipe {version}")
+            );
+        }
+        let (_directory, binary) =
+            mock_runtime("printf 'dyld: Library not loaded: libexample.dylib\\n' >&2; exit 127");
+        let error = preflight_waypipe(&binary, "/usr/bin:/bin")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("libexample.dylib"));
+        assert!(error.contains("127"));
+        assert!(error.contains("Mac architecture"));
+        assert!(error.contains("waypipe-darwin"));
+        assert!(error.contains(binary.to_str().unwrap()));
+        assert!(
+            preflight_waypipe(
+                Path::new("/nonexistent/cocoa-way-test-waypipe"),
+                "/usr/bin:/bin"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn orbstack_checks_do_not_execute_any_runtime_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("woken");
+        let (_binary_directory, binary) = mock_runtime(&format!(
+            "touch {}\nexit 1",
+            shell_single_quote(marker.to_str().unwrap())
+        ));
+        let session = diagnostic_session("orbstack");
+        let warnings = preflight_session(
+            &session,
+            ContainerRuntime::OrbStack,
+            &binary,
+            "/usr/bin:/bin",
+        )
+        .unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("not checked"))
+        );
+        assert!(
+            !runtime_container_is_running(
+                ContainerRuntime::OrbStack,
+                &binary,
+                "/usr/bin:/bin",
+                "test"
+            )
+            .unwrap()
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn docker_preflight_requires_no_apple_runtime_or_relay_tools_and_never_pulls() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = directory.path().join("calls");
+        let (_binary_directory, binary) = mock_runtime(&format!(
+            "printf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = run ]; then printf 'COCOA_WAY_IMAGE_PROBE_STARTED\\n'; fi",
+            shell_single_quote(calls.to_str().unwrap())
+        ));
+        let mut session = diagnostic_session("docker");
+        session.runtime_args.push("--pull=always".into());
+        assert!(
+            preflight_session(&session, ContainerRuntime::Docker, &binary, "/usr/bin:/bin")
+                .unwrap()
+                .is_empty()
+        );
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert!(calls.contains("image inspect test:latest"));
+        assert!(calls.contains("--pull=never"));
+        assert!(calls.find("--pull=always").unwrap() < calls.find("--pull=never").unwrap());
+        assert!(!calls.contains("system status"));
+        assert!(!calls.contains("command -v 'perl'"));
+    }
+
+    #[test]
+    fn image_inspection_preserves_service_errors_and_only_labels_known_missing_images() {
+        for (message, missing) in [
+            ("Cannot connect to the Docker daemon", false),
+            ("permission denied", false),
+            ("No such image: test:latest", true),
+        ] {
+            let (_directory, binary) = mock_runtime(&format!(
+                "printf '%s\\n' {} >&2; exit 7",
+                shell_single_quote(message)
+            ));
+            let error = inspect_image(
+                &binary,
+                "/usr/bin:/bin",
+                &["image", "inspect", "test:latest"],
+                "Docker",
+                "test:latest",
+                "Build/tag the image.",
+            )
+            .unwrap_err();
+            assert_eq!(
+                matches!(error, LaunchError::ImageUnavailable { .. }),
+                missing
+            );
+            assert!(error.to_string().contains(message));
+            assert!(error.to_string().contains("7"));
+        }
+    }
+
+    #[test]
+    fn missing_machine_local_image_explains_migration_and_local_remedies() {
+        let (_directory, binary) = mock_runtime(
+            "if [ \"$1\" = system ]; then printf '%s\\n' '{\"status\":\"running\"}'; exit 0; fi\nprintf 'image localhost/cocoa-way-niri:latest not found\\n' >&2; exit 1",
+        );
+        let mut session = diagnostic_session("container");
+        session.image = "localhost/cocoa-way-niri:latest".into();
+        let error = preflight_session(&session, ContainerRuntime::Apple, &binary, "/usr/bin:/bin")
+            .unwrap_err();
+        assert!(matches!(error, LaunchError::ImageUnavailable { .. }));
+        let detail = error.to_string();
+        assert!(detail.contains("not bundled"));
+        assert!(detail.contains("another Mac"));
+        assert!(detail.contains("Build it on this Mac"));
+        assert!(detail.contains("import"));
+        assert!(detail.contains("installed GUI-ready image"));
+        assert!(!detail.contains("image pull"));
+    }
+
+    #[test]
+    fn stopped_apple_service_is_reported_before_local_image_availability() {
+        let (_directory, binary) = mock_runtime(
+            "if [ \"$1\" = system ]; then printf '%s\\n' '{\"status\":\"stopped\"}'; exit 0; fi\nprintf 'image localhost/cocoa-way-niri:latest not found\\n' >&2; exit 1",
+        );
+        let mut session = diagnostic_session("container");
+        session.image = "localhost/cocoa-way-niri:latest".into();
+        let error = preflight_session(&session, ContainerRuntime::Apple, &binary, "/usr/bin:/bin")
+            .unwrap_err();
+        assert!(matches!(error, LaunchError::RuntimeNotReady { .. }));
+        let detail = error.to_string();
+        assert!(detail.contains("not running"));
+        assert!(detail.contains("container system start"));
+        assert!(!detail.contains("image pull"));
+        assert!(!detail.contains("not available locally"));
+    }
+
+    #[test]
+    fn failed_container_inventory_does_not_claim_the_container_is_stopped() {
+        let (_directory, binary) = mock_runtime("printf 'permission denied\\n' >&2; exit 1");
+        for runtime in [ContainerRuntime::Apple, ContainerRuntime::Docker] {
+            assert!(matches!(
+                runtime_container_is_running(runtime, &binary, "/usr/bin:/bin", "test"),
+                Err(LaunchError::RuntimeNotReady { .. })
+            ));
+        }
+        let (_directory, binary) =
+            mock_runtime("printf 'Error: No such object: test\\n' >&2; exit 1");
+        assert!(
+            !runtime_container_is_running(
+                ContainerRuntime::Docker,
+                &binary,
+                "/usr/bin:/bin",
+                "test"
+            )
+            .unwrap()
+        );
+        let (_directory, binary) = mock_runtime("printf 'unexpected-result\\n'");
+        assert!(
+            runtime_container_is_running(
+                ContainerRuntime::Docker,
+                &binary,
+                "/usr/bin:/bin",
+                "test"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_failures_preserve_the_actual_error_instead_of_returning_success() {
+        let (_directory, binary) =
+            mock_runtime("printf 'runtime service not found\\n' >&2; exit 7");
+        let error = cleanup_named_runtime_container(
+            ContainerRuntime::Apple,
+            &binary,
+            "/usr/bin:/bin",
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.contains("runtime service not found"));
+        assert!(error.contains("7"));
+        let (_directory, binary) = mock_runtime("printf 'container test not found\\n' >&2; exit 1");
+        assert!(
+            cleanup_named_runtime_container(
+                ContainerRuntime::Apple,
+                &binary,
+                "/usr/bin:/bin",
+                "test"
+            )
+            .is_ok()
+        );
+        assert!(runtime_output_is_not_found(
+            b"Error: notFound: container test does not exist",
+            "test"
+        ));
+        let mut session = diagnostic_session("orbstack");
+        session.image.clear();
+        assert!(cleanup_named_session(&session).is_ok());
+        session.runtime = "typo".into();
+        assert!(cleanup_named_session(&session).is_err());
+    }
+
+    #[test]
+    fn guest_probe_script_names_the_required_missing_gui_command() {
+        let (directory, binary) =
+            mock_runtime("for arg do script=\"$arg\"; done\n/bin/sh -c \"$script\"");
+        for tool in ["waypipe", "perl"] {
+            std::os::unix::fs::symlink("/usr/bin/true", directory.path().join(tool)).unwrap();
+        }
+        let mut session = diagnostic_session("container");
+        session.audio = false;
+        session.command = Some("cocoa-way-test-missing-gui-20261015".into());
+        let child_path = format!("{}:/usr/bin:/bin", directory.path().display());
+        let error = verify_gui_tools_in_image(
+            &session,
+            &binary,
+            &child_path,
+            ContainerRuntime::Apple,
+            "Apple Container",
+            &session.image,
+        )
+        .unwrap_err();
+        assert!(matches!(error, LaunchError::ImageNotGuiReady { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cocoa-way-test-missing-gui-20261015")
+        );
+    }
+
+    #[test]
+    fn audio_tools_are_optional_and_absence_is_visible_in_check_warnings() {
+        for (audio_ready, expected_warnings) in [(false, 1), (true, 0)] {
+            let (_directory, binary) = mock_runtime(&format!(
+                "printf 'COCOA_WAY_IMAGE_PROBE_STARTED\\n{}'",
+                if audio_ready {
+                    "COCOA_WAY_AUDIO_TOOLS_READY\\n"
+                } else {
+                    ""
+                }
+            ));
+            let session = diagnostic_session("container");
+            let warnings = verify_gui_tools_in_image(
+                &session,
+                &binary,
+                "/usr/bin:/bin",
+                ContainerRuntime::Apple,
+                "Apple Container",
+                &session.image,
+            )
+            .unwrap();
+            assert_eq!(warnings.len(), expected_warnings);
+        }
+    }
+
+    #[test]
+    fn successful_runtime_exit_without_guest_probe_is_not_validation_success() {
+        let (_directory, binary) = mock_runtime("exit 0");
+        let session = diagnostic_session("docker");
+        assert!(matches!(
+            verify_gui_tools_in_image(
+                &session,
+                &binary,
+                "/usr/bin:/bin",
+                ContainerRuntime::Docker,
+                "Docker",
+                &session.image
+            ),
+            Err(LaunchError::RuntimeNotReady { .. })
+        ));
+    }
+
+    #[test]
+    fn socket_wait_reports_early_waypipe_exit_with_stderr() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf 'incompatible Waypipe option\\n' >&2; exit 64"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let error = wait_for_socket(
+            "/nonexistent/cocoa-way-test.sock",
+            &mut child,
+            Duration::from_secs(8),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LaunchError::ProcessExited { .. }));
+        assert!(error.to_string().contains("incompatible Waypipe option"));
+        assert!(error.to_string().contains("64"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn socket_wait_requires_an_actual_socket_not_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("socket");
+        std::fs::write(&path, "not a socket").unwrap();
+        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let result = wait_for_socket(
+            path.to_str().unwrap(),
+            &mut child,
+            Duration::from_millis(100),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(matches!(result, Err(LaunchError::SocketTimeout { .. })));
+    }
+
     #[test]
     fn apple_preflight_accepts_structured_status() {
         let (_directory, binary) = mock_runtime("printf '%s\\n' '{\"status\":\"running\"}'");
@@ -2759,6 +3565,21 @@ mod tests {
             "if [ \"$3\" = --format ]; then printf 'Unknown option --format\\n' >&2; exit 64; fi\nprintf 'status running\\n'",
         );
         assert!(preflight_apple_container(&binary, "/usr/bin:/bin").is_ok());
+    }
+
+    #[test]
+    fn unregistered_apple_service_preserves_remote_error_and_start_upgrade_guidance() {
+        let (_directory, binary) = mock_runtime(
+            "if [ \"$3\" = --format ]; then printf 'Unknown option --format\\n' >&2; exit 64; fi\nprintf 'apiserver is not running and not registered with launchd\\n' >&2; exit 1",
+        );
+        let error = preflight_apple_container(&binary, "/usr/bin:/bin").unwrap_err();
+        assert!(matches!(error, LaunchError::RuntimeNotReady { .. }));
+        let detail = error.to_string();
+        assert!(detail.contains("apiserver is not running and not registered with launchd"));
+        assert!(detail.contains("Start System"));
+        assert!(detail.contains("install the latest supported official Apple Container release"));
+        assert!(detail.contains("1.0.0"));
+        assert!(!detail.contains("image pull"));
     }
 
     #[test]
@@ -2823,8 +3644,18 @@ mod tests {
         output.stdout = b"COCOA_WAY_IMAGE_PROBE_STARTED\n".to_vec();
         assert!(matches!(
             image_probe_failure("Apple Container", "gui:latest", &output),
+            LaunchError::RuntimeNotReady { .. }
+        ));
+        output.stderr = b"COCOA_WAY_MISSING_TOOL: perl\n".to_vec();
+        assert!(matches!(
+            image_probe_failure("Apple Container", "gui:latest", &output),
             LaunchError::ImageNotGuiReady { .. }
         ));
+        assert!(
+            image_probe_failure("Apple Container", "gui:latest", &output)
+                .to_string()
+                .contains("perl")
+        );
     }
 
     #[test]

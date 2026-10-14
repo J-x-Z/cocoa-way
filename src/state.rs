@@ -1357,6 +1357,9 @@ impl XdgShellHandler for AppState {
                 );
             } else {
                 self.layout.add_tile(surface.clone());
+                let _ = self
+                    .loop_signal
+                    .send(crate::messages::CompositorMessage::DesktopToplevelCreated);
             }
             self.needs_redraw = true;
         }

@@ -63,7 +63,7 @@ pub fn load_connections() -> Vec<Connection> {
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Write an example config so the user knows the format
             let _ = std::fs::create_dir_all(&config_dir);
             let example = r#"# cocoa-way connections
@@ -95,6 +95,13 @@ pub fn load_connections() -> Vec<Connection> {
             log::info!("Created example connections.toml at {:?}", path);
             return vec![];
         }
+        Err(error) => {
+            log::error!(
+                "Could not read saved connections from {}: {error}. Check the file permissions; Cocoa-Way has not replaced the file.",
+                path.display()
+            );
+            return vec![];
+        }
     };
 
     match toml::from_str::<Config>(&content) {
@@ -107,7 +114,11 @@ pub fn load_connections() -> Vec<Connection> {
             cfg.connection
         }
         Err(e) => {
-            log::warn!("Failed to parse connections.toml: {}", e);
+            log::warn!(
+                "Failed to parse {}: {}. Correct this TOML file before using saved connections; Cocoa-Way has not replaced it.",
+                path.display(),
+                e
+            );
             vec![]
         }
     }
@@ -195,7 +206,7 @@ fn save_connection_at(path: &Path, connection: &Connection) -> Result<usize, Str
 pub fn spawn_waypipe(conn: &Connection, runtime_dir: &str, display: &str) -> Result<Child, String> {
     let app = conn.app.as_deref().unwrap_or("weston-terminal");
     let waypipe = resolve_waypipe_path(conn.waypipe_path.as_deref())
-        .ok_or_else(|| "waypipe was not found in PATH or the configured path".to_string())?;
+        .ok_or_else(|| "Waypipe was not found in PATH or the configured executable path. Install it with `brew install J-x-Z/tap/waypipe-darwin`, or correct waypipe_path in Connections settings. Waypipe is also required on the Linux host.".to_string())?;
     let child_path = build_child_path();
     let target = resolve_display_target(conn.display.as_deref(), runtime_dir, display)?;
 

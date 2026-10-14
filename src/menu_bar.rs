@@ -15,7 +15,10 @@ use objc2::mutability::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{ClassType, DeclaredClass, msg_send, msg_send_id, sel};
-use objc2_app_kit::{NSAlert, NSApplication, NSEventModifierFlags, NSImage, NSMenu, NSMenuItem};
+use objc2_app_kit::{
+    NSAlert, NSApplication, NSEventModifierFlags, NSImage, NSMenu, NSMenuItem, NSStatusBar,
+    NSStatusItem, NSVariableStatusItemLength,
+};
 use objc2_foundation::{MainThreadMarker, NSData, NSString};
 
 use crate::connections::Connection;
@@ -29,12 +32,19 @@ static SENDER: Mutex<Option<Sender<CompositorMessage>>> = Mutex::new(None);
 #[derive(Default)]
 struct DesktopBackgroundMenuState {
     active: bool,
-    item: Option<Retained<NSMenuItem>>,
+    items: Vec<Retained<NSMenuItem>>,
+}
+
+#[derive(Default)]
+struct NativeMenuState {
+    handler: Option<Retained<MenuHandler>>,
+    status_item: Option<Retained<NSStatusItem>>,
 }
 
 thread_local! {
     static DESKTOP_BACKGROUND_MENU: RefCell<DesktopBackgroundMenuState> =
         RefCell::new(DesktopBackgroundMenuState::default());
+    static NATIVE_MENU: RefCell<NativeMenuState> = RefCell::new(NativeMenuState::default());
 }
 
 /// Sync only after the event loop knows the actual mode state, including a
@@ -47,7 +57,7 @@ pub fn set_desktop_background_active(active: bool) {
     DESKTOP_BACKGROUND_MENU.with(|state| {
         let mut state = state.borrow_mut();
         state.active = active;
-        if let Some(item) = state.item.as_ref() {
+        for item in &state.items {
             unsafe {
                 let _: () = msg_send![&**item, setState: isize::from(active)];
             }
@@ -85,6 +95,7 @@ declare_class!(
         /// "Connect to Machine…" — shows a quick-connect NSAlert dialog.
         #[method(quickConnect:)]
         fn quick_connect(&self, _sender: &AnyObject) {
+            activate_application();
             unsafe { show_quick_connect_dialog(); }
         }
 
@@ -107,7 +118,49 @@ declare_class!(
             };
             // Menu actions are delivered on the main thread.
             let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            activate_application();
             crate::container_mode::show(tx, mtm);
+        }
+
+        #[method(openApplications:)]
+        fn open_applications(&self, _sender: &AnyObject) {
+            open_panel(crate::container_mode::PanelPage::Applications);
+        }
+
+        #[method(openDisplays:)]
+        fn open_displays(&self, _sender: &AnyObject) {
+            open_panel(crate::container_mode::PanelPage::Displays);
+        }
+
+        #[method(openDiagnostics:)]
+        fn open_diagnostics(&self, _sender: &AnyObject) {
+            open_panel(crate::container_mode::PanelPage::Diagnostics);
+        }
+
+        #[method(checkEnvironment:)]
+        fn check_environment(&self, _sender: &AnyObject) {
+            activate_application();
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            unsafe {
+                let alert = NSAlert::new(mtm);
+                alert.setMessageText(&NSString::from_str("Cocoa-Way Environment"));
+                alert.setInformativeText(&NSString::from_str(&crate::startup::environment_report()));
+                alert.addButtonWithTitle(&NSString::from_str("OK"));
+                alert.addButtonWithTitle(&NSString::from_str("Open Diagnostic Logs"));
+                if alert.runModal() == 1001 {
+                    open_diagnostic_logs();
+                }
+            }
+        }
+
+        #[method(openDiagnosticLogs:)]
+        fn open_diagnostic_logs(&self, _sender: &AnyObject) {
+            open_diagnostic_logs();
+        }
+
+        #[method(hideDefaultDisplay:)]
+        fn hide_default_display(&self, _sender: &AnyObject) {
+            send(CompositorMessage::HideDefaultDisplay);
         }
 
         #[method(showDefaultDisplay:)]
@@ -141,6 +194,54 @@ declare_class!(
         }
     }
 );
+
+fn activate_application() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        unsafe {
+            NSApplication::sharedApplication(mtm).activate();
+        }
+    }
+}
+
+fn open_panel(page: crate::container_mode::PanelPage) {
+    let Some(tx) = sender() else {
+        return;
+    };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    activate_application();
+    crate::container_mode::show_page(tx, mtm, page);
+}
+
+fn open_diagnostic_logs() {
+    let Some(path) = crate::startup::log_directory() else {
+        return;
+    };
+    if let Err(error) = crate::startup::prepare_private_directory(&path) {
+        log::error!("Could not open diagnostic logs: {error}");
+        return;
+    }
+    if let Err(error) = std::process::Command::new("/usr/bin/open")
+        .arg(&path)
+        .spawn()
+    {
+        log::error!("Could not open {}: {error}", path.display());
+    }
+}
+
+pub fn remove_status_item(mtm: MainThreadMarker) {
+    NATIVE_MENU.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(item) = state.status_item.take() {
+            unsafe {
+                NSStatusBar::systemStatusBar().removeStatusItem(&item);
+            }
+        }
+        state.handler = None;
+    });
+    let _ = mtm;
+}
 
 // ── Quick-connect dialog ──────────────────────────────────────────────────────
 
@@ -359,9 +460,16 @@ pub fn show_startup_error(message: &str, mtm: MainThreadMarker) {
     unsafe {
         let alert = NSAlert::new(mtm);
         alert.setMessageText(&NSString::from_str("Cocoa-Way Could Not Start"));
-        alert.setInformativeText(&NSString::from_str(message));
+        let detail = crate::startup::log_directory().map_or_else(
+            || message.to_string(),
+            |path| format!("{message}\n\nDiagnostic logs: {}", path.display()),
+        );
+        alert.setInformativeText(&NSString::from_str(&detail));
         alert.addButtonWithTitle(&NSString::from_str("Quit"));
-        alert.runModal();
+        alert.addButtonWithTitle(&NSString::from_str("Open Diagnostic Logs"));
+        if alert.runModal() == 1001 {
+            open_diagnostic_logs();
+        }
     }
 }
 
@@ -410,7 +518,13 @@ pub fn setup_menu(
     *SENDER.lock().unwrap() = Some(sender);
 
     unsafe {
-        let handler: Retained<MenuHandler> = msg_send_id![MenuHandler::class(), new];
+        let handler = NATIVE_MENU.with(|state| {
+            state
+                .borrow_mut()
+                .handler
+                .get_or_insert_with(|| msg_send_id![MenuHandler::class(), new])
+                .clone()
+        });
 
         let app = NSApplication::sharedApplication(mtm);
         install_application_icon(&app, mtm);
@@ -543,7 +657,7 @@ pub fn setup_menu(
         DESKTOP_BACKGROUND_MENU.with(|state| {
             let mut state = state.borrow_mut();
             let _: () = msg_send![&*desktop_background, setState: isize::from(state.active)];
-            state.item = Some(desktop_background.clone());
+            state.items = vec![desktop_background.clone()];
         });
         view_menu.addItem(&desktop_background);
         let restore_desktop = NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -564,8 +678,142 @@ pub fn setup_menu(
         root.addItem(&view_item);
 
         app.setMainMenu(Some(&root));
-        std::mem::forget(handler);
+        install_status_menu(connections, container_sessions, &handler, &app, mtm);
     }
+}
+
+unsafe fn action_item(
+    title: &str,
+    action: objc2::runtime::Sel,
+    handler: &MenuHandler,
+    mtm: MainThreadMarker,
+) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc::<NSMenuItem>(),
+            &NSString::from_str(title),
+            Some(action),
+            &NSString::from_str(""),
+        )
+    };
+    unsafe {
+        item.setTarget(Some(handler));
+    }
+    item
+}
+
+unsafe fn install_status_menu(
+    connections: &[Connection],
+    sessions: &[ContainerSession],
+    handler: &MenuHandler,
+    app: &NSApplication,
+    mtm: MainThreadMarker,
+) {
+    let menu = NSMenu::new(mtm);
+    unsafe {
+        menu.setAutoenablesItems(false);
+    }
+    let title = unsafe { label_item(&format!("Cocoa-Way {}", env!("CARGO_PKG_VERSION")), mtm) };
+    unsafe {
+        title.setEnabled(false);
+    }
+    menu.addItem(&title);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    for (title, action) in [
+        ("Applications...", sel!(openApplications:)),
+        ("Connect to Machine...", sel!(quickConnect:)),
+        ("Displays...", sel!(openDisplays:)),
+        ("Diagnostics...", sel!(openDiagnostics:)),
+        ("Check Environment...", sel!(checkEnvironment:)),
+        ("Open Diagnostic Logs", sel!(openDiagnosticLogs:)),
+    ] {
+        let item = unsafe { action_item(title, action, handler, mtm) };
+        menu.addItem(&item);
+    }
+    if !connections.is_empty() {
+        let submenu = NSMenu::new(mtm);
+        for (index, connection) in connections.iter().enumerate() {
+            let item =
+                unsafe { action_item(&connection.name, sel!(connectMachine:), handler, mtm) };
+            unsafe {
+                item.setTag(index as isize);
+            }
+            submenu.addItem(&item);
+        }
+        let saved = unsafe { label_item("Saved Connections", mtm) };
+        saved.setSubmenu(Some(&submenu));
+        menu.addItem(&saved);
+    }
+    if !sessions.is_empty() {
+        let submenu = NSMenu::new(mtm);
+        for (index, session) in sessions.iter().enumerate() {
+            let item =
+                unsafe { action_item(&session.name, sel!(startContainerSession:), handler, mtm) };
+            unsafe {
+                item.setTag(index as isize);
+            }
+            submenu.addItem(&item);
+        }
+        let applications = unsafe { label_item("Launch Application", mtm) };
+        applications.setSubmenu(Some(&submenu));
+        menu.addItem(&applications);
+    }
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    for (title, action) in [
+        ("Show Default Display", sel!(showDefaultDisplay:)),
+        ("Hide Default Display", sel!(hideDefaultDisplay:)),
+        (
+            "Use Desktop Background (Experimental)",
+            sel!(toggleDesktopBackground:),
+        ),
+        ("Restore Desktop Window", sel!(restoreDesktopWindow:)),
+    ] {
+        let item = unsafe { action_item(title, action, handler, mtm) };
+        if action == sel!(toggleDesktopBackground:) {
+            DESKTOP_BACKGROUND_MENU.with(|state| {
+                let mut state = state.borrow_mut();
+                unsafe {
+                    let _: () = msg_send![&*item, setState: isize::from(state.active)];
+                }
+                state.items.push(item.clone());
+            });
+        }
+        menu.addItem(&item);
+    }
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let quit = unsafe { action_item("Quit Cocoa-Way", sel!(terminate:), handler, mtm) };
+    unsafe {
+        quit.setTarget(Some(app));
+    }
+    menu.addItem(&quit);
+    NATIVE_MENU.with(|state| {
+        let mut state = state.borrow_mut();
+        let item = state.status_item.get_or_insert_with(|| unsafe {
+            NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength)
+        });
+        unsafe {
+            if let Some(button) = item.button(mtm) {
+                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str("display"),
+                    Some(&NSString::from_str("Cocoa-Way")),
+                ) {
+                    image.setTemplate(true);
+                    image.setSize(objc2_foundation::NSSize {
+                        width: 18.0,
+                        height: 18.0,
+                    });
+                    button.setImage(Some(&image));
+                    button.setTitle(&NSString::from_str(""));
+                } else {
+                    button.setTitle(&NSString::from_str("CW"));
+                }
+                button.setToolTip(Some(&NSString::from_str(
+                    "Cocoa-Way: applications, connections and diagnostics",
+                )));
+            }
+            item.setMenu(Some(&menu));
+        }
+    });
 }
 
 /// Disable macOS window tab bar (removes "Show Tab Bar" from the View menu).
