@@ -11,6 +11,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use winit::window::Window;
 
+#[path = "texture_lifetime.rs"]
+mod texture_lifetime;
+use texture_lifetime::{FrameGate, FrameLifetime, TextureVersions, UpdateError};
+
 // All three shaders share one vertex function; each has its own fragment function.
 const SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -77,17 +81,31 @@ struct FrameState {
     drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     encoder: Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>,
+    lifetime: Arc<FrameLifetime>,
 }
 
-// Per-surface texture cache entry
-struct CachedTexture {
+struct TextureResource {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    width: i32,
+    height: i32,
+}
+
+// Slots cover size changes too; a busy old-sized resource cannot be replaced.
+struct CachedTexture {
+    textures: TextureVersions<TextureResource>,
     buffer_id: ObjectId,
     alpha: TextureAlpha,
-    tex_w: i32,
-    tex_h: i32,
     dest_w: i32,
     dest_h: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PixelDrawResult {
+    Drawn,
+    /// No frame/idle texture slot. Caller must retain the latest commit for retry.
+    Deferred,
+    /// Invalid dimensions/range or failed Metal allocation; no texture was changed.
+    Rejected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +140,7 @@ pub struct MetalRenderer {
     border_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     // Set for the duration of one rendered frame
     frame: RefCell<Option<FrameState>>,
+    frame_gate: Arc<FrameGate>,
     // surface ObjectId → cached GPU texture
     texture_cache: RefCell<HashMap<ObjectId, CachedTexture>>,
     trace: crate::latency_trace::LatencyTrace,
@@ -205,6 +224,7 @@ impl MetalRenderer {
                 alpha_blit_pipeline,
                 border_pipeline,
                 frame: RefCell::new(None),
+                frame_gate: Arc::new(FrameGate::default()),
                 texture_cache: RefCell::new(HashMap::new()),
                 trace: crate::latency_trace::LatencyTrace::default(),
                 trace_frames: RefCell::new(Vec::new()),
@@ -233,9 +253,11 @@ impl MetalRenderer {
     }
 
     pub fn ready_for_redraw(&self) -> bool {
-        self.native_frame_source
-            .as_ref()
-            .is_none_or(|source| source.has_drawable())
+        self.frame_gate.ready()
+            && self
+                .native_frame_source
+                .as_ref()
+                .is_none_or(|source| source.has_drawable())
     }
 
     pub fn begin_trace_frame(&self, frames: Vec<u64>) {
@@ -254,6 +276,10 @@ impl MetalRenderer {
             );
         }
         *self.trace_frames.borrow_mut() = frames;
+    }
+
+    pub fn discard_trace_frame(&self) {
+        self.trace_frames.borrow_mut().clear();
     }
 
     pub fn set_scale_factor(&mut self, scale: f64) {
@@ -281,6 +307,10 @@ impl MetalRenderer {
         let mut frame_slot = self.frame.borrow_mut();
         // Drop any leftover frame state from a previous incomplete frame.
         *frame_slot = None;
+        // Fail before consuming a drawable or any caller-owned buffer commits.
+        let Some(lifetime) = self.frame_gate.begin() else {
+            return false;
+        };
 
         let acquire_started = (self.trace.enabled() && !self.trace_frames.borrow().is_empty())
             .then(crate::latency_trace::now_ns);
@@ -340,6 +370,7 @@ impl MetalRenderer {
             drawable,
             command_buffer: cmd_buf,
             encoder,
+            lifetime,
         });
         true
     }
@@ -351,6 +382,17 @@ impl MetalRenderer {
         };
         unsafe {
             frame.encoder.endEncoding();
+            let lifetime = frame.lifetime.clone();
+            let window = self.window.clone();
+            let completed = block2::RcBlock::new(
+                move |_command_buffer: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    // Always release ownership, including GPU errors and tracing-disabled runs.
+                    if lifetime.complete() {
+                        window.request_redraw();
+                    }
+                },
+            );
+            let () = objc2::msg_send![&*frame.command_buffer, addCompletedHandler: &*completed];
             let compose_finished = (self.trace.enabled() && !self.trace_frames.borrow().is_empty())
                 .then(crate::latency_trace::now_ns);
             let traced_frames = std::mem::take(&mut *self.trace_frames.borrow_mut());
@@ -467,7 +509,8 @@ impl MetalRenderer {
         self.texture_cache
             .borrow()
             .get(surface_id)
-            .map(|entry| (entry.tex_w, entry.tex_h))
+            .and_then(|entry| entry.textures.current())
+            .map(|texture| (texture.width, texture.height))
     }
 
     /// Render from cache using only surf_id — no buf_id required.
@@ -480,8 +523,8 @@ impl MetalRenderer {
         scale: f64,
         viewport_dst: Option<smithay::utils::Size<i32, smithay::utils::Logical>>,
     ) -> bool {
-        let cache = self.texture_cache.borrow();
-        let Some(entry) = cache.get(surface_id) else {
+        let mut cache = self.texture_cache.borrow_mut();
+        let Some(entry) = cache.get_mut(surface_id) else {
             return false;
         };
         let dest_w = viewport_dst
@@ -497,6 +540,11 @@ impl MetalRenderer {
         let Some(frame) = frame_ref.as_ref() else {
             return false;
         };
+        if entry.textures.current().is_none() {
+            return false;
+        }
+        entry.textures.mark_read(&frame.lifetime);
+        let texture = &entry.textures.current().unwrap().texture;
         let rect = self.to_ndc(phys_x, phys_y, dest_w, dest_h);
         unsafe {
             let enc = &frame.encoder;
@@ -511,7 +559,7 @@ impl MetalRenderer {
                 std::mem::size_of::<RectUniform>(),
                 0,
             );
-            enc.setFragmentTexture_atIndex(Some(&entry.texture), 0);
+            enc.setFragmentTexture_atIndex(Some(texture), 0);
             enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         }
         true
@@ -519,7 +567,8 @@ impl MetalRenderer {
 
     // ── Draw calls ───────────────────────────────────────────────────────────
 
-    /// Draw a surface buffer. Pass `tex_w=0, pixels=&[]` on a cache hit.
+    /// Draw a new buffer snapshot; cache-only draws must use `draw_from_cache`.
+    /// `Deferred` must not be counted as rendered or discard the caller's latest commit.
     pub fn draw_pixels(
         &self,
         surface_id: ObjectId,
@@ -534,13 +583,13 @@ impl MetalRenderer {
         pixels: &[u8],
         alpha: TextureAlpha,
         damage: &[BufferDamage],
-    ) {
+    ) -> PixelDrawResult {
         if dest_w <= 0 || dest_h <= 0 {
-            return;
+            return PixelDrawResult::Rejected;
         }
         let frame_ref = self.frame.borrow();
         let Some(frame) = frame_ref.as_ref() else {
-            return;
+            return PixelDrawResult::Deferred;
         };
 
         let texture = self.get_or_create_texture(
@@ -554,9 +603,11 @@ impl MetalRenderer {
             pixels,
             alpha,
             damage,
+            &frame.lifetime,
         );
-        let Some(texture) = texture else {
-            return;
+        let texture = match texture {
+            Ok(texture) => texture,
+            Err(result) => return result,
         };
 
         let rect = self.to_ndc(x, y, dest_w, dest_h);
@@ -576,6 +627,7 @@ impl MetalRenderer {
             enc.setFragmentTexture_atIndex(Some(&texture), 0);
             enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         }
+        PixelDrawResult::Drawn
     }
 
     pub fn draw_border(&self, x: i32, y: i32, width: i32, height: i32, border_width: f32) {
@@ -630,102 +682,127 @@ impl MetalRenderer {
         pixels: &[u8],
         alpha: TextureAlpha,
         damage: &[BufferDamage],
-    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+        frame: &Arc<FrameLifetime>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, PixelDrawResult> {
         let mut cache = self.texture_cache.borrow_mut();
 
-        let row_bytes = (tex_w.max(0) as usize).saturating_mul(4);
+        let row_bytes = (tex_w.max(0) as usize).checked_mul(4);
         let required = (tex_h.max(0) as usize)
             .checked_sub(1)
             .and_then(|rows| rows.checked_mul(bytes_per_row))
-            .and_then(|prefix| prefix.checked_add(row_bytes));
+            .and_then(|prefix| prefix.checked_add(row_bytes?));
         if tex_w <= 0
             || tex_h <= 0
-            || bytes_per_row < row_bytes
+            || row_bytes.is_none_or(|row_bytes| bytes_per_row < row_bytes)
             || required.is_none_or(|required| pixels.len() < required)
         {
             cache.remove(&surface_id);
-            return None;
+            return Err(PixelDrawResult::Rejected);
         }
 
-        let region = MTLRegion {
-            origin: MTLOrigin { x: 0, y: 0, z: 0 },
-            size: MTLSize {
-                width: tex_w as usize,
-                height: tex_h as usize,
-                depth: 1,
-            },
-        };
-
-        // Reuse existing texture if same size — avoids VRAM allocation every frame.
-        if let Some(entry) = cache.get_mut(&surface_id) {
-            if entry.tex_w == tex_w && entry.tex_h == tex_h {
-                if let Some(damage) = coalesce_damage(damage, tex_w, tex_h) {
-                    let byte_offset = (damage.y as usize)
-                        .saturating_mul(bytes_per_row)
-                        .saturating_add((damage.x as usize).saturating_mul(4));
-                    let damage_region = MTLRegion {
-                        origin: MTLOrigin {
-                            x: damage.x as usize,
-                            y: damage.y as usize,
-                            z: 0,
-                        },
-                        size: MTLSize {
-                            width: damage.width as usize,
-                            height: damage.height as usize,
-                            depth: 1,
-                        },
-                    };
-                    unsafe {
-                        entry
-                            .texture
-                            .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                                damage_region,
-                                0,
-                                NonNull::new_unchecked(pixels.as_ptr().add(byte_offset) as *mut _),
-                                bytes_per_row,
-                            );
-                    }
-                }
-                entry.buffer_id = buffer_id;
-                entry.alpha = alpha;
-                entry.dest_w = dest_w;
-                entry.dest_h = dest_h;
-                return Some(entry.texture.clone());
-            }
-        }
-
-        // First frame or size changed: allocate a new MTLTexture.
-        let texture = unsafe {
-            let desc = MTLTextureDescriptor::new();
-            desc.setTextureType(MTLTextureType::MTLTextureType2D);
-            desc.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-            desc.setWidth(tex_w as usize);
-            desc.setHeight(tex_h as usize);
-            desc.setUsage(MTLTextureUsage::ShaderRead);
-            let tex = self.device.newTextureWithDescriptor(&desc)?;
-            tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                region,
-                0,
-                slice_bytes(pixels),
-                bytes_per_row,
-            );
-            tex
-        };
-
-        let cloned = texture.clone();
-        cache.insert(
-            surface_id,
-            CachedTexture {
-                texture,
-                buffer_id,
+        let entry = cache
+            .entry(surface_id.clone())
+            .or_insert_with(|| CachedTexture {
+                textures: TextureVersions::new(),
+                buffer_id: buffer_id.clone(),
                 alpha,
-                tex_w,
-                tex_h,
                 dest_w,
                 dest_h,
-            },
-        );
-        Some(cloned)
+            });
+        let same_size = entry
+            .textures
+            .current()
+            .is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
+        let damage = coalesce_damage(damage, tex_w, tex_h);
+        if !same_size || damage.is_some() {
+            let result = entry.textures.update(|idle, is_current| {
+                let same_size =
+                    idle.is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
+                // Idle alternate slots may contain an older image (or old dimensions).
+                let upload = texture_upload_damage(is_current, same_size, damage, tex_w, tex_h)?;
+                let byte_offset = (upload.y as usize)
+                    .checked_mul(bytes_per_row)?
+                    .checked_add((upload.x as usize).checked_mul(4)?)?;
+                let region = MTLRegion {
+                    origin: MTLOrigin {
+                        x: upload.x as usize,
+                        y: upload.y as usize,
+                        z: 0,
+                    },
+                    size: MTLSize {
+                        width: upload.width as usize,
+                        height: upload.height as usize,
+                        depth: 1,
+                    },
+                };
+                let texture = if same_size {
+                    idle.unwrap().texture.clone()
+                } else {
+                    let desc = unsafe { MTLTextureDescriptor::new() };
+                    desc.setTextureType(MTLTextureType::MTLTextureType2D);
+                    desc.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+                    unsafe {
+                        desc.setWidth(tex_w as usize);
+                        desc.setHeight(tex_h as usize);
+                    }
+                    desc.setUsage(MTLTextureUsage::ShaderRead);
+                    self.device.newTextureWithDescriptor(&desc)?
+                };
+                // The ownership model excludes ALL encoded/submitted GPU readers here.
+                unsafe {
+                    texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                        region,
+                        0,
+                        NonNull::new_unchecked(pixels.as_ptr().add(byte_offset) as *mut _),
+                        bytes_per_row,
+                    );
+                }
+                Some(TextureResource {
+                    texture,
+                    width: tex_w,
+                    height: tex_h,
+                })
+            });
+            if let Err(error) = result {
+                if entry.textures.current().is_none() {
+                    cache.remove(&surface_id);
+                }
+                return Err(match error {
+                    UpdateError::Busy => {
+                        self.frame_gate.defer_redraw();
+                        PixelDrawResult::Deferred
+                    }
+                    UpdateError::Rejected => PixelDrawResult::Rejected,
+                });
+            }
+        }
+        entry.buffer_id = buffer_id;
+        entry.alpha = alpha;
+        entry.dest_w = dest_w;
+        entry.dest_h = dest_h;
+        // Default command buffers retain encoded Metal textures through completion;
+        // this CPU-only fence additionally prevents replaceRegion while they are read.
+        entry.textures.mark_read(frame);
+        Ok(entry.textures.current().unwrap().texture.clone())
+    }
+}
+
+fn texture_upload_damage(
+    is_current: bool,
+    same_size: bool,
+    damage: Option<BufferDamage>,
+    width: i32,
+    height: i32,
+) -> Option<BufferDamage> {
+    if is_current && same_size {
+        damage
+    } else {
+        Some(BufferDamage {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        })
     }
 }
 
@@ -756,7 +833,38 @@ fn coalesce_damage(damage: &[BufferDamage], width: i32, height: i32) -> Option<B
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferDamage, TextureAlpha, coalesce_damage};
+    use super::{BufferDamage, TextureAlpha, coalesce_damage, texture_upload_damage};
+
+    #[test]
+    fn alternate_or_resized_slots_require_full_upload_even_with_empty_damage() {
+        let damage = BufferDamage {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        let full = BufferDamage {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 30,
+        };
+        assert_eq!(
+            texture_upload_damage(true, true, Some(damage), 20, 30),
+            Some(damage)
+        );
+        assert_eq!(texture_upload_damage(true, true, None, 20, 30), None);
+        for (current, same_size) in [(false, false), (false, true), (true, false)] {
+            assert_eq!(
+                texture_upload_damage(current, same_size, Some(damage), 20, 30),
+                Some(full)
+            );
+            assert_eq!(
+                texture_upload_damage(current, same_size, None, 20, 30),
+                Some(full)
+            );
+        }
+    }
 
     #[test]
     fn damage_is_clipped_and_coalesced() {

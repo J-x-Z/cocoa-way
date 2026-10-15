@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 use crate::network::{HostProxyBridge, has_proxy_environment};
 use crate::runtime_commands::CommandError as RuntimeCommandError;
 use crate::runtime_paths::{build_child_path, resolve_command_path, shell_single_quote};
+
+#[path = "container_identity.rs"]
+mod container_identity;
+pub use container_identity::{OwnedContainerIdentity, cleanup_owned_instance};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContainerSession {
@@ -59,6 +63,7 @@ enum ContainerRuntime {
 
 #[derive(Debug)]
 pub struct LaunchReport {
+    pub identity: OwnedContainerIdentity,
     pub container_child: Option<Child>,
     pub waypipe_child: Child,
     pub runtime: String,
@@ -255,6 +260,8 @@ impl LaunchError {
 const RELAY_ENV: &str = "COCOA_WAY_CONTAINER_RELAY";
 const RELAY_IMAGE_ENV: &str = "COCOA_WAY_RELAY_IMAGE";
 const RELAY_NAME_ENV: &str = "COCOA_WAY_RELAY_CONTAINER_NAME";
+const RELAY_OWNER_ENV: &str = "COCOA_WAY_RELAY_OWNER_TOKEN";
+const RELAY_BINARY_ENV: &str = "COCOA_WAY_RELAY_RUNTIME_BINARY";
 const RELAY_ENV_LIST_ENV: &str = "COCOA_WAY_RELAY_ENV";
 const RELAY_MOUNTS_ENV: &str = "COCOA_WAY_RELAY_MOUNTS";
 const RELAY_RUNTIME_ARGS_ENV: &str = "COCOA_WAY_RELAY_RUNTIME_ARGS";
@@ -284,13 +291,24 @@ fn run_container_relay(args: Vec<String>) -> Result<(), String> {
     let image =
         std::env::var(RELAY_IMAGE_ENV).map_err(|_| format!("missing {}", RELAY_IMAGE_ENV))?;
     let container_name =
-        std::env::var(RELAY_NAME_ENV).unwrap_or_else(|_| "cocoa-way-apple-relay".into());
+        std::env::var(RELAY_NAME_ENV).map_err(|_| format!("missing {RELAY_NAME_ENV}"))?;
+    let owner_token =
+        std::env::var(RELAY_OWNER_ENV).map_err(|_| format!("missing {RELAY_OWNER_ENV}"))?;
+    let container = std::env::var_os(RELAY_BINARY_ENV)
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| format!("missing {RELAY_BINARY_ENV}"))?;
     let child_path = build_child_path();
-    let container = require_session_command(
+    let identity = OwnedContainerIdentity::with_token(
         "container",
-        None,
+        &container_name,
+        &container,
         &child_path,
-        "Install Apple Container for this relay, then retry.",
+        &owner_token,
+    )?;
+    require_executable(
+        identity.runtime_binary(),
+        "container",
+        "Restore the captured Apple Container executable and validate the profile again.",
     )
     .map_err(|error| error.to_string())?;
 
@@ -326,21 +344,16 @@ fn run_container_relay(args: Vec<String>) -> Result<(), String> {
             &container,
             &child_path,
             &image,
-            &container_name,
+            &identity,
             &environment,
         ) {
             Ok(()) => return Ok(()),
             Err(PublishRelayError::Active(error)) => return Err(error),
             Err(PublishRelayError::Startup(error)) => {
+                cleanup_before_stdio_fallback(&identity, &error)?;
                 eprintln!(
                     "cocoa-way transport v2 startup failed: {}; falling back to stdio relay",
                     error
-                );
-                let _ = cleanup_named_runtime_container(
-                    ContainerRuntime::Apple,
-                    &container,
-                    &child_path,
-                    &container_name,
                 );
             }
         }
@@ -353,11 +366,22 @@ fn run_container_relay(args: Vec<String>) -> Result<(), String> {
         &container,
         &child_path,
         &image,
-        &container_name,
+        &identity,
         &environment,
     );
     drop(proxy_bridge);
     result
+}
+
+fn cleanup_before_stdio_fallback(
+    identity: &OwnedContainerIdentity,
+    startup_error: &str,
+) -> Result<(), String> {
+    cleanup_owned_instance(identity).map_err(|cleanup_error| {
+        format!(
+            "publish-socket startup failed: {startup_error}; {cleanup_error}; stdio fallback was not started"
+        )
+    })
 }
 
 fn run_stdio_relay(
@@ -365,7 +389,7 @@ fn run_stdio_relay(
     container: &Path,
     child_path: &str,
     image: &str,
-    container_name: &str,
+    identity: &OwnedContainerIdentity,
     environment: &[String],
 ) -> Result<(), String> {
     eprintln!("cocoa-way container relay: using stdio compatibility transport");
@@ -379,7 +403,7 @@ fn run_stdio_relay(
         .arg("--rm")
         .arg("-i")
         .arg("--name")
-        .arg(container_name)
+        .arg(identity.name())
         .arg("--env")
         .arg(format!("XDG_RUNTIME_DIR={}", default_guest_runtime_dir()));
     for env in environment {
@@ -393,6 +417,7 @@ fn run_stdio_relay(
     for arg in relay_env_list(RELAY_RUNTIME_ARGS_ENV) {
         cmd.arg(arg);
     }
+    identity.append_owner_label(&mut cmd);
     append_guest_command(&mut cmd, image, "perl");
     cmd.arg("-e")
         .arg(guest_relay_perl())
@@ -415,12 +440,43 @@ fn run_stdio_relay(
         Arc::clone(&child_stdin),
         &relay.local_socket,
     );
-    let status = child.wait().map_err(|error| error.to_string())?;
+    drop(child_stdin);
+    let status = finish_relay_child(child, relay_result.is_err(), Duration::from_secs(2))?;
     relay_result?;
     if status.success() {
         Ok(())
     } else {
         Err(format!("container relay exited with {}", status))
+    }
+}
+
+fn finish_relay_child(
+    mut child: Child,
+    failed: bool,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+        return Ok(status);
+    }
+    if failed {
+        let _ = child.kill();
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            // Reap after SIGKILL on a detached waiter rather than block the relay caller.
+            let _ = thread::Builder::new()
+                .name("relay-reap".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+            return Err("container relay did not exit within the teardown deadline".into());
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -434,7 +490,7 @@ fn run_publish_socket_relay(
     container: &Path,
     child_path: &str,
     image: &str,
-    container_name: &str,
+    identity: &OwnedContainerIdentity,
     environment: &[String],
 ) -> Result<(), PublishRelayError> {
     let host_transport =
@@ -465,7 +521,7 @@ fn run_publish_socket_relay(
         .arg("run")
         .arg("--rm")
         .arg("--name")
-        .arg(container_name)
+        .arg(identity.name())
         .arg("--publish-socket")
         .arg(format!("{}:{}", host_transport, guest_transport))
         .arg("--env")
@@ -487,6 +543,7 @@ fn run_publish_socket_relay(
     for arg in relay_env_list(RELAY_RUNTIME_ARGS_ENV) {
         cmd.arg(arg);
     }
+    identity.append_owner_label(&mut cmd);
     append_guest_command(&mut cmd, image, "perl");
     cmd.arg("-e")
         .arg(guest_publish_socket_relay_perl())
@@ -540,9 +597,8 @@ fn run_publish_socket_relay(
         &relay.local_socket,
     );
     let _ = transport.shutdown(std::net::Shutdown::Both);
-    let status = child
-        .wait()
-        .map_err(|error| PublishRelayError::Active(error.to_string()))?;
+    let status = finish_relay_child(child, relay_result.is_err(), Duration::from_secs(2))
+        .map_err(PublishRelayError::Active)?;
     let _ = std::fs::remove_file(&host_transport);
     if let Some(host_audio) = host_audio.as_deref() {
         let _ = std::fs::remove_file(host_audio);
@@ -794,11 +850,13 @@ fn wait_for_publish_relay_ready(
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut ready_sent = false;
-        for line in BufReader::new(stdout).lines() {
+        for line in crate::process_output::lines(stdout) {
             match line {
                 Ok(line) if line == RELAY_V2_READY_LINE => {
-                    ready_sent = true;
-                    let _ = sender.send(Ok(()));
+                    if !ready_sent {
+                        ready_sent = true;
+                        let _ = sender.send(Ok(()));
+                    }
                 }
                 Ok(line) => eprintln!("[container stdout] {}", line),
                 Err(error) => {
@@ -1569,6 +1627,7 @@ fn load_sessions_report_from_path(path: &Path) -> SessionLoadReport {
 }
 
 pub fn append_session(session: &ContainerSession) -> std::io::Result<()> {
+    validate_profile_name(session, &load_sessions(), None)?;
     let path = config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1595,6 +1654,7 @@ pub fn append_session(session: &ContainerSession) -> std::io::Result<()> {
 }
 
 pub fn replace_session(index: usize, session: &ContainerSession) -> std::io::Result<()> {
+    validate_profile_name(session, &load_sessions(), Some(index))?;
     let path = config_path();
     let content = std::fs::read_to_string(&path)?;
     let ranges = session_ranges(&content);
@@ -1620,6 +1680,10 @@ pub fn replace_session(index: usize, session: &ContainerSession) -> std::io::Res
 }
 
 pub fn remove_session(index: usize) -> std::io::Result<()> {
+    crate::profile_activity::while_idle(|| remove_idle_session(index))
+}
+
+fn remove_idle_session(index: usize) -> std::io::Result<()> {
     let path = config_path();
     let content = std::fs::read_to_string(&path)?;
     let ranges = session_ranges(&content);
@@ -1635,6 +1699,37 @@ pub fn remove_session(index: usize) -> std::io::Result<()> {
     updated.push_str(&content[..start]);
     updated.push_str(content[end..].trim_start_matches('\n'));
     std::fs::write(path, updated)
+}
+
+fn validate_profile_name(
+    session: &ContainerSession,
+    sessions: &[ContainerSession],
+    replaced_index: Option<usize>,
+) -> std::io::Result<()> {
+    let name = container_name(session);
+    if let Some((_, existing)) = sessions.iter().enumerate().find(|(index, existing)| {
+        Some(*index) != replaced_index
+            && runtime_binary_name(&existing.runtime) == runtime_binary_name(&session.runtime)
+            && container_name(existing) == name
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Profile name conflicts with '{}': both resolve to container '{}'. Choose a distinct name.",
+                existing.name, name
+            ),
+        ));
+    }
+    if crate::profile_activity::identity_reserved_by_other(&session.runtime, &name, replaced_index)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "Container identity '{name}' is reserved by another pending or running profile. Wait for its cleanup or choose a distinct name."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn session_ranges(content: &str) -> Vec<(usize, usize)> {
@@ -1800,14 +1895,11 @@ pub fn launch_checked_session(
     )?;
     let runtime_binary_name = runtime_binary_name(&session.runtime);
     let runtime_kind = normalize_container_runtime(&session.runtime);
-    let runtime_binary = require_session_command(
+    let runtime_binary = std::path::PathBuf::from(&check.runtime_binary);
+    require_executable(
+        &runtime_binary,
         runtime_binary_name,
-        None,
-        &child_path,
-        &format!(
-            "Install {} or choose another runtime for this session.",
-            runtime_label(&session.runtime)
-        ),
+        "Restore the captured runtime executable and validate the profile again.",
     )?;
     let host_socket = session
         .socket
@@ -1818,35 +1910,22 @@ pub fn launch_checked_session(
         .clone()
         .unwrap_or_else(|| default_container_socket_path(&host_socket, runtime_kind));
     let container_name = container_name(session);
+    let identity = OwnedContainerIdentity::new(
+        &session.runtime,
+        &container_name,
+        &runtime_binary,
+        &child_path,
+    )
+    .map_err(|hint| LaunchError::InvalidSession {
+        session: session.name.clone(),
+        hint,
+    })?;
     if runtime_container_is_running(runtime_kind, &runtime_binary, &child_path, &container_name)? {
-        if matches!(runtime_kind, ContainerRuntime::Apple) {
-            progress(
-                LaunchStep::CreateContainer,
-                "Removing an untracked Cocoa-Way Apple Container instance left by an earlier run",
-            );
-            cleanup_named_runtime_container(
-                runtime_kind,
-                &runtime_binary,
-                &child_path,
-                &container_name,
-            )
-            .map_err(|hint| LaunchError::RuntimeNotReady {
-                runtime: runtime_label(&session.runtime).into(),
-                hint,
-            })?;
-        }
-        if runtime_container_is_running(
-            runtime_kind,
-            &runtime_binary,
-            &child_path,
-            &container_name,
-        )? {
-            return Err(LaunchError::ContainerAlreadyRunning {
-                runtime: runtime_label(&session.runtime).into(),
-                container_name,
-                hint: "Stop the existing container from Container Mode before launching this profile again, or choose a different profile name.".into(),
-            });
-        }
+        return Err(LaunchError::ContainerAlreadyRunning {
+            runtime: runtime_label(&session.runtime).into(),
+            container_name,
+            hint: "A container with this name is already running. Stop it explicitly or choose a different profile name; Cocoa-Way will not automatically delete an untracked container.".into(),
+        });
     }
 
     let command = session_command(session);
@@ -1891,6 +1970,7 @@ pub fn launch_checked_session(
                 socket_parent.display(),
                 socket_parent.display()
             ));
+            identity.append_owner_label(&mut cmd);
             append_guest_command(&mut cmd, &session.image, "sh");
             cmd.args(["-lc", &server_command]);
         }
@@ -1908,16 +1988,6 @@ pub fn launch_checked_session(
 
     let (container_child, waypipe_child) = match runtime_kind {
         ContainerRuntime::Apple => {
-            cleanup_named_runtime_container(
-                runtime_kind,
-                &runtime_binary,
-                &child_path,
-                &container_name,
-            )
-            .map_err(|hint| LaunchError::RuntimeNotReady {
-                runtime: runtime_label(&session.runtime).into(),
-                hint,
-            })?;
             progress(
                 LaunchStep::StartWaypipe,
                 "Starting the native socket transport and Waypipe client",
@@ -1930,7 +2000,7 @@ pub fn launch_checked_session(
                 session,
                 &host_socket,
                 &container_socket,
-                &container_name,
+                &identity,
                 &command,
                 audio_host_socket.as_deref(),
             )?;
@@ -1979,6 +2049,7 @@ pub fn launch_checked_session(
         }
     };
     Ok(LaunchReport {
+        identity,
         container_child,
         waypipe_child,
         runtime: runtime_label(&session.runtime).into(),
@@ -2010,76 +2081,6 @@ pub fn terminal_command(session: &ContainerSession) -> String {
             name,
             shell_single_quote("exec ${SHELL:-/bin/sh}")
         ),
-    }
-}
-
-pub fn cleanup_named_session(session: &ContainerSession) -> Result<(), String> {
-    // A broken image/command must not prevent stopping an existing named session.
-    if !matches!(
-        session.runtime.trim(),
-        "container" | "apple" | "apple-container" | "docker" | "orb" | "orbstack"
-    ) {
-        return Err(format!(
-            "Unknown runtime '{}'; correct this profile's runtime before cleanup.",
-            session.runtime
-        ));
-    }
-    let runtime_kind = normalize_container_runtime(&session.runtime);
-    if matches!(runtime_kind, ContainerRuntime::OrbStack) {
-        return Ok(());
-    }
-
-    let child_path = build_child_path();
-    let binary_name = runtime_binary_name(&session.runtime);
-    let binary = resolve_command_path(binary_name, None, binary_name, &child_path)
-        .ok_or_else(|| format!("Missing command `{}`.", binary_name))?;
-    let name = container_name(session);
-    cleanup_named_runtime_container(runtime_kind, &binary, &child_path, &name)
-}
-
-fn cleanup_named_runtime_container(
-    runtime_kind: ContainerRuntime,
-    binary: &Path,
-    child_path: &str,
-    name: &str,
-) -> Result<(), String> {
-    let args: Vec<&str> = match runtime_kind {
-        ContainerRuntime::Apple => vec!["delete", "--force", name],
-        ContainerRuntime::Docker => vec!["rm", "-f", name],
-        ContainerRuntime::OrbStack => return Ok(()),
-    };
-    let mut command = Command::new(binary);
-    command.env("PATH", child_path).args(args);
-    match command_output_with_timeout(command, Duration::from_secs(6)) {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) if runtime_output_is_not_found(&output.stderr, name) => Ok(()),
-        Ok(output) if runtime_output_is_not_found(&output.stdout, name) => Ok(()),
-        Ok(output) => {
-            let message = format!(
-                "Could not remove stale container '{}': {}. Check the runtime service and permissions, remove it manually if safe, then retry.",
-                name,
-                runtime_failure_detail(&output)
-            );
-            log::warn!("Failed to cleanup stale container '{}': {}", name, message);
-            Err(message)
-        }
-        Err(RuntimeCommandError::TimedOut) => {
-            log::warn!(
-                "Timed out cleaning up stale container '{}'; runtime may still be wedged",
-                name
-            );
-            Err(format!(
-                "Timed out removing stale container '{}'. Check runtime status and remove it manually if safe, then retry.",
-                name
-            ))
-        }
-        Err(RuntimeCommandError::Io(error)) => {
-            log::warn!("Failed to cleanup stale container '{}': {}", name, error);
-            Err(format!(
-                "Failed to remove stale container '{}': {}. Check the runtime executable/service and retry.",
-                name, error
-            ))
-        }
     }
 }
 
@@ -2585,6 +2586,9 @@ fn verify_gui_tools_in_image(
             std::process::id(),
             PROBE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        let identity =
+            OwnedContainerIdentity::new(&session.runtime, &name, runtime_binary, child_path)
+                .map_err(|error| RuntimeCommandError::Io(std::io::Error::other(error)))?;
         let mut cmd = Command::new(runtime_binary);
         cmd.env("PATH", child_path);
         cmd.args(["run", "--rm", "--name", &name]);
@@ -2601,6 +2605,7 @@ fn verify_gui_tools_in_image(
             // The preflight must not download images, even if profile arguments request a pull.
             cmd.arg("--pull=never");
         }
+        identity.append_owner_label(&mut cmd);
         let script = format!(
             "printf '%s\\n' COCOA_WAY_IMAGE_PROBE_STARTED; {}",
             probes.join(" && ")
@@ -2610,7 +2615,7 @@ fn verify_gui_tools_in_image(
         let result = command_output_with_timeout(cmd, Duration::from_secs(60));
         if result.is_err() {
             // Killing a CLI does not necessarily stop a VM owned by the runtime daemon.
-            let _ = cleanup_named_runtime_container(runtime, runtime_binary, child_path, &name);
+            let _ = cleanup_owned_instance(&identity);
         }
         result
     };
@@ -2979,7 +2984,7 @@ fn spawn_apple_container_waypipe_ssh(
     session: &ContainerSession,
     host_socket: &str,
     container_socket: &str,
-    container_name: &str,
+    identity: &OwnedContainerIdentity,
     command: &str,
     audio_host_socket: Option<&str>,
 ) -> Result<Child, LaunchError> {
@@ -2992,7 +2997,9 @@ fn spawn_apple_container_waypipe_ssh(
         .env("WAYLAND_DISPLAY", display)
         .env(RELAY_ENV, "1")
         .env(RELAY_IMAGE_ENV, &session.image)
-        .env(RELAY_NAME_ENV, container_name)
+        .env(RELAY_NAME_ENV, identity.name())
+        .env(RELAY_OWNER_ENV, identity.owner_token())
+        .env(RELAY_BINARY_ENV, identity.runtime_binary())
         .env(RELAY_ENV_LIST_ENV, session.env.join("\n"))
         .env(RELAY_MOUNTS_ENV, session.mounts.join("\n"))
         .env(RELAY_RUNTIME_ARGS_ENV, session.runtime_args.join("\n"))
@@ -3108,6 +3115,323 @@ mod tests {
             "name = 'Diagnostics'\nimage = 'test:latest'\ncommand = 'foot'\nruntime = '{runtime}'"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn lossy_profile_names_cannot_share_a_runtime_container() {
+        for (first, second) in [
+            ("Work A", "Work-A"),
+            ("Work", "work"),
+            ("\u{7ec8}\u{7aef}", "\u{6d4f}\u{89c8}\u{5668}"),
+        ] {
+            let mut a = diagnostic_session("container");
+            a.name = first.into();
+            let mut b = a.clone();
+            b.name = second.into();
+            assert!(validate_profile_name(&b, &[a.clone()], None).is_err());
+            assert!(validate_profile_name(&b, &[a], Some(0)).is_ok());
+        }
+    }
+
+    #[test]
+    fn renamed_profile_keeps_its_pending_runtime_name_reserved() {
+        let mut original = diagnostic_session("apple");
+        original.name = "Audit reserved profile identity".into();
+        let name = container_name(&original);
+        let reservation =
+            crate::profile_activity::reserve_identity(71, 1, "container", &name).unwrap();
+        let mut renamed = original.clone();
+        renamed.name = "Audit renamed profile identity".into();
+        let mut replacement = original.clone();
+        replacement.runtime = "apple-container".into();
+        assert!(validate_profile_name(&replacement, &[renamed.clone()], None).is_err());
+        assert!(validate_profile_name(&replacement, &[renamed.clone()], Some(0)).is_err());
+        assert!(validate_profile_name(&replacement, &[], Some(71)).is_ok());
+        replacement.runtime = "docker".into();
+        assert!(validate_profile_name(&replacement, &[renamed.clone()], None).is_ok());
+        drop(reservation);
+        assert!(validate_profile_name(&original, &[renamed], None).is_ok());
+    }
+
+    fn assert_run_owner_label(args: &[String], identity: &OwnedContainerIdentity, image: &str) {
+        let image_index = args.iter().position(|arg| arg == image).unwrap();
+        let expected = format!(
+            "{}={}",
+            container_identity::OWNER_LABEL,
+            identity.owner_token()
+        );
+        assert!(
+            args[..image_index]
+                .windows(2)
+                .any(|pair| pair == ["--label", &expected])
+        );
+    }
+
+    #[test]
+    fn both_apple_relay_transports_label_the_same_attempt() {
+        assert!(
+            std::env::var_os(RELAY_AUDIO_HOST_ENV).is_none(),
+            "test must not use an external audio socket override"
+        );
+        let (directory, binary) =
+            mock_runtime("printf '%s\\n' \"$@\" > \"${0%/*}/run-argv\"; exit 0");
+        let sockets = tempfile::Builder::new()
+            .prefix("cw")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let identity = OwnedContainerIdentity::new(
+            "container",
+            "cocoa-way-test-relay",
+            &binary,
+            "/usr/bin:/bin",
+        )
+        .unwrap();
+        let relay = WaypipeRelayArgs {
+            remote_socket: "/tmp/guest-waypipe.sock".into(),
+            local_socket: sockets
+                .path()
+                .join("relay.sock")
+                .to_string_lossy()
+                .into_owned(),
+            remote_command: vec!["true".into()],
+        };
+        run_stdio_relay(
+            &relay,
+            &binary,
+            "/usr/bin:/bin",
+            "test:latest",
+            &identity,
+            &[],
+        )
+        .unwrap();
+        let args = std::fs::read_to_string(directory.path().join("run-argv")).unwrap();
+        assert_run_owner_label(
+            &args.lines().map(str::to_string).collect::<Vec<_>>(),
+            &identity,
+            "test:latest",
+        );
+
+        // A local stub exits before readiness; it never creates a container or transport socket.
+        assert!(matches!(
+            run_publish_socket_relay(
+                &relay,
+                &binary,
+                "/usr/bin:/bin",
+                "test:latest",
+                &identity,
+                &[]
+            ),
+            Err(PublishRelayError::Startup(_))
+        ));
+        let args = std::fs::read_to_string(directory.path().join("run-argv")).unwrap();
+        assert_run_owner_label(
+            &args.lines().map(str::to_string).collect::<Vec<_>>(),
+            &identity,
+            "test:latest",
+        );
+    }
+
+    #[test]
+    fn stdio_fallback_requires_owned_cleanup_or_confirmed_absence() {
+        let (directory, binary) = mock_runtime(
+            r#"
+root=${0%/*}
+printf '%s\n' "$*" >> "$root/commands"
+if [ "$1" = inspect ]; then
+    /bin/cat "$root/inspect.json"
+    /bin/cat "$root/inspect-error" >&2
+    exit "$(/bin/cat "$root/inspect-status")"
+fi
+"#,
+        );
+        let name = "cocoa-way-fallback-test";
+        let identity =
+            OwnedContainerIdentity::new("container", name, &binary, "/usr/bin:/bin").unwrap();
+        for (label, status, diagnostic, success, deletes) in [
+            (identity.owner_token(), "0", String::new(), true, true),
+            (
+                "unowned-existing-instance",
+                "0",
+                String::new(),
+                false,
+                false,
+            ),
+            (
+                "",
+                "1",
+                format!("Error: container not found: {name}\n"),
+                true,
+                false,
+            ),
+            ("", "1", "Error: permission denied\n".into(), false, false),
+        ] {
+            let record = serde_json::json!([{"id": name, "configuration": {"id": name, "labels": {container_identity::OWNER_LABEL: label}}}]);
+            std::fs::write(directory.path().join("inspect.json"), record.to_string()).unwrap();
+            std::fs::write(directory.path().join("inspect-status"), status).unwrap();
+            std::fs::write(directory.path().join("inspect-error"), diagnostic).unwrap();
+            let _ = std::fs::remove_file(directory.path().join("commands"));
+            let result = cleanup_before_stdio_fallback(&identity, "listener did not start");
+            assert_eq!(result.is_ok(), success);
+            if let Err(error) = result {
+                assert!(error.contains("listener did not start"));
+                assert!(error.contains("stdio fallback was not started"));
+            }
+            let commands = std::fs::read_to_string(directory.path().join("commands")).unwrap();
+            let expected = if deletes {
+                format!("inspect {name}\ndelete --force {name}\n")
+            } else {
+                format!("inspect {name}\n")
+            };
+            assert_eq!(commands, expected);
+        }
+    }
+
+    #[test]
+    fn apple_waypipe_child_receives_captured_runtime_and_owner_token() {
+        let (directory, waypipe) = mock_runtime(
+            "printf '%s\\n' \"$COCOA_WAY_RELAY_CONTAINER_NAME\" \"$COCOA_WAY_RELAY_OWNER_TOKEN\" \"$COCOA_WAY_RELAY_RUNTIME_BINARY\" > \"${0%/*}/relay-env\"",
+        );
+        let session = diagnostic_session("container");
+        let identity = OwnedContainerIdentity::new(
+            "container",
+            &container_name(&session),
+            &waypipe,
+            "/usr/bin:/bin",
+        )
+        .unwrap();
+        let mut child = spawn_apple_container_waypipe_ssh(
+            &waypipe,
+            "/usr/bin:/bin",
+            "/tmp",
+            "wayland-test",
+            &session,
+            "/tmp/waypipe-test.sock",
+            "/tmp/guest-test.sock",
+            &identity,
+            "true",
+            None,
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        let env = std::fs::read_to_string(directory.path().join("relay-env")).unwrap();
+        assert_eq!(
+            env,
+            format!(
+                "{}\n{}\n{}\n",
+                identity.name(),
+                identity.owner_token(),
+                identity.runtime_binary().display()
+            )
+        );
+    }
+
+    #[test]
+    fn docker_launch_uses_checked_binary_and_labels_the_attempt() {
+        let (runtime_directory, runtime) = mock_runtime(
+            r#"
+if [ "$1" = inspect ]; then printf 'false\n'; exit 0; fi
+printf '%s\n' "$@" > "${0%/*}/run-argv"
+"#,
+        );
+        let (waypipe_directory, waypipe) = mock_runtime(": > \"${0%/*}/ready\"; exec /bin/sleep 5");
+        let sockets = tempfile::Builder::new()
+            .prefix("cw")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = sockets.path().join("client.sock");
+        let ready = waypipe_directory.path().join("ready");
+        let listener_path = socket.clone();
+        let listener = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "fake Waypipe did not start");
+            std::os::unix::net::UnixListener::bind(listener_path).unwrap()
+        });
+        let mut session = diagnostic_session("docker");
+        session.socket = Some(socket.to_string_lossy().into_owned());
+        let check = CheckReport {
+            runtime: "Docker".into(),
+            image: session.image.clone(),
+            command: session_command(&session),
+            waypipe: waypipe.to_string_lossy().into_owned(),
+            waypipe_version: "test".into(),
+            runtime_binary: runtime.to_string_lossy().into_owned(),
+            container_name: container_name(&session),
+            running: false,
+            warnings: Vec::new(),
+        };
+        let result = launch_checked_session(&session, "/tmp", "wayland-test", check, |_, _| {});
+        let _listener = listener.join().unwrap();
+        let mut report = result.unwrap();
+        let _ = report.waypipe_child.kill();
+        let _ = report.waypipe_child.wait();
+        assert!(
+            report
+                .container_child
+                .as_mut()
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(report.identity.runtime_binary(), runtime);
+        let args = std::fs::read_to_string(runtime_directory.path().join("run-argv")).unwrap();
+        assert_run_owner_label(
+            &args.lines().map(str::to_string).collect::<Vec<_>>(),
+            &report.identity,
+            &session.image,
+        );
+    }
+
+    #[test]
+    fn image_probes_also_have_unique_owner_labels() {
+        for runtime in ["container", "docker"] {
+            let (directory, binary) = mock_runtime(
+                "printf '%s\\n' \"$@\" > \"${0%/*}/run-argv\"; printf 'COCOA_WAY_IMAGE_PROBE_STARTED\\n'",
+            );
+            let mut session = diagnostic_session(runtime);
+            session.audio = false;
+            verify_gui_tools_in_image(
+                &session,
+                &binary,
+                "/usr/bin:/bin",
+                normalize_container_runtime(runtime),
+                runtime,
+                &session.image,
+            )
+            .unwrap();
+            let args = std::fs::read_to_string(directory.path().join("run-argv")).unwrap();
+            let args = args.lines().collect::<Vec<_>>();
+            let label = args.windows(2).find(|pair| pair[0] == "--label").unwrap()[1];
+            let token = label
+                .strip_prefix(&format!("{}=", container_identity::OWNER_LABEL))
+                .unwrap();
+            assert_eq!(token.len(), 64);
+            assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(
+                args.iter().position(|arg| *arg == label).unwrap()
+                    < args.iter().position(|arg| *arg == session.image).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_relay_child_waiting_on_stdin_is_killed_and_reaped() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let pid = child.id();
+        let started = Instant::now();
+        let status = finish_relay_child(child, true, Duration::from_secs(1)).unwrap();
+        assert!(!status.success());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        drop(stdin);
     }
 
     #[test]
@@ -3400,40 +3724,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn cleanup_failures_preserve_the_actual_error_instead_of_returning_success() {
-        let (_directory, binary) =
-            mock_runtime("printf 'runtime service not found\\n' >&2; exit 7");
-        let error = cleanup_named_runtime_container(
-            ContainerRuntime::Apple,
-            &binary,
-            "/usr/bin:/bin",
-            "test",
-        )
-        .unwrap_err();
-        assert!(error.contains("runtime service not found"));
-        assert!(error.contains("7"));
-        let (_directory, binary) = mock_runtime("printf 'container test not found\\n' >&2; exit 1");
-        assert!(
-            cleanup_named_runtime_container(
-                ContainerRuntime::Apple,
-                &binary,
-                "/usr/bin:/bin",
-                "test"
-            )
-            .is_ok()
-        );
-        assert!(runtime_output_is_not_found(
-            b"Error: notFound: container test does not exist",
-            "test"
-        ));
-        let mut session = diagnostic_session("orbstack");
-        session.image.clear();
-        assert!(cleanup_named_session(&session).is_ok());
-        session.runtime = "typo".into();
-        assert!(cleanup_named_session(&session).is_err());
     }
 
     #[test]

@@ -14,5 +14,9 @@ backports = [
     "39ee351a0352379313daff66938a830ac71e1459", # SHM destruction
     "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef", # unknown text-input enums
 ]
-patches = ["patches/smithay/standalone.patch", "patches/smithay/darwin-sealed-file.patch"]
-tree_sha256 = "cb5ad509e55aaf3a2fe232ba6fbfebdcedfe1c68eb70c6e852ff4524e6dac565"
+patches = [
+    "patches/smithay/standalone.patch",
+    "patches/smithay/darwin-sealed-file.patch",
+    "patches/smithay/protocol-robustness.patch",
+]
+tree_sha256 = "03dbb3ad340e3d2be71e599c1df59666a2236ed11330b54d20102b42e80c3472"

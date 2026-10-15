@@ -537,13 +537,18 @@ fn connection_template(arguments: &Value) -> Result<Value, String> {
             lines.push(format!("user = {}", toml_string(user)));
         }
         lines.push(format!("port = {port}"));
-        if let Some(identity) = optional_text(arguments, "identity") {
+        let identity_argument = if let Some(identity) = optional_text(arguments, "identity") {
             lines.push(format!("identity = {}", toml_string(identity)));
-        }
+            format!(" -i {}", shell_quote(identity))
+        } else {
+            String::new()
+        };
         format!(
-            "./run_waypipe.sh --display {} ssh -p {} {} {}",
+            "COCOA_WAY_COMPRESS={} ./run_waypipe.sh --display {} ssh -p {}{} {} {}",
+            shell_quote(compression),
             shell_quote(display),
             port,
+            identity_argument,
             shell_quote(&target),
             shell_quote(command)
         )
@@ -562,6 +567,11 @@ fn connection_template(arguments: &Value) -> Result<Value, String> {
     guided_result(json!({
         "connection": lines.join("\n") + "\n",
         "run_waypipe": run_command,
+        "transport_note": if connection_type == "local" {
+            "Local client mode only attaches to the socket; app and compression must be configured on its existing Waypipe server."
+        } else {
+            "The shell command preserves the saved SSH identity and compression settings."
+        },
         "steps": [
             "Start Cocoa-Way and create the requested managed Display if it is not default.",
             "Review and save this entry in Connections > Connect to Machine; passwords are intentionally never stored.",
@@ -837,6 +847,115 @@ mod tests {
                 .unwrap()
                 .contains("--display 'display-1' ssh")
         );
+    }
+
+    #[test]
+    fn ssh_template_preserves_quoted_identity_compression_and_argv() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("run_waypipe.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' \"$COCOA_WAY_COMPRESS\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = "/keys/a b's;$HOME";
+        let command = "foot --title 'a b'; echo literal";
+        let result = connection_template(&json!({
+            "host": "linux.example", "user": "guest", "port": 2222,
+            "identity": identity, "compression": "none", "command": command,
+            "display": "display-1"
+        }))
+        .unwrap();
+        let generated = result["structuredContent"]["run_waypipe"].as_str().unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", generated])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "none",
+                "--display",
+                "display-1",
+                "ssh",
+                "-p",
+                "2222",
+                "-i",
+                identity,
+                "guest@linux.example",
+                command
+            ]
+        );
+        let saved: toml::Value =
+            toml::from_str(result["structuredContent"]["connection"].as_str().unwrap()).unwrap();
+        assert_eq!(saved["connection"][0]["identity"].as_str(), Some(identity));
+        assert_eq!(saved["connection"][0]["compression"].as_str(), Some("none"));
+    }
+
+    #[test]
+    fn local_template_explains_server_side_settings() {
+        let result = connection_template(&json!({
+            "type": "local", "socket": "/tmp/a b's.sock", "compression": "none"
+        }))
+        .unwrap();
+        let structured = &result["structuredContent"];
+        assert!(
+            structured["run_waypipe"]
+                .as_str()
+                .unwrap()
+                .ends_with("'/tmp/a b'\\''s.sock' client")
+        );
+        assert!(
+            structured["transport_note"]
+                .as_str()
+                .unwrap()
+                .contains("existing Waypipe server")
+        );
+    }
+
+    #[test]
+    fn malformed_control_response_does_not_prevent_a_later_ping() {
+        use std::io::{BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            BufReader::new(&stream)
+                .read_line(&mut String::new())
+                .unwrap();
+            stream.write_all(b"not-json\n").unwrap();
+        });
+        let mut initialized = true;
+        let response = handle_message(
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "cocoa_way_status", "arguments": {}}
+            }),
+            &path,
+            &mut initialized,
+        )
+        .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let ping = handle_message(
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+            &path,
+            &mut initialized,
+        )
+        .unwrap();
+        assert!(ping["result"].is_object());
+        worker.join().unwrap();
     }
 
     #[test]

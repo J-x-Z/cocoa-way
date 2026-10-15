@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -171,6 +172,27 @@ where
                 // We now can assign a role to the surface
                 let surface = &data.wl_surface;
                 let shell = &data.wm_base;
+
+                let mut ancestor = parent_surface.clone();
+                let mut visited = HashSet::new();
+                visited.insert(surface.id());
+                while let Some(parent) = ancestor {
+                    if !visited.insert(parent.id()) {
+                        shell.post_error(
+                            xdg_wm_base::Error::InvalidPopupParent,
+                            "xdg_popup parent ancestry contains a cycle",
+                        );
+                        return;
+                    }
+
+                    // Drop each surface's locks before following its parent link.
+                    ancestor = compositor::with_states(&parent, |states| {
+                        states
+                            .data_map
+                            .get::<XdgPopupSurfaceData>()
+                            .and_then(|attributes| attributes.lock().unwrap().parent.clone())
+                    });
+                }
 
                 let attributes = XdgPopupSurfaceRoleAttributes {
                     parent: parent_surface,

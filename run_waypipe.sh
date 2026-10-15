@@ -47,104 +47,143 @@ if [ -n "${TMPDIR:-}" ]; then
 fi
 runtime_candidates+=("/tmp/cocoa-way")
 
-find_wayland_socket() {
-    local directory="$1"
-    [ -d "$directory" ] || return 1
-    find "$directory" -maxdepth 1 -type s -name 'wayland-*' -print 2>/dev/null \
-        | sort | head -n 1
+# macOS ships Perl. Its nonblocking, no-follow opens avoid shell redirections/cat
+# blocking on a replaced FIFO, while fstat verifies the object actually opened.
+discover_displays() {
+    /usr/bin/perl - "$list_displays" "$selected_slot" \
+        "${XDG_RUNTIME_DIR:-}" "${WAYLAND_DISPLAY:-}" "${runtime_candidates[@]}" <<'PERL'
+use strict;
+use warnings;
+use Fcntl qw(:DEFAULT :mode);
+use Cwd qw(abs_path);
+use File::Basename qw(dirname);
+my ($list, $selected, $xdg, $preferred, @candidates) = @ARGV;
+my $uid = $>;
+sub safe_text { defined($_[0]) && $_[0] !~ /[\x00-\x1f\x7f]/ }
+sub directory {
+    my ($path) = @_;
+    return unless safe_text($path);
+    my @s = lstat($path);
+    return unless @s && S_ISDIR($s[2]) && $s[4] == $uid && !($s[2] & 0077);
+    my $original = dirname($path);
+    while (1) {
+        my @p = lstat($original);
+        return unless @p;
+        if (S_ISLNK($p[2])) {
+            return unless $p[4] == 0;
+        } else {
+            return unless S_ISDIR($p[2]) && ($p[4] == 0 || $p[4] == $uid);
+            return if ($p[2] & 0022) && !($p[4] == 0 && ($p[2] & 01000));
+        }
+        my $next = dirname($original);
+        last if $next eq $original;
+        $original = $next;
+    }
+    my $parent = abs_path("$path/..");
+    return unless defined $parent;
+    while (1) {
+        my @p = lstat($parent);
+        return unless @p && S_ISDIR($p[2]) && ($p[4] == 0 || $p[4] == $uid);
+        return if ($p[2] & 0022) && !($p[4] == 0 && ($p[2] & 01000));
+        last if $parent eq '/';
+        $parent =~ s{/[^/]+$}{};
+        $parent = '/' if $parent eq '';
+    }
+    return \@s;
 }
-
-find_default_display() {
-    local candidate socket
-    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] && \
-       [ -S "${XDG_RUNTIME_DIR%/}/$WAYLAND_DISPLAY" ]; then
-        runtime_dir="${XDG_RUNTIME_DIR%/}"
-        display="$WAYLAND_DISPLAY"
-        return 0
-    fi
-    for candidate in "${runtime_candidates[@]}"; do
-        socket=$(find_wayland_socket "$candidate" || true)
-        if [ -n "$socket" ]; then
-            runtime_dir="$candidate"
-            display=$(basename "$socket")
-            return 0
-        fi
-    done
-    return 1
+sub unchanged {
+    my ($path, $before) = @_;
+    my $after = directory($path);
+    return $after && $before->[0] == $after->[0] && $before->[1] == $after->[1];
 }
-
-find_managed_display() {
-    local requested_slot="$1"
-    local marker candidate socket
-    for marker in /tmp/cwd-*/display.slot; do
-        [ -f "$marker" ] || continue
-        managed_display_is_live "$marker" || continue
-        [ "$(cat "$marker" 2>/dev/null || true)" = "$requested_slot" ] || continue
-        candidate=$(dirname "$marker")
-        socket=$(find_wayland_socket "$candidate" || true)
-        if [ -n "$socket" ]; then
-            runtime_dir="$candidate"
-            display=$(basename "$socket")
-            return 0
-        fi
-    done
-    return 1
+sub marker {
+    my ($path) = @_;
+    sysopen(my $fh, $path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW) or return;
+    my @s = stat($fh);
+    return unless @s && S_ISREG($s[2]) && $s[3] == 1 && $s[4] == $uid
+        && !($s[2] & 0022) && $s[7] <= 256;
+    my $text = '';
+    while (length($text) <= 256) {
+        my $n = sysread($fh, my $chunk, 257 - length($text));
+        return unless defined $n;
+        last if $n == 0;
+        $text .= $chunk;
+    }
+    return if length($text) > 256;
+    $text =~ s/\s+\z//;
+    return safe_text($text) ? $text : undef;
 }
-
-managed_display_is_live() {
-    local marker="$1"
-    local directory base parent_pid worker_pid command
-    directory=$(dirname "$marker")
-    if [ -f "$directory/display.parent" ]; then
-        parent_pid=$(cat "$directory/display.parent" 2>/dev/null || true)
-    else
-        base=$(basename "$directory")
-        parent_pid=${base#cwd-}
-        parent_pid=${parent_pid%%-*}
-    fi
-    [[ "$parent_pid" =~ ^[0-9]+$ ]] || return 1
-    kill -0 "$parent_pid" 2>/dev/null || return 1
-    command=$(ps -p "$parent_pid" -o command= 2>/dev/null || true)
-    [[ "$command" == *cocoa-way* ]] || return 1
-    # Workers created before the PID marker was introduced remain discoverable
-    # until Cocoa-Way restarts; new workers receive the stricter liveness check.
-    [ -f "$directory/display.worker" ] || return 0
-    worker_pid=$(cat "$directory/display.worker" 2>/dev/null || true)
-    [[ "$worker_pid" =~ ^[0-9]+$ ]] || return 1
-    kill -0 "$worker_pid" 2>/dev/null || return 1
-    command=$(ps -p "$worker_pid" -o command= 2>/dev/null || true)
-    [[ "$command" == *cocoa-way* ]]
+sub live_process {
+    my ($pid) = @_;
+    return unless defined($pid) && $pid =~ /\A[0-9]+\z/ && $pid > 0 && $pid <= 2147483647;
+    return unless kill(0, $pid);
+    open(my $ps, '-|', 'ps', '-p', $pid, '-o', 'uid=', '-o', 'command=') or return;
+    my $line = <$ps> // '';
+    close($ps);
+    return $line =~ /^\s*([0-9]+)\s+.*cocoa-way/ && $1 == $uid;
+}
+sub socket_name {
+    my ($path, $preferred) = @_;
+    my @names;
+    if (defined($preferred) && $preferred ne '') {
+        @names = ($preferred);
+    } else {
+        opendir(my $dir, $path) or return;
+        @names = sort grep { /^wayland-/ } readdir($dir);
+        closedir($dir);
+    }
+    for my $name (@names) {
+        next unless safe_text($name) && $name ne '.' && $name ne '..' && $name !~ m{/};
+        my @s = lstat("$path/$name");
+        return $name if @s && S_ISSOCK($s[2]) && $s[4] == $uid && !($s[2] & 0022);
+    }
+    return;
+}
+sub emit_display {
+    my ($slot, $path, $preferred) = @_;
+    $path =~ s{/+\z}{};
+    my $before = directory($path) or return;
+    my $name = socket_name($path, $preferred);
+    return unless defined($name) && unchanged($path, $before);
+    print "$slot\t$path\t$name\n";
+    return 1;
+}
+if ($list eq 'true' || $selected eq '' || $selected eq 'default' || $selected eq 'auto') {
+    my $found = $xdg ne '' && $preferred ne '' && emit_display('default', $xdg, $preferred);
+    for my $path (@candidates) {
+        last if $found;
+        $found = emit_display('default', $path, undef);
+    }
+    exit if $list ne 'true';
+}
+opendir(my $tmp, '/tmp') or exit;
+my @managed = sort grep { /^cwd-/ } readdir($tmp);
+closedir($tmp);
+for my $name (@managed) {
+    my $path = "/tmp/$name";
+    my $before = directory($path) or next;
+    my $slot = marker("$path/display.slot");
+    next unless defined($slot) && $slot ne '' && ($list eq 'true' || $slot eq $selected);
+    next unless live_process(marker("$path/display.parent")) && live_process(marker("$path/display.worker"));
+    next unless unchanged($path, $before);
+    last if emit_display($slot, $path, undef) && $list ne 'true';
+}
+PERL
 }
 
 runtime_dir=""
 display=""
-
+discovered=$(discover_displays)
 if $list_displays; then
     printf '%-18s %s\n' "SLOT" "SOCKET"
-    if find_default_display; then
-        printf '%-18s %s/%s\n' "default" "$runtime_dir" "$display"
-    fi
-    for marker in /tmp/cwd-*/display.slot; do
-        [ -f "$marker" ] || continue
-        managed_display_is_live "$marker" || continue
-        slot=$(cat "$marker" 2>/dev/null || true)
-        candidate=$(dirname "$marker")
-        socket=$(find_wayland_socket "$candidate" || true)
-        if [ -n "$slot" ] && [ -n "$socket" ]; then
-            printf '%-18s %s\n' "$slot" "$socket"
-        fi
-    done
+    while IFS=$'\t' read -r slot candidate socket; do
+        [ -n "$socket" ] || continue
+        printf '%-18s %s/%s\n' "$slot" "$candidate" "$socket"
+    done <<< "$discovered"
     exit 0
 fi
-
-if [ -n "$selected_slot" ] && [ "$selected_slot" != "default" ]; then
-    if ! find_managed_display "$selected_slot"; then
-        echo "Error: Cocoa-Way display slot '$selected_slot' is not available." >&2
-        echo "Run '$0 --list-displays' to inspect live display slots." >&2
-        exit 1
-    fi
-else
-    find_default_display || true
+if [ -n "$discovered" ]; then
+    IFS=$'\t' read -r slot runtime_dir display <<< "$discovered"
 fi
 
 if [ -z "$runtime_dir" ] || [ -z "$display" ]; then

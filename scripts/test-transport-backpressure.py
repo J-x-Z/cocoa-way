@@ -623,7 +623,92 @@ def extract(source):
     return match.group(1)
 
 
-def main():
+def load_scripts(variant, baseline_ref):
+    scripts = {}
+    if variant in ("baseline", "both"):
+        baseline_source = subprocess.run(
+            ["git", "show", f"{baseline_ref}:src/container_sessions.rs"], cwd=ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout
+        scripts["baseline"] = extract(baseline_source)
+    if variant in ("current", "both"):
+        scripts["current"] = extract(SOURCE.read_text())
+    return scripts
+
+
+def check_source_loading():
+    """Read-only regressions: mock history, artifact I/O and all relay workloads."""
+    from unittest.mock import Mock, patch
+
+    current = 'print "current fixture";'
+    baseline = 'print "baseline fixture";'
+
+    def source(script):
+        return "fn guest_publish_socket_relay_perl() -> &'static str { r#\"" + script + '\"# }'
+
+    missing_ref = "unavailable-history"
+    git_command = ["git", "show", f"{missing_ref}:src/container_sessions.rs"]
+    missing_history = subprocess.CalledProcessError(128, git_command)
+    syntax_command = ["perl", "-c", "-e", current]
+
+    def syntax_only(command, **kwargs):
+        if command == git_command:
+            raise missing_history
+        assert command == syntax_command, command
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="-e syntax OK\n")
+
+    checks = {name: Mock(return_value={}) for name in (
+        "framing_and_churn", "peer_backpressure", "backpressure", "tiny_frame_pressure",
+    )}
+    checks["disconnect_under_backpressure"] = Mock(return_value={"prompt_exit": True})
+    with contextlib.ExitStack() as stack:
+        read_source = stack.enter_context(patch.object(Path, "read_text", return_value=source(current)))
+        writes = stack.enter_context(patch.object(Path, "write_text"))
+        stack.enter_context(patch.object(Path, "mkdir"))
+        run = stack.enter_context(patch.object(subprocess, "run", side_effect=syntax_only))
+        stack.enter_context(patch.object(platform, "platform", return_value="mock-platform"))
+        stack.enter_context(patch("builtins.print"))
+        stack.enter_context(patch.dict(globals(), checks))
+        assert main(["--variant", "current", "--checks-only", "--churn", "2",
+                     "--baseline-ref", missing_ref]) == 0
+        read_source.assert_called_once_with()
+        run.assert_called_once_with(syntax_command, capture_output=True, text=True)
+        result = json.loads(writes.call_args.args[0])
+        assert result["completed"] and list(result["variants"]) == ["current"]
+        assert result["variants"]["current"]["runs"] == []
+        for check in checks.values():
+            check.assert_called_once()
+        checks["framing_and_churn"].assert_called_once_with(current, True, 2)
+        checks["backpressure"].assert_called_once_with(current, 2000, 64 * 1024 * 1024, 10)
+
+    for variant in ("baseline", "both"):
+        with patch.object(subprocess, "run", side_effect=missing_history) as git, \
+                patch.object(Path, "read_text") as read_source:
+            try:
+                load_scripts(variant, missing_ref)
+            except subprocess.CalledProcessError:
+                pass
+            else:
+                raise AssertionError(f"{variant} must still require its historical source")
+            git.assert_called_once_with(git_command, cwd=ROOT, capture_output=True, text=True, check=True)
+            read_source.assert_not_called()
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                git_command, 0, stdout=source(baseline))) as git, \
+                patch.object(Path, "read_text", return_value=source(current)) as read_source:
+            expected = {"baseline": baseline}
+            if variant == "both":
+                expected["current"] = current
+            assert load_scripts(variant, missing_ref) == expected
+            git.assert_called_once_with(git_command, cwd=ROOT, capture_output=True, text=True, check=True)
+            if variant == "both":
+                read_source.assert_called_once_with()
+            else:
+                read_source.assert_not_called()
+    print("Source-loading regressions passed (mocked, read-only; no relay workloads).")
+    return 0
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fake-child", nargs=2, metavar=("SIDEBAND", "PEER"))
     parser.add_argument("--variant", choices=("baseline", "current", "both"), default="both")
@@ -635,19 +720,19 @@ def main():
     parser.add_argument("--output", default="results.json")
     parser.add_argument("--skip-checks", action="store_true")
     parser.add_argument("--checks-only", action="store_true")
+    parser.add_argument("--check-source-loading", action="store_true",
+                        help="run read-only source-loading regressions without relay workloads")
     parser.add_argument("--signals", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.fake_child:
         return fake_child(*args.fake_child)
+    if args.check_source_loading:
+        return check_source_loading()
     if args.trials < 1 or args.bulk_mib < 1 or args.interval_ms <= 0 or args.churn < 2:
         parser.error("trials/bulk/interval must be positive; churn must be at least two")
     destination = ROOT / "target/latency-audit"
     destination.mkdir(parents=True, exist_ok=True)
-    baseline_source = subprocess.run(
-        ["git", "show", f"{args.baseline_ref}:src/container_sessions.rs"], cwd=ROOT,
-        capture_output=True, text=True, check=True,
-    ).stdout
-    scripts = {"baseline": extract(baseline_source), "current": extract(SOURCE.read_text())}
+    scripts = load_scripts(args.variant, args.baseline_ref)
     result = {"platform": platform.platform(), "python": sys.version,
               "clock": "host time.monotonic_ns; no host/guest clock subtraction",
               "delivery_rtt_boundary": "host send -> fake guest receipt -> independent sideband host ACK",

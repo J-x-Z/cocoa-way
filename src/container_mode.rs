@@ -84,6 +84,7 @@ static DETAIL_SCROLL_VIEW: Mutex<Option<TrackedScrollView>> = Mutex::new(None);
 static SUMMARY_FPS_LABEL: Mutex<Option<usize>> = Mutex::new(None);
 static LIVE_DISPLAY_FPS_LABELS: Mutex<Vec<LiveDisplayFpsLabel>> = Mutex::new(Vec::new());
 static COMMAND_CACHE_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static RUNTIME_DETAIL_SCROLL_TO_TOP: AtomicBool = AtomicBool::new(false);
 static TASK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const UI_COMMAND_CACHE_TTL: Duration = Duration::from_secs(10);
@@ -1399,12 +1400,22 @@ fn preferred_gui_image_reference() -> String {
         .unwrap_or_else(|| smoke_image_reference().into())
 }
 
-fn smoke_containerfile_path() -> &'static str {
-    "examples/container-images/Containerfile.niri"
-}
-
-fn smoke_build_context() -> &'static str {
-    "."
+fn smoke_image_build_paths(
+    resources: Result<crate::image_resources::ExampleImageResources, String>,
+) -> Result<(String, String), String> {
+    let resources = resources?;
+    if !resources.containerfile.is_absolute() || !resources.context.is_absolute() {
+        return Err("Example image resources must resolve to absolute paths.".into());
+    }
+    let path_string = |path: &std::path::Path| {
+        path.to_str().map(str::to_owned).ok_or_else(|| {
+            "Example image resource paths must be valid UTF-8. Move or reinstall Cocoa-Way at a UTF-8 path.".to_string()
+        })
+    };
+    Ok((
+        path_string(&resources.containerfile)?,
+        path_string(&resources.context)?,
+    ))
 }
 
 fn default_gui_runtime_args(runtime: &str, profile: Option<&str>) -> Vec<String> {
@@ -1425,6 +1436,14 @@ fn default_gui_runtime_args(runtime: &str, profile: Option<&str>) -> Vec<String>
 }
 
 fn request_smoke_image_build() {
+    let (containerfile, context) =
+        match smoke_image_build_paths(crate::image_resources::resolve_example_image_resources()) {
+            Ok(paths) => paths,
+            Err(error) => {
+                show_error_alert(&error);
+                return;
+            }
+        };
     if !allow_storage_growth("build the example image") {
         return;
     }
@@ -1434,8 +1453,8 @@ fn request_smoke_image_build() {
     ));
     send(CompositorMessage::BuildContainerImage {
         image: smoke_image_reference().into(),
-        containerfile: smoke_containerfile_path().into(),
-        context: smoke_build_context().into(),
+        containerfile,
+        context,
     });
 }
 
@@ -1484,6 +1503,7 @@ fn add_or_select_smoke_session() {
                 invalidate_profile_validation(index);
             }
             push_activity(format!("Restored example session: {}", session.image));
+            send(CompositorMessage::ReloadMenu);
         }
         Err(error) => {
             let message = format!("Failed to restore example session: {}", error);
@@ -2606,6 +2626,7 @@ unsafe fn duplicate_session_profile(index: usize) {
                 "Duplicated application profile: {}",
                 duplicate.name
             ));
+            send(CompositorMessage::ReloadMenu);
             unsafe {
                 rebuild_window();
             }
@@ -2791,6 +2812,7 @@ unsafe fn show_session_resources_dialog(index: usize) {
                 "Saved resource settings for {}; effective on the next launch.",
                 session.name
             ));
+            send(CompositorMessage::ReloadMenu);
         }
         Err(error) => show_error_alert(&format!("Failed to save resource settings: {error}")),
     }
@@ -3206,6 +3228,7 @@ unsafe fn show_session_dialog(
 
     match result {
         Ok(selected_index) => {
+            send(CompositorMessage::ReloadMenu);
             let sessions = container_sessions::load_sessions();
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
             let selected_index = selected_index.or_else(|| sessions.len().checked_sub(1));
@@ -3684,8 +3707,12 @@ unsafe fn delete_container_session(index: usize) {
         show_error_alert("Application profile no longer exists.");
         return;
     };
-    if active_session(index).is_some() || session_can_stop(session_state(index).as_ref()) {
-        show_error_alert("Stop all running instances before deleting this profile.");
+    if sessions.iter().enumerate().any(|(index, _)| {
+        active_session(index).is_some() || session_can_stop(session_state(index).as_ref())
+    }) {
+        show_error_alert(
+            "Stop all application instances and wait for pending launches before deleting a profile.",
+        );
         return;
     }
     if !confirm_delete_session(&session.name) {
@@ -3698,6 +3725,7 @@ unsafe fn delete_container_session(index: usize) {
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
             invalidate_all_profile_validation();
             push_activity(format!("Deleted application profile: {}", session.name));
+            send(CompositorMessage::ReloadMenu);
             unsafe {
                 rebuild_window();
             }
@@ -4546,6 +4574,7 @@ declare_class!(
                         session.name,
                         session_presentation_summary(&session)
                     ));
+                    send(CompositorMessage::ReloadMenu);
                 }
                 Err(error) => {
                     let message = format!("Failed to update presentation mode: {}", error);
@@ -4685,15 +4714,22 @@ declare_class!(
 
         #[method(copySmokeImageBuildCommand:)]
         fn copy_smoke_image_build_command(&self, _sender: &AnyObject) {
+            let command = match smoke_image_build_command() {
+                Ok(command) => command,
+                Err(error) => {
+                    show_error_alert(&error);
+                    return;
+                }
+            };
             unsafe {
                 let pasteboard = NSPasteboard::generalPasteboard();
                 pasteboard.clearContents();
                 pasteboard.setString_forType(
-            &NSString::from_str(&smoke_image_build_command()),
-            NSPasteboardTypeString,
-        );
-    }
-    push_activity("Copied example image build command.".into());
+                    &NSString::from_str(&command),
+                    NSPasteboardTypeString,
+                );
+            }
+            push_activity("Copied example image build command.".into());
             unsafe { rebuild_window(); }
         }
 
@@ -4887,6 +4923,7 @@ declare_class!(
             *SELECTED_NAV.lock().unwrap() = runtime_nav(&selected.runtime);
             *SELECTED_RUNTIME_CONTAINER.lock().unwrap() = Some(selected.clone());
             *RUNTIME_CONTAINER_DETAILS.lock().unwrap() = None;
+            RUNTIME_DETAIL_SCROLL_TO_TOP.store(true, Ordering::Relaxed);
             send(CompositorMessage::RefreshRuntimeContainerDetails {
                 runtime: selected.runtime,
                 name: selected.name,
@@ -4897,6 +4934,14 @@ declare_class!(
         #[method(refreshRuntimeContainerDetails:)]
         fn refresh_runtime_container_details(&self, _sender: &AnyObject) {
             request_selected_runtime_container_details();
+            unsafe { rebuild_window(); }
+        }
+
+        #[method(closeRuntimeContainerDetails:)]
+        fn close_runtime_container_details(&self, _sender: &AnyObject) {
+            *SELECTED_RUNTIME_CONTAINER.lock().unwrap() = None;
+            *RUNTIME_CONTAINER_DETAILS.lock().unwrap() = None;
+            RUNTIME_DETAIL_SCROLL_TO_TOP.store(true, Ordering::Relaxed);
             unsafe { rebuild_window(); }
         }
 
@@ -5406,8 +5451,13 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         scroll.setDocumentView(Some(&content));
         let clip_view: Retained<AnyObject> = msg_send_id![&*scroll, contentView];
         let top_y = (content_height - viewport.height).max(0.0);
-        let scroll_key = format!("list:{selected_nav}");
-        let saved_y = saved_scroll_position(&scroll_key, top_y);
+        let selected_runtime = SELECTED_RUNTIME_CONTAINER.lock().unwrap().clone();
+        let scroll_key = runtime_list_scroll_key(selected_nav, selected_runtime.as_ref());
+        let saved_y = if RUNTIME_DETAIL_SCROLL_TO_TOP.swap(false, Ordering::Relaxed) {
+            top_y
+        } else {
+            saved_scroll_position(&scroll_key, top_y)
+        };
         let _: () = msg_send![&*clip_view, scrollToPoint: NSPoint { x: 0.0, y: saved_y }];
         let _: () = msg_send![&*scroll, reflectScrolledClipView: &*clip_view];
         *LIST_SCROLL_VIEW.lock().unwrap() = Some(TrackedScrollView {
@@ -6531,6 +6581,28 @@ fn add_runtime_list(
 
     let child_path = build_child_path();
     let command_path = find_command_path(runtime.command, &child_path);
+    let orbstack_running = selected_nav == NAV_ORBSTACK
+        && command_path
+            .as_deref()
+            .is_some_and(|path| orbstack_is_running(path, &child_path));
+    let container_rows = match (selected_nav, command_path.as_deref()) {
+        (NAV_APPLE_CONTAINER, Some(path)) => apple_container_rows(path, &child_path),
+        (NAV_DOCKER, Some(_)) => docker_container_rows(&child_path),
+        (NAV_ORBSTACK, Some(_)) if orbstack_running => docker_container_rows(&child_path),
+        _ => vec![RuntimeContainerRow {
+            name: None,
+            label: "Runtime is unavailable or stopped. Reload after starting it.".into(),
+            running: false,
+        }],
+    };
+    let selected_container = runtime_container_detail_selection(
+        SELECTED_RUNTIME_CONTAINER.lock().unwrap().as_ref(),
+        selected_nav,
+        &container_rows,
+    );
+    if let Some((container, _)) = selected_container.as_ref() {
+        *SELECTED_RUNTIME_CONTAINER.lock().unwrap() = Some(container.clone());
+    }
     let mut y = content_height - 58.0;
     add_label(
         parent,
@@ -6555,6 +6627,36 @@ fn add_runtime_list(
         }
     }
     y -= 42.0;
+
+    if let Some((container, notice)) = selected_container {
+        add_label(
+            parent,
+            "Selected Container",
+            rect(34.0, y + 8.0, width - 68.0, 20.0),
+            mtm,
+            TextStyle::Heading,
+        );
+        y = add_runtime_container_detail(
+            parent,
+            &container,
+            0.0,
+            0.0,
+            width,
+            y + 30.0,
+            notice.as_deref(),
+            handler,
+            mtm,
+        ) - 30.0;
+    } else {
+        add_label(
+            parent,
+            "Select a container below for inspect, logs, resource stats, and terminal actions.",
+            rect(34.0, y - 10.0, width - 68.0, 36.0),
+            mtm,
+            TextStyle::Caption,
+        );
+        y -= 52.0;
+    }
 
     let Some(command_path) = command_path else {
         let is_orbstack = selected_nav == NAV_ORBSTACK;
@@ -6735,7 +6837,7 @@ fn add_runtime_list(
         );
         y -= 196.0;
 
-        add_apple_container_inventory(parent, width, y, &command_path, &child_path, handler, mtm);
+        add_apple_container_inventory(parent, width, y, &container_rows, handler, mtm);
         y -= 340.0;
     } else if selected_nav == NAV_DOCKER {
         add_docker_context_inventory(parent, width, y, &child_path, handler, mtm);
@@ -6785,23 +6887,31 @@ fn add_runtime_list(
             y -= 144.0;
         }
 
-        add_docker_container_inventory(parent, width, y, &child_path, handler, mtm);
+        add_docker_container_inventory(parent, width, y, &container_rows, handler, mtm);
         y -= 318.0;
     } else if selected_nav == NAV_ORBSTACK {
-        let running = orbstack_is_running(&command_path, &child_path);
         let machine_height = add_orbstack_machine_inventory(
             parent,
             width,
             y,
             &command_path,
             &child_path,
-            running,
+            orbstack_running,
             handler,
             mtm,
         );
         y -= machine_height + 18.0;
 
-        add_orbstack_docker_inventory(parent, width, y, &child_path, running, handler, mtm);
+        add_orbstack_docker_inventory(
+            parent,
+            width,
+            y,
+            &child_path,
+            orbstack_running,
+            &container_rows,
+            handler,
+            mtm,
+        );
         y -= 316.0;
     }
 
@@ -6922,8 +7032,7 @@ fn add_apple_container_inventory(
     parent: &NSView,
     width: f64,
     y: f64,
-    command_path: &std::path::Path,
-    child_path: &str,
+    rows: &[RuntimeContainerRow],
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
@@ -6943,7 +7052,6 @@ fn add_apple_container_inventory(
         TextStyle::Caption,
     );
 
-    let rows = apple_container_rows(command_path, child_path);
     let mut row_y = y - 82.0;
     for row in rows.iter().take(4) {
         add_runtime_container_row(parent, width, row_y, "apple", row, handler, mtm);
@@ -7099,7 +7207,7 @@ fn add_docker_container_inventory(
     parent: &NSView,
     width: f64,
     y: f64,
-    child_path: &str,
+    rows: &[RuntimeContainerRow],
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
@@ -7119,7 +7227,6 @@ fn add_docker_container_inventory(
         TextStyle::Caption,
     );
 
-    let rows = docker_container_rows(child_path);
     let mut row_y = y - 70.0;
     for row in rows.iter().take(4) {
         add_runtime_container_row(parent, width, row_y, "docker", row, handler, mtm);
@@ -7320,6 +7427,7 @@ fn add_orbstack_docker_inventory(
     y: f64,
     child_path: &str,
     running: bool,
+    rows: &[RuntimeContainerRow],
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
@@ -7366,7 +7474,6 @@ fn add_orbstack_docker_inventory(
         );
         line_y -= 22.0;
     }
-    let rows = docker_container_rows(child_path);
     line_y -= 12.0;
     for row in rows.iter().take(3) {
         add_runtime_container_row(parent, width, line_y, "orbstack", row, handler, mtm);
@@ -8326,22 +8433,33 @@ fn resource_preview_lines(
 
 fn command_items() -> Vec<String> {
     let config_path = container_sessions::config_path();
-    vec![
+    let mut commands = vec![
         format!("container system status"),
         format!("container image list"),
-        smoke_image_build_command(),
         format!("container image pull docker.io/library/alpine:3.20"),
         format!("container image load --input /tmp/cocoa-way-niri.tar"),
         format!("docker image ls"),
-        format!(
-            "docker buildx build -f examples/container-images/Containerfile.niri --output type=oci,dest=/tmp/cocoa-way-niri.tar ."
-        ),
         format!(
             "open '{}'",
             apple_container_data_root().replace('\'', "'\\''")
         ),
         format!("open -R {}", config_path.display()),
-    ]
+    ];
+    if let Ok((containerfile, context)) =
+        smoke_image_build_paths(crate::image_resources::resolve_example_image_resources())
+    {
+        // Optional entries go last so resource changes cannot retarget existing Copy tags.
+        commands.push(smoke_image_build_command_for_paths(
+            &containerfile,
+            &context,
+        ));
+        commands.push(format!(
+            "docker buildx build -f {} --output type=oci,dest=/tmp/cocoa-way-niri.tar {}",
+            shell_single_quote(&containerfile),
+            shell_single_quote(&context),
+        ));
+    }
+    commands
 }
 
 fn add_commands_list(
@@ -9169,6 +9287,7 @@ fn add_detail_panel(
             0.0,
             document_width,
             document_height,
+            None,
             handler,
             mtm,
         );
@@ -9234,6 +9353,13 @@ fn detail_scroll_key(
         }
     }
     format!("detail:{selected_nav}:empty")
+}
+
+fn runtime_list_scroll_key(nav: usize, selected: Option<&SelectedRuntimeContainer>) -> String {
+    selected
+        .filter(|container| runtime_nav(&container.runtime) == nav)
+        .map(|container| format!("list:{nav}:container:{}", container.name))
+        .unwrap_or_else(|| format!("list:{nav}"))
 }
 
 unsafe fn capture_tracked_scroll_position(slot: &Mutex<Option<TrackedScrollView>>) {
@@ -10251,12 +10377,21 @@ fn is_smoke_image_reference(image: &str) -> bool {
     image.contains("cocoa-way-niri") || image.contains("cocoa-way-smoke")
 }
 
-fn smoke_image_build_command() -> String {
+fn smoke_image_build_command() -> Result<String, String> {
+    let (containerfile, context) =
+        smoke_image_build_paths(crate::image_resources::resolve_example_image_resources())?;
+    Ok(smoke_image_build_command_for_paths(
+        &containerfile,
+        &context,
+    ))
+}
+
+fn smoke_image_build_command_for_paths(containerfile: &str, context: &str) -> String {
     format!(
         "container build -f {} -t {} {}",
-        smoke_containerfile_path(),
-        smoke_image_reference(),
-        smoke_build_context()
+        shell_single_quote(containerfile),
+        shell_single_quote(smoke_image_reference()),
+        shell_single_quote(context),
     )
 }
 
@@ -10993,6 +11128,135 @@ fn add_volume_detail(
     }
 }
 
+fn runtime_container_detail_selection(
+    selected: Option<&SelectedRuntimeContainer>,
+    nav: usize,
+    rows: &[RuntimeContainerRow],
+) -> Option<(SelectedRuntimeContainer, Option<String>)> {
+    let mut container = selected
+        .filter(|container| runtime_nav(&container.runtime) == nav)?
+        .clone();
+    let notice = if let Some(row) = rows
+        .iter()
+        .find(|row| row.name.as_deref() == Some(container.name.as_str()))
+    {
+        container.label = row.label.clone();
+        container.running = row.running;
+        None
+    } else {
+        container.running = false;
+        let reason = rows
+            .iter()
+            .find(|row| row.name.is_none())
+            .map(|row| row.label.as_str())
+            .unwrap_or("This container no longer appears in the current inventory.");
+        Some(format!(
+            "{reason} Reload the runtime inventory or select another container below."
+        ))
+    };
+    Some((container, notice))
+}
+
+fn runtime_container_detail_action_states(running: bool, available: bool) -> [bool; 6] {
+    [
+        available,
+        available && running,
+        available && running,
+        available,
+        available && !running,
+        true,
+    ]
+}
+
+fn runtime_container_detail_output(
+    container: &SelectedRuntimeContainer,
+    details: Option<&RuntimeContainerDetails>,
+    available: bool,
+) -> [Vec<String>; 3] {
+    let details = details.filter(|details| {
+        available && details.runtime == container.runtime && details.name == container.name
+    });
+    let mut info = details
+        .map(|details| details.info.clone())
+        .unwrap_or_else(|| {
+            vec![if available {
+        "Loading runtime details..."
+    } else {
+        "Inspect output is unavailable until this container appears in the current inventory."
+    }.into()]
+        });
+    if let Some(error) = details.and_then(|details| details.error.as_ref()) {
+        info.push(format!("Warning: {}", error));
+    }
+    if info.is_empty() {
+        info.push(container.label.clone());
+    }
+    let mut stats = details
+        .map(|details| details.stats.clone())
+        .unwrap_or_else(|| {
+            vec![
+                if available {
+                    "Waiting for a one-shot resource sample..."
+                } else {
+                    "Resource stats unavailable."
+                }
+                .into(),
+            ]
+        });
+    if stats.is_empty() {
+        stats.push("No resource sample returned. Stopped containers may not report stats.".into());
+    }
+    let mut logs = details
+        .map(|details| details.logs.clone())
+        .unwrap_or_else(|| {
+            vec![
+                if available {
+                    "Waiting for recent container logs..."
+                } else {
+                    "Recent logs unavailable."
+                }
+                .into(),
+            ]
+        });
+    if logs.is_empty() {
+        logs.push("No recent container log output.".into());
+    }
+    [info, stats, logs]
+}
+
+struct RuntimeContainerDetailLayout {
+    actions: Vec<NSRect>,
+    outputs: [NSRect; 3],
+    bottom: f64,
+}
+
+fn runtime_container_detail_layout(
+    x: f64,
+    header_y: f64,
+    width: f64,
+    has_notice: bool,
+) -> RuntimeContainerDetailLayout {
+    let actions = action_frames(
+        x,
+        header_y - if has_notice { 132.0 } else { 72.0 },
+        width,
+        &[88.0, 88.0, 96.0, 128.0, 88.0, 112.0],
+        30.0,
+    );
+    let actions_bottom = actions
+        .iter()
+        .map(|frame| frame.origin.y)
+        .fold(header_y, f64::min);
+    let info = rect(x, actions_bottom - 164.0, width, 140.0);
+    let stats = rect(x, info.origin.y - 136.0, width, 112.0);
+    let logs = rect(x, stats.origin.y - 250.0, width, 226.0);
+    RuntimeContainerDetailLayout {
+        actions,
+        outputs: [info, stats, logs],
+        bottom: logs.origin.y - 24.0,
+    }
+}
+
 fn add_runtime_container_detail(
     parent: &NSView,
     container: &SelectedRuntimeContainer,
@@ -11000,12 +11264,15 @@ fn add_runtime_container_detail(
     y: f64,
     width: f64,
     height: f64,
+    notice: Option<&str>,
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
-) {
+) -> f64 {
     let content_x = x + 42.0;
     let content_width = width - 84.0;
-    let header_y = y + height - 124.0;
+    let header_y = y + height - 70.0;
+    let layout =
+        runtime_container_detail_layout(content_x, header_y, content_width, notice.is_some());
     add_label(
         parent,
         &short_text(
@@ -11021,7 +11288,9 @@ fn add_runtime_container_detail(
         &format!(
             "{} container · {}",
             runtime_label(&container.runtime),
-            if container.running {
+            if notice.is_some() {
+                "Unavailable"
+            } else if container.running {
                 "Running"
             } else {
                 "Stopped"
@@ -11032,11 +11301,30 @@ fn add_runtime_container_detail(
         TextStyle::Body,
     );
 
+    if let Some(notice) = notice {
+        let text = bounded_text_rows(
+            notice,
+            chars_for_width(content_width, TextStyle::Caption),
+            2,
+        )
+        .join("\n");
+        let label = add_label(
+            parent,
+            &text,
+            rect(content_x, header_y - 82.0, content_width, 42.0),
+            mtm,
+            TextStyle::Caption,
+        );
+        unsafe {
+            let _: () = msg_send![&*label, setToolTip: &*NSString::from_str(notice)];
+        }
+    }
+
     let action_index = push_runtime_container_action(&container.runtime, &container.name);
     let primary = add_button(
         parent,
         if container.running { "Stop" } else { "Start" },
-        rect(content_x, header_y - 72.0, 88.0, 30.0),
+        layout.actions[0],
         handler,
         if container.running {
             sel!(stopRuntimeContainer:)
@@ -11048,7 +11336,7 @@ fn add_runtime_container_detail(
     let restart = add_button(
         parent,
         "Restart",
-        rect(content_x + 98.0, header_y - 72.0, 88.0, 30.0),
+        layout.actions[1],
         handler,
         sel!(restartRuntimeContainer:),
         mtm,
@@ -11056,15 +11344,15 @@ fn add_runtime_container_detail(
     let terminal = add_button(
         parent,
         "Terminal",
-        rect(content_x + 196.0, header_y - 72.0, 96.0, 30.0),
+        layout.actions[2],
         handler,
         sel!(openRuntimeContainerTerminal:),
         mtm,
     );
     let refresh = add_button(
         parent,
-        "Refresh",
-        rect(content_x, header_y - 110.0, 88.0, 30.0),
+        "Refresh Details",
+        layout.actions[3],
         handler,
         sel!(refreshRuntimeContainerDetails:),
         mtm,
@@ -11072,9 +11360,17 @@ fn add_runtime_container_detail(
     let delete = add_button(
         parent,
         "Delete",
-        rect(content_x + 98.0, header_y - 110.0, 88.0, 30.0),
+        layout.actions[4],
         handler,
         sel!(deleteRuntimeContainer:),
+        mtm,
+    );
+    let close = add_button(
+        parent,
+        "Hide Details",
+        layout.actions[5],
+        handler,
+        sel!(closeRuntimeContainerDetails:),
         mtm,
     );
     unsafe {
@@ -11090,71 +11386,57 @@ fn add_runtime_container_detail(
         let _: () = msg_send![&*refresh, setToolTip:
             &*NSString::from_str("Reload inspect, resource, and recent log output")];
         let _: () = msg_send![&*delete, setToolTip:
-            &*NSString::from_str("Delete this container after confirmation")];
-        let _: () = msg_send![&*restart, setEnabled: container.running];
-        let _: () = msg_send![&*terminal, setEnabled: container.running];
+            &*NSString::from_str(if container.running { "Stop this container before deleting it" } else { "Delete this container after confirmation" })];
+        for (button, enabled) in [&primary, &restart, &terminal, &refresh, &delete, &close]
+            .into_iter()
+            .zip(runtime_container_detail_action_states(
+                container.running,
+                notice.is_none(),
+            ))
+        {
+            let _: () = msg_send![&**button, setEnabled: enabled];
+        }
     }
 
-    let details = RUNTIME_CONTAINER_DETAILS
-        .lock()
-        .unwrap()
-        .clone()
-        .filter(|details| details.runtime == container.runtime && details.name == container.name);
-    let mut info = details
-        .as_ref()
-        .map(|details| details.info.clone())
-        .unwrap_or_else(|| vec!["Loading runtime details...".into()]);
-    if let Some(error) = details.as_ref().and_then(|details| details.error.as_ref()) {
-        info.push(format!("Warning: {}", error));
-    }
-    if info.is_empty() {
-        info.push(container.label.clone());
-    }
-    let stats = details
-        .as_ref()
-        .map(|details| details.stats.clone())
-        .unwrap_or_else(|| vec!["Waiting for a one-shot resource sample...".into()]);
-    let logs = details
-        .as_ref()
-        .map(|details| details.logs.clone())
-        .unwrap_or_else(|| vec!["Waiting for recent container logs...".into()]);
+    let details = RUNTIME_CONTAINER_DETAILS.lock().unwrap().clone();
+    let [info, stats, logs] =
+        runtime_container_detail_output(container, details.as_ref(), notice.is_none());
 
-    let info_y = header_y - 286.0;
+    let [info_frame, stats_frame, logs_frame] = layout.outputs;
     add_runtime_output_card(
         parent,
-        "Info",
+        "Inspect",
         &info,
-        content_x,
-        info_y,
-        content_width,
-        140.0,
+        info_frame.origin.x,
+        info_frame.origin.y,
+        info_frame.size.width,
+        info_frame.size.height,
         4,
         mtm,
     );
-    let stats_y = info_y - 136.0;
     add_runtime_output_card(
         parent,
-        "Resources",
+        "Resources / Stats",
         &stats,
-        content_x,
-        stats_y,
-        content_width,
-        112.0,
+        stats_frame.origin.x,
+        stats_frame.origin.y,
+        stats_frame.size.width,
+        stats_frame.size.height,
         3,
         mtm,
     );
-    let logs_y = stats_y - 250.0;
     add_runtime_output_card(
         parent,
         "Recent Logs",
         &logs,
-        content_x,
-        logs_y,
-        content_width,
-        226.0,
+        logs_frame.origin.x,
+        logs_frame.origin.y,
+        logs_frame.size.width,
+        logs_frame.size.height,
         8,
         mtm,
     );
+    layout.bottom
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12060,6 +12342,258 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect {
         origin: NSPoint { x, y },
         size: NSSize { width, height },
+    }
+}
+
+#[cfg(test)]
+mod example_image_build_tests {
+    use super::*;
+    use crate::image_resources::ExampleImageResources;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolved_build_paths_are_absolute_and_preserved_as_raw_arguments() {
+        let paths = smoke_image_build_paths(Ok(ExampleImageResources {
+            containerfile: PathBuf::from("/app dir/it's/Containerfile.niri"),
+            context: PathBuf::from("/app dir/it's"),
+        }))
+        .unwrap();
+        assert_eq!(paths.0, "/app dir/it's/Containerfile.niri");
+        assert_eq!(paths.1, "/app dir/it's");
+        assert_eq!(
+            smoke_image_build_command_for_paths(&paths.0, &paths.1),
+            r#"container build -f '/app dir/it'\''s/Containerfile.niri' -t 'localhost/cocoa-way-niri:latest' '/app dir/it'\''s'"#
+        );
+    }
+
+    #[test]
+    fn missing_resources_and_relative_paths_never_produce_build_parameters() {
+        assert_eq!(
+            smoke_image_build_paths(Err("Example resources missing".into())).unwrap_err(),
+            "Example resources missing"
+        );
+        for (containerfile, context) in [
+            ("Containerfile.niri", "/absolute"),
+            ("/absolute/Containerfile.niri", "."),
+        ] {
+            assert!(
+                smoke_image_build_paths(Ok(ExampleImageResources {
+                    containerfile: containerfile.into(),
+                    context: context.into(),
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrepresentable_paths_are_rejected_instead_of_lossily_changed() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"/example/\xff".to_vec()));
+        assert!(
+            smoke_image_build_paths(Ok(ExampleImageResources {
+                containerfile: invalid.clone(),
+                context: "/example".into(),
+            }))
+            .is_err()
+        );
+        assert!(
+            smoke_image_build_paths(Ok(ExampleImageResources {
+                containerfile: "/example/Containerfile.niri".into(),
+                context: invalid,
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_container_detail_tests {
+    use super::*;
+
+    fn selected(runtime: &str) -> SelectedRuntimeContainer {
+        SelectedRuntimeContainer {
+            runtime: runtime.into(),
+            name: "example".into(),
+            label: "old inventory label".into(),
+            running: true,
+        }
+    }
+
+    #[test]
+    fn selection_is_inline_for_each_runtime_and_uses_the_full_inventory() {
+        for (runtime, nav) in [
+            ("apple", NAV_APPLE_CONTAINER),
+            ("docker", NAV_DOCKER),
+            ("orbstack", NAV_ORBSTACK),
+        ] {
+            let container = selected(runtime);
+            let mut rows: Vec<_> = (0..5)
+                .map(|index| RuntimeContainerRow {
+                    name: Some(format!("other-{index}")),
+                    label: "other".into(),
+                    running: true,
+                })
+                .collect();
+            rows.push(RuntimeContainerRow {
+                name: Some(container.name.clone()),
+                label: "fresh stopped inventory label".into(),
+                running: false,
+            });
+            let (resolved, notice) =
+                runtime_container_detail_selection(Some(&container), nav, &rows).unwrap();
+            assert!(notice.is_none());
+            assert!(!resolved.running);
+            assert_eq!(resolved.label, "fresh stopped inventory label");
+            assert!(
+                runtime_container_detail_selection(Some(&container), NAV_SESSIONS, &rows).is_none()
+            );
+        }
+        assert!(runtime_container_detail_selection(None, NAV_DOCKER, &[]).is_none());
+    }
+
+    #[test]
+    fn missing_or_loading_inventory_never_reuses_stale_running_actions() {
+        let container = selected("docker");
+        for rows in [
+            vec![],
+            vec![RuntimeContainerRow {
+                name: None,
+                label: UI_COMMAND_LOADING.into(),
+                running: false,
+            }],
+            vec![RuntimeContainerRow {
+                name: Some("replacement".into()),
+                label: "another container".into(),
+                running: true,
+            }],
+        ] {
+            let (resolved, notice) =
+                runtime_container_detail_selection(Some(&container), NAV_DOCKER, &rows).unwrap();
+            assert!(notice.is_some());
+            assert!(!resolved.running);
+            assert_eq!(
+                runtime_container_detail_action_states(resolved.running, notice.is_none()),
+                [false, false, false, false, false, true]
+            );
+        }
+        assert_eq!(
+            runtime_container_detail_action_states(true, true),
+            [true, true, true, true, false, true]
+        );
+        assert_eq!(
+            runtime_container_detail_action_states(false, true),
+            [true, false, false, true, true, true]
+        );
+    }
+
+    #[test]
+    fn output_rejects_stale_identity_and_explains_empty_or_loading_data() {
+        let container = selected("apple");
+        let mut details = RuntimeContainerDetails {
+            runtime: "apple".into(),
+            name: "example".into(),
+            info: vec![],
+            stats: vec![],
+            logs: vec![],
+            error: None,
+        };
+        let output = runtime_container_detail_output(&container, Some(&details), true);
+        assert_eq!(output[0], vec![container.label.clone()]);
+        assert!(output[1][0].contains("No resource sample"));
+        assert!(output[2][0].contains("No recent container log"));
+        details.info.push("private inspect".into());
+        details.logs.push("private logs".into());
+        for (runtime, name, available) in [
+            ("docker", "example", true),
+            ("apple", "other", true),
+            ("apple", "example", false),
+        ] {
+            details.runtime = runtime.into();
+            details.name = name.into();
+            let output = runtime_container_detail_output(&container, Some(&details), available);
+            assert!(!output.iter().flatten().any(|line| line.contains("private")));
+            assert!(output.iter().all(|lines| !lines.is_empty()));
+        }
+        details.runtime = "apple".into();
+        details.name = "example".into();
+        details.error = Some("inspect failed".into());
+        assert!(
+            runtime_container_detail_output(&container, Some(&details), true)[0]
+                .iter()
+                .any(|line| line.contains("inspect failed"))
+        );
+        assert!(runtime_container_detail_output(&container, None, true)[0][0].contains("Loading"));
+    }
+
+    #[test]
+    fn layout_inline_actions_and_output_cards_do_not_overlap_at_narrow_widths() {
+        for width in [
+            240.0,
+            360.0,
+            429.0,
+            LIST_MIN_WIDTH + DETAIL_MIN_WIDTH - 15.0,
+            1180.0,
+            1728.0,
+        ] {
+            for notice in [false, true] {
+                let content_width = width - 84.0;
+                let layout = runtime_container_detail_layout(42.0, 900.0, content_width, notice);
+                assert_eq!(layout.actions.len(), 6);
+                for (index, frame) in layout.actions.iter().enumerate() {
+                    assert!(frame.origin.x >= 42.0);
+                    assert!(frame.origin.x + frame.size.width <= width - 42.0);
+                    for other in &layout.actions[..index] {
+                        assert!(
+                            frame.origin.x >= other.origin.x + other.size.width
+                                || frame.origin.y + frame.size.height <= other.origin.y
+                        );
+                    }
+                    assert!(
+                        layout.outputs[0].origin.y + layout.outputs[0].size.height + 24.0
+                            <= frame.origin.y
+                    );
+                }
+                for pair in layout.outputs.windows(2) {
+                    assert_eq!(
+                        pair[1].origin.y + pair[1].size.height + 24.0,
+                        pair[0].origin.y
+                    );
+                }
+                assert_eq!(layout.bottom + 24.0, layout.outputs[2].origin.y);
+            }
+        }
+        let narrow = runtime_container_detail_layout(42.0, 900.0, 156.0, false);
+        let wide = runtime_container_detail_layout(42.0, 900.0, 800.0, false);
+        assert!(narrow.bottom < wide.bottom);
+        assert_eq!(
+            runtime_container_detail_layout(42.0, 900.0, 800.0, true).bottom,
+            wide.bottom - 60.0
+        );
+    }
+
+    #[test]
+    fn overview_and_each_selected_container_keep_independent_scroll_keys() {
+        let container = selected("orbstack");
+        let mut another = container.clone();
+        another.name = "another".into();
+        assert_eq!(
+            runtime_list_scroll_key(NAV_ORBSTACK, None),
+            format!("list:{NAV_ORBSTACK}")
+        );
+        assert_ne!(
+            runtime_list_scroll_key(NAV_ORBSTACK, Some(&container)),
+            runtime_list_scroll_key(NAV_ORBSTACK, Some(&another))
+        );
+        assert_ne!(
+            runtime_list_scroll_key(NAV_ORBSTACK, Some(&container)),
+            runtime_list_scroll_key(NAV_ORBSTACK, None)
+        );
+        assert_eq!(
+            runtime_list_scroll_key(NAV_DOCKER, Some(&container)),
+            format!("list:{NAV_DOCKER}")
+        );
     }
 }
 

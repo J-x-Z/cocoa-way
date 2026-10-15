@@ -5,20 +5,17 @@ log() {
     printf '%s\n' "cocoa-way clipboard relay: $*" >&2
 }
 
-transfer() {
+read_selection() {
     source=$1
-    destination=$2
-    state_file=$3
-    data_file=$(mktemp)
-    trap 'rm -f "$data_file"' EXIT
+    data_file=$2
     # Drain the watch pipe before querying its compositor again. Older wl-paste
     # versions do not expose CLIPBOARD_TYPE, so query the offered types explicitly.
-    timeout 10 head -c 67108865 >"$data_file" || exit 0
+    timeout 10 head -c 67108865 >"$data_file" || return 1
     # Nested compositors often announce an empty selection at startup. Do not
     # let that erase a valid host clipboard before both watchers are ready.
-    [ -s "$data_file" ] || exit 0
-    [ "$(wc -c <"$data_file")" -le 67108864 ] || exit 0
-    types=$(WAYLAND_DISPLAY="$source" timeout 3 wl-paste --list-types) || exit 0
+    [ -s "$data_file" ] || return 1
+    [ "$(wc -c <"$data_file")" -le 67108864 ] || return 1
+    types=$(WAYLAND_DISPLAY="$source" timeout 3 wl-paste --list-types) || return 1
     mime=
     for candidate in image/png 'text/plain;charset=utf-8' 'text/plain;charset=UTF-8' text/plain UTF8_STRING TEXT STRING; do
         if printf '%s\n' "$types" | grep -Fxq "$candidate"; then
@@ -27,14 +24,27 @@ transfer() {
         fi
     done
     # HTML is not plain text. Never copy markup under a text/plain label.
-    [ -n "$mime" ] || exit 0
+    [ -n "$mime" ] || return 1
     if [ "${CLIPBOARD_TYPE:-}" != "$mime" ]; then
         # ulimit bounds output even if a misbehaving source never closes its pipe.
-        (ulimit -f 131072; WAYLAND_DISPLAY="$source" timeout 10 wl-paste --no-newline --type "$mime" >"$data_file") || exit 0
+        (ulimit -f 131072; WAYLAND_DISPLAY="$source" timeout 10 wl-paste --no-newline --type "$mime" >"$data_file") || return 1
     fi
-    [ -s "$data_file" ] || exit 0
-    [ "$(wc -c <"$data_file")" -le 67108864 ] || exit 0
+    [ -s "$data_file" ] || return 1
+    [ "$(wc -c <"$data_file")" -le 67108864 ] || return 1
     digest="$mime:$(cksum <"$data_file" | awk '{ print $1 ":" $2 }')"
+}
+
+transfer() {
+    source=$1
+    destination=$2
+    state_file=$3
+    data_file=$(mktemp) || exit 0
+    trap 'rm -f "$data_file"' EXIT
+    digest=
+    if ! read_selection "$source" "$data_file"; then
+        # An unrelayable selection changes this endpoint, not the other one.
+        digest=
+    fi
 
     lock_dir="${state_file}.lock"
     attempts=0
@@ -45,15 +55,34 @@ transfer() {
     done
     trap 'rmdir "$lock_dir" 2>/dev/null; rm -f "$data_file"' EXIT
 
-    previous=$(cat "$state_file" 2>/dev/null || true)
-    if [ "$previous" = "$digest" ]; then
-        exit 0
+    previous_source=
+    previous_source_digest=
+    previous_destination=
+    previous_destination_digest=
+    if [ -r "$state_file" ]; then
+        {
+            IFS= read -r previous_source || true
+            IFS= read -r previous_source_digest || true
+            IFS= read -r previous_destination || true
+            IFS= read -r previous_destination_digest || true
+        } <"$state_file"
     fi
-    printf '%s\n' "$digest" >"$state_file"
-    # wl-copy normally forks once it owns the selection; wait for that handshake.
-    if ! WAYLAND_DISPLAY="$destination" timeout 3 wl-copy --type "$mime" <"$data_file"; then
-        printf '%s\n' "$previous" >"$state_file"
+
+    destination_digest=
+    if [ "$previous_source" = "$source" ] && [ "$previous_destination" = "$destination" ]; then
+        destination_digest=$previous_destination_digest
+    elif [ "$previous_source" = "$destination" ] && [ "$previous_destination" = "$source" ]; then
+        destination_digest=$previous_source_digest
     fi
+    # Deduplicate only against this destination's current selection. Remember a
+    # successful copy on both endpoints so its reverse watch callback is an echo.
+    if [ -n "$digest" ] && [ "$destination_digest" != "$digest" ]; then
+        # wl-copy normally forks once it owns the selection; wait for that handshake.
+        if WAYLAND_DISPLAY="$destination" timeout 3 wl-copy --type "$mime" <"$data_file"; then
+            destination_digest=$digest
+        fi
+    fi
+    printf '%s\n' "$source" "$digest" "$destination" "$destination_digest" >"$state_file"
 }
 
 if [ "${1:-}" = "--transfer" ]; then

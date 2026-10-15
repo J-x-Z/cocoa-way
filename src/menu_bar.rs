@@ -181,7 +181,13 @@ declare_class!(
         #[method(startContainerSession:)]
         fn start_container_session(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
-            send(CompositorMessage::StartContainerSession(tag as usize));
+            let signature: Option<Retained<NSString>> = unsafe { msg_send_id![sender, representedObject] };
+            let Some(signature) = signature else { return; };
+            let Ok(index) = usize::try_from(tag) else { return; };
+            send(CompositorMessage::StartContainerSessionIfCurrent {
+                index,
+                signature: signature.to_string(),
+            });
         }
 
         /// Toggles HiDPI rendering.
@@ -617,6 +623,8 @@ pub fn setup_menu(
                     &NSString::from_str(""),
                 );
                 let _: () = msg_send![&*item, setTag: i as isize];
+                let _: () = msg_send![&*item, setRepresentedObject:
+                    &*NSString::from_str(&crate::container_sessions::session_to_toml(session))];
                 let _: () = msg_send![&*item, setTarget: &*handler];
                 container_menu.addItem(&item);
             }
@@ -751,6 +759,8 @@ unsafe fn install_status_menu(
                 unsafe { action_item(&session.name, sel!(startContainerSession:), handler, mtm) };
             unsafe {
                 item.setTag(index as isize);
+                let _: () = msg_send![&*item, setRepresentedObject:
+                    &*NSString::from_str(&crate::container_sessions::session_to_toml(session))];
             }
             submenu.addItem(&item);
         }

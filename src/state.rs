@@ -26,6 +26,29 @@ const CLIPBOARD_IMAGE_MIME: &str = "image/png";
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIPBOARD_IMAGE_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CLIPBOARD_IMAGE_PIXELS: usize = 32 * 1024 * 1024;
+const MAX_SURFACE_ANCESTORS: usize = 128;
+
+fn bounded_parent_chain<T, Id: Eq + std::hash::Hash>(
+    first: T,
+    id: impl Fn(&T) -> Id,
+    mut parent: impl FnMut(&T) -> Option<T>,
+) -> Option<Vec<T>> {
+    let mut visited = std::collections::HashSet::new();
+    let mut chain = Vec::new();
+    let mut current = first;
+    for _ in 0..MAX_SURFACE_ANCESTORS {
+        if !visited.insert(id(&current)) {
+            return None;
+        }
+        let next = parent(&current);
+        chain.push(current);
+        let Some(next) = next else {
+            return Some(chain);
+        };
+        current = next;
+    }
+    None
+}
 
 type PointerOriginPart = (
     smithay::reexports::wayland_server::backend::ObjectId,
@@ -132,6 +155,7 @@ pub struct AppState {
     host_clipboard_image_png: Option<Arc<[u8]>>,
     pending_guest_clipboard_mime: Option<String>,
     guest_clipboard_generation: Arc<AtomicU64>,
+    outgoing_clipboard_transfers: Arc<crate::clipboard_transfer::TransferBudget>,
     pasteboard_change_count: isize,
     last_pasteboard_poll: std::time::Instant,
     pointer_gesture: PointerGestureTracker,
@@ -394,6 +418,9 @@ impl AppState {
             host_clipboard_image_png: None,
             pending_guest_clipboard_mime: None,
             guest_clipboard_generation: Arc::new(AtomicU64::new(0)),
+            outgoing_clipboard_transfers: Arc::new(
+                crate::clipboard_transfer::TransferBudget::default(),
+            ),
             pasteboard_change_count: -1,
             last_pasteboard_poll: std::time::Instant::now() - std::time::Duration::from_millis(100),
             pointer_gesture: PointerGestureTracker::default(),
@@ -538,14 +565,17 @@ impl AppState {
     pub fn pointer_focus_origin_current(&self) -> bool {
         self.pointer_input.focus().is_some_and(|focus| {
             focus.surface.is_alive()
+                && !self.pointer_origin_stamp.is_empty()
                 && self.pointer_origin_stamp == self.pointer_origin_parts(&focus.surface)
         })
     }
 
     fn pointer_origin_parts(&self, surface: &WlSurface) -> Vec<PointerOriginPart> {
         let mut parts = Vec::new();
-        let mut surface = Some(surface.clone());
-        while let Some(current) = surface {
+        let Some(chain) = self.surface_ancestor_chain(surface) else {
+            return parts;
+        };
+        for current in chain {
             let (offset, geometry) =
                 smithay::wayland::compositor::with_states(&current, |states| {
                     let offset = states
@@ -571,8 +601,6 @@ impl AppState {
                 })
             });
             parts.push((current.id(), offset, geometry, popup_origin));
-            surface = smithay::wayland::compositor::get_parent(&current)
-                .or_else(|| popup.and_then(|popup| popup.get_parent_surface()));
         }
         parts
     }
@@ -841,40 +869,145 @@ impl AppState {
         self.finish_pointer_gesture_if_idle(pointer, time, true);
     }
 
+    fn surface_ancestor_chain(&self, surface: &WlSurface) -> Option<Vec<WlSurface>> {
+        bounded_parent_chain(surface.clone(), Resource::id, |current| {
+            smithay::wayland::compositor::get_parent(current).or_else(|| {
+                self.popups
+                    .iter()
+                    .find(|popup| popup.wl_surface() == current)
+                    .and_then(|popup| popup.get_parent_surface())
+            })
+        })
+    }
+
     fn root_toplevel_id_for_surface(
         &self,
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     ) -> Option<smithay::reexports::wayland_server::backend::ObjectId> {
-        let mut root = surface.clone();
-        loop {
-            while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
-                root = parent;
-            }
-            let Some(parent) = self
-                .popups
-                .iter()
-                .find(|popup| popup.wl_surface() == &root)
-                .and_then(|popup| popup.get_parent_surface())
-            else {
-                break;
-            };
-            root = parent;
-        }
+        let chain = self.surface_ancestor_chain(surface)?;
+        let root = chain.last()?;
         self.toplevels
             .iter()
-            .find(|toplevel| toplevel.wl_surface() == &root)
+            .find(|toplevel| toplevel.wl_surface() == root)
             .map(|toplevel| toplevel.wl_surface().id())
     }
 
-    pub fn take_trace_frames(
-        &mut self,
+    /// Unmap a role's scene without destroying its reusable wl_surface.
+    fn remove_surface_from_scene(&mut self, surface: &WlSurface, was_toplevel: bool) {
+        use smithay::wayland::compositor::{TraversalAction, with_surface_tree_downward};
+
+        let surface_id = surface.id();
+        let affected_root = self.root_toplevel_id_for_surface(surface);
+        // Resolve popup ancestry before removing the role that connects the tree.
+        let mut scene_roots = vec![surface.clone()];
+        scene_roots.extend(self.popups.iter().filter_map(|popup| {
+            (popup.wl_surface() != surface
+                && self
+                    .surface_ancestor_chain(popup.wl_surface())
+                    .is_some_and(|chain| chain.iter().any(|ancestor| ancestor == surface)))
+            .then(|| popup.wl_surface().clone())
+        }));
+        let mut retired = std::collections::HashSet::new();
+        for root in scene_roots {
+            with_surface_tree_downward(
+                &root,
+                (),
+                |_, _, _| TraversalAction::DoChildren(()),
+                |child, _, _| {
+                    retired.insert(child.id());
+                    self.pointer_input.forget_surface(child);
+                },
+                |_, _, _| true,
+            );
+        }
+        self.pointer_surface_buffers
+            .retain(|id, _| !retired.contains(id));
+        self.surface_positions.retain(|id, _| !retired.contains(id));
+        self.layout.remove_tile(&surface_id);
+        self.toplevels
+            .retain(|toplevel| toplevel.wl_surface() != surface);
+        for popup in &self.popups {
+            if popup.wl_surface() != surface
+                && retired.contains(&popup.wl_surface().id())
+                && popup.alive()
+            {
+                popup.send_popup_done();
+            }
+        }
+        self.popups
+            .retain(|popup| !retired.contains(&popup.wl_surface().id()));
+        self.pending_frame_callbacks.retain(|pending| {
+            !retired.contains(&pending.source_surface.id())
+                && !(was_toplevel && pending.root_surface.as_ref() == Some(&surface_id))
+        });
+        if was_toplevel {
+            self.output.leave(surface);
+            self.rootless_dirty_surfaces.remove(&surface_id);
+            self.trace_frames.remove(&surface_id);
+        }
+        if self
+            .drag_state
+            .as_ref()
+            .is_some_and(|(id, _)| retired.contains(id))
+        {
+            self.drag_state = None;
+        }
+        if self
+            .start_drag_request
+            .as_ref()
+            .is_some_and(|id| retired.contains(id))
+        {
+            self.start_drag_request = None;
+        }
+        if self.pointer_input.focus().is_none() {
+            self.pointer_origin_stamp.clear();
+        }
+        if let Some(pointer) = self.seat.get_pointer()
+            && pointer
+                .current_focus()
+                .is_some_and(|focus| retired.contains(&focus.id()))
+        {
+            self.native_cursor_left();
+            let time = self.start_time.elapsed().as_millis() as u32;
+            self.cancel_pointer_gesture(&pointer, time);
+            crate::clear_pointer_focus(self, time);
+        }
+        self.refresh_native_cursor();
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && keyboard
+                .current_focus()
+                .is_some_and(|focus| retired.contains(&focus.id()))
+        {
+            keyboard.set_focus(self, None, smithay::utils::SERIAL_COUNTER.next_serial());
+        }
+        if self.presentation.is_rootless() {
+            if !was_toplevel && let Some(root) = affected_root {
+                self.rootless_dirty_surfaces.insert(root);
+            }
+            self.needs_redraw = !self.rootless_dirty_surfaces.is_empty();
+            if was_toplevel {
+                let _ = self.loop_signal.send(
+                    crate::messages::CompositorMessage::RootlessToplevelDestroyed(surface_id),
+                );
+            }
+        } else {
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn trace_frames_for(
+        &self,
         root: Option<&smithay::reexports::wayland_server::backend::ObjectId>,
     ) -> Vec<u64> {
         if let Some(root) = root {
-            self.trace_frames.remove(root).into_iter().collect()
+            self.trace_frames.get(root).copied().into_iter().collect()
         } else {
-            self.trace_frames.drain().map(|(_, id)| id).collect()
+            self.trace_frames.values().copied().collect()
         }
+    }
+
+    pub fn retire_trace_frames(&mut self, submitted: &[u64]) {
+        self.trace_frames.retain(|_, id| !submitted.contains(id));
     }
 
     fn take_frame_callbacks_for(
@@ -1089,20 +1222,28 @@ impl AppState {
         let generation = generation_counter.load(Ordering::Relaxed);
         let pasteboard_change_count =
             unsafe { objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() };
-        std::thread::spawn(move || {
-            let result = read_guest_clipboard(read_fd, &mime, &generation_counter, generation);
-            match result {
-                Ok(Some(payload)) => {
-                    let _ = loop_signal.send(crate::messages::CompositorMessage::GuestClipboard {
-                        generation,
-                        pasteboard_change_count,
-                        payload,
-                    });
+        if let Err(error) = std::thread::Builder::new()
+            .name("clipboard-read".into())
+            .spawn(move || {
+                let result = read_guest_clipboard(read_fd, &mime, &generation_counter, generation);
+                match result {
+                    Ok(Some(payload)) => {
+                        let _ =
+                            loop_signal.send(crate::messages::CompositorMessage::GuestClipboard {
+                                generation,
+                                pasteboard_change_count,
+                                payload,
+                            });
+                    }
+                    Ok(None) => {}
+                    Err(error) => crate::diagnostics::record_clipboard_failure(error),
                 }
-                Ok(None) => {}
-                Err(error) => crate::diagnostics::record_clipboard_failure(error),
-            }
-        });
+            })
+        {
+            crate::diagnostics::record_clipboard_failure(format!(
+                "Failed to start Wayland clipboard reader: {error}"
+            ));
+        }
     }
     pub fn update_scale_factor(&mut self, scale: f64) {
         let scale = if scale.is_finite() && scale > 0.0 {
@@ -1267,74 +1408,16 @@ impl CompositorHandler for AppState {
             return;
         }
         let surface_id = surface.id();
-        self.pointer_surface_buffers.remove(&surface_id);
-        self.pointer_input.forget_surface(surface);
-        let affected_root = self.root_toplevel_id_for_surface(surface);
         let was_toplevel = self
             .toplevels
             .iter()
             .any(|toplevel| toplevel.wl_surface() == surface);
-        self.layout.remove_tile(&surface_id);
-        self.toplevels
-            .retain(|toplevel| toplevel.wl_surface() != surface);
-        self.popups.retain(|popup| popup.wl_surface() != surface);
-        self.surface_positions.remove(&surface_id);
-        self.pending_frame_callbacks
-            .retain(|pending| pending.source_surface != *surface);
-        if was_toplevel {
-            self.output.leave(surface);
-            self.rootless_dirty_surfaces.remove(&surface_id);
-            self.trace_frames.remove(&surface_id);
-            self.pending_frame_callbacks
-                .retain(|pending| pending.root_surface.as_ref() != Some(&surface_id));
-        }
-        if self
-            .drag_state
-            .as_ref()
-            .is_some_and(|(id, _)| id == &surface_id)
-        {
-            self.drag_state = None;
-        }
-        if self.start_drag_request.as_ref() == Some(&surface_id) {
-            self.start_drag_request = None;
-        }
-
-        if let Some(pointer) = self.seat.get_pointer() {
-            if pointer.current_focus().as_ref() == Some(surface) {
-                self.native_cursor_left();
-                // Wayland destruction can remove the native window before winit's
-                // CursorLeft/Destroyed events, so release its pointer here.
-                let time = self.start_time.elapsed().as_millis() as u32;
-                self.cancel_pointer_gesture(&pointer, time);
-                crate::clear_pointer_focus(self, time);
-            }
-        }
-
-        self.refresh_native_cursor();
-
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            if keyboard.current_focus().as_ref() == Some(surface) {
-                keyboard.set_focus(self, None, smithay::utils::SERIAL_COUNTER.next_serial());
-            }
-        }
-        if self.presentation.is_rootless() {
-            if !was_toplevel && let Some(root) = affected_root {
-                self.rootless_dirty_surfaces.insert(root);
-            }
-            self.needs_redraw = !self.rootless_dirty_surfaces.is_empty();
-        } else {
-            self.needs_redraw = true;
-        }
-        if self.presentation.is_rootless() {
-            let _ = self.loop_signal.send(
-                crate::messages::CompositorMessage::RootlessSurfaceDestroyed(surface_id.clone()),
-            );
-        }
-        if was_toplevel && self.presentation.is_rootless() {
-            let _ = self.loop_signal.send(
-                crate::messages::CompositorMessage::RootlessToplevelDestroyed(surface_id.clone()),
-            );
-        }
+        self.remove_surface_from_scene(surface, was_toplevel);
+        let _ = self
+            .loop_signal
+            .send(crate::messages::CompositorMessage::SurfaceDestroyed(
+                surface_id.clone(),
+            ));
         log::info!("Removed destroyed surface {surface_id:?} from the compositor layout");
     }
 }
@@ -1344,7 +1427,20 @@ impl XdgShellHandler for AppState {
     }
     fn new_toplevel(&mut self, surface: smithay::wayland::shell::xdg::ToplevelSurface) {
         log::info!("New XDG Toplevel Created: {:?}", surface.wl_surface().id());
-        if !self.toplevels.contains(&surface) {
+        // Smithay's ToplevelSurface equality only compares wl_surface, not the role.
+        if !self
+            .toplevels
+            .iter()
+            .any(|known| known.xdg_toplevel() == surface.xdg_toplevel())
+        {
+            if let Some(previous) = self
+                .toplevels
+                .iter()
+                .find(|known| known.wl_surface() == surface.wl_surface())
+                .cloned()
+            {
+                self.toplevel_destroyed(previous);
+            }
             self.toplevels.push(surface.clone());
             self.output.enter(surface.wl_surface());
             if self.presentation.is_rootless() {
@@ -1388,6 +1484,21 @@ impl XdgShellHandler for AppState {
         surface: smithay::wayland::shell::xdg::PopupSurface,
         positioner: smithay::wayland::shell::xdg::PositionerState,
     ) {
+        if self
+            .popups
+            .iter()
+            .any(|known| known.xdg_popup() == surface.xdg_popup())
+        {
+            return;
+        }
+        if let Some(previous) = self
+            .popups
+            .iter()
+            .find(|known| known.wl_surface() == surface.wl_surface())
+            .cloned()
+        {
+            self.popup_destroyed(previous);
+        }
         let geo = positioner.get_geometry();
         surface.with_pending_state(|state| {
             state.geometry = geo;
@@ -1408,6 +1519,25 @@ impl XdgShellHandler for AppState {
             self.rootless_dirty_surfaces.insert(root);
         }
         self.needs_redraw = true;
+    }
+    fn toplevel_destroyed(&mut self, surface: smithay::wayland::shell::xdg::ToplevelSurface) {
+        // A late callback for an old role must not unmap its replacement.
+        if self
+            .toplevels
+            .iter()
+            .any(|known| known.xdg_toplevel() == surface.xdg_toplevel())
+        {
+            self.remove_surface_from_scene(surface.wl_surface(), true);
+        }
+    }
+    fn popup_destroyed(&mut self, surface: smithay::wayland::shell::xdg::PopupSurface) {
+        if self
+            .popups
+            .iter()
+            .any(|known| known.xdg_popup() == surface.xdg_popup())
+        {
+            self.remove_surface_from_scene(surface.wl_surface(), false);
+        }
     }
     fn grab(
         &mut self,
@@ -1698,16 +1828,23 @@ impl SelectionHandler for AppState {
         } else {
             return;
         };
-        log::info!("Clipboard: Wayland client requested macOS contents as {mime_type}");
-        std::thread::spawn(move || {
-            if let Some(payload) = payload {
-                if let Err(error) = write_clipboard_payload(fd, payload.as_bytes()) {
-                    crate::diagnostics::record_clipboard_host_failure(format!(
-                        "Failed to send macOS clipboard contents to Wayland: {error}"
-                    ));
-                }
-            }
-        });
+        let Some(payload) = payload else {
+            return;
+        };
+        if let Err(error) =
+            self.outgoing_clipboard_transfers
+                .spawn(payload.as_bytes().len(), move || {
+                    if let Err(error) = write_clipboard_payload(fd, payload.as_bytes()) {
+                        crate::diagnostics::record_clipboard_host_failure(format!(
+                            "Failed to send macOS clipboard contents to Wayland: {error}"
+                        ));
+                    }
+                })
+        {
+            crate::diagnostics::record_clipboard_host_failure(format!(
+                "Unable to start macOS clipboard transfer: {error}"
+            ));
+        }
     }
 }
 impl DataDeviceHandler for AppState {
@@ -2024,6 +2161,432 @@ fn preferred_clipboard_text_mime(mime_types: &[String]) -> Option<String> {
 }
 
 #[cfg(test)]
+mod surface_ancestry_tests {
+    use super::{MAX_SURFACE_ANCESTORS, bounded_parent_chain};
+
+    #[test]
+    fn accepts_a_root_and_mixed_popup_subsurface_ancestry() {
+        assert_eq!(bounded_parent_chain(0, |id| *id, |_| None), Some(vec![0]));
+        assert_eq!(
+            bounded_parent_chain(
+                0,
+                |id| *id,
+                |id| match id {
+                    0 => Some(1), // subsurface -> popup
+                    1 => Some(2), // popup -> subsurface
+                    2 => Some(3), // subsurface -> toplevel
+                    _ => None,
+                }
+            ),
+            Some(vec![0, 1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn rejects_self_and_two_node_cycles_before_revisiting_a_parent() {
+        let mut calls = 0;
+        assert!(
+            bounded_parent_chain(
+                0,
+                |id| *id,
+                |_| {
+                    calls += 1;
+                    Some(0)
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(calls, 1);
+        calls = 0;
+        assert!(
+            bounded_parent_chain(
+                0,
+                |id| *id,
+                |id| {
+                    calls += 1;
+                    Some(1 - id)
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn accepts_the_depth_boundary_and_bounds_acyclic_walks() {
+        let chain = bounded_parent_chain(
+            0,
+            |id| *id,
+            |id| (*id + 1 < MAX_SURFACE_ANCESTORS).then_some(id + 1),
+        )
+        .unwrap();
+        assert_eq!(chain.len(), MAX_SURFACE_ANCESTORS);
+        let mut calls = 0;
+        assert!(
+            bounded_parent_chain(
+                0,
+                |id| *id,
+                |id| {
+                    calls += 1;
+                    Some(id + 1)
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(calls, MAX_SURFACE_ANCESTORS);
+        // A rejected client's graph does not poison the next independent walk.
+        assert_eq!(bounded_parent_chain(5, |id| *id, |_| None), Some(vec![5]));
+    }
+}
+
+#[cfg(test)]
+mod role_lifecycle_tests {
+    use super::*;
+    use crate::messages::CompositorMessage;
+    use crate::presentation::PresentationMode;
+    use smithay::reexports::wayland_server::Display;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // An in-process protocol peer exercises the real destruction callbacks without
+    // opening native windows or requiring client-side XDG protocol features.
+    struct Scene {
+        display: Display<AppState>,
+        state: AppState,
+        peer: UnixStream,
+        messages: mpsc::Receiver<CompositorMessage>,
+        next_id: u32,
+        compositor: u32,
+        shell: u32,
+    }
+
+    fn word(bytes: &[u8]) -> u32 {
+        u32::from_ne_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    impl Scene {
+        fn new(mode: PresentationMode) -> Self {
+            let display = Display::new().unwrap();
+            let (sender, messages) = mpsc::channel();
+            let state = AppState::new(
+                &display.handle(),
+                1.0,
+                crate::event_loop_signal::Sender::with_waker(sender, || {}),
+                mode,
+                800,
+                600,
+            )
+            .unwrap();
+            let (peer, server) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            display
+                .handle()
+                .insert_client(
+                    server,
+                    Arc::new(ClientState {
+                        compositor_state: CompositorClientState::default(),
+                    }),
+                )
+                .unwrap();
+            let mut scene = Self {
+                display,
+                state,
+                peer,
+                messages,
+                next_id: 3,
+                compositor: 0,
+                shell: 0,
+            };
+            scene.request(1, 1, &[2]); // wl_display.get_registry
+            let globals = scene.roundtrip();
+            for (object, opcode, body) in globals {
+                if object == 2 && opcode == 0 {
+                    let length = word(&body[4..]) as usize;
+                    let interface = std::str::from_utf8(&body[8..8 + length - 1]).unwrap();
+                    if interface == "wl_compositor" {
+                        scene.compositor = scene.bind(word(&body), interface);
+                    } else if interface == "xdg_wm_base" {
+                        scene.shell = scene.bind(word(&body), interface);
+                    }
+                }
+            }
+            assert_ne!(scene.compositor, 0);
+            assert_ne!(scene.shell, 0);
+            scene.roundtrip();
+            scene
+        }
+
+        fn id(&mut self) -> u32 {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
+        fn send(&mut self, object: u32, opcode: u16, body: &[u8]) {
+            let mut bytes = object.to_ne_bytes().to_vec();
+            bytes.extend((((body.len() as u32 + 8) << 16) | u32::from(opcode)).to_ne_bytes());
+            bytes.extend(body);
+            self.peer.write_all(&bytes).unwrap();
+        }
+
+        fn request(&mut self, object: u32, opcode: u16, words: &[u32]) {
+            let body: Vec<_> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+            self.send(object, opcode, &body);
+        }
+
+        fn bind(&mut self, global: u32, interface: &str) -> u32 {
+            let id = self.id();
+            let mut body = global.to_ne_bytes().to_vec();
+            body.extend(((interface.len() + 1) as u32).to_ne_bytes());
+            body.extend(interface.as_bytes());
+            body.push(0);
+            body.resize(body.len().next_multiple_of(4), 0);
+            body.extend(1u32.to_ne_bytes());
+            body.extend(id.to_ne_bytes());
+            self.send(2, 0, &body);
+            id
+        }
+
+        fn roundtrip(&mut self) -> Vec<(u32, u16, Vec<u8>)> {
+            let callback = self.id();
+            self.request(1, 0, &[callback]);
+            self.display.dispatch_clients(&mut self.state).unwrap();
+            self.display.flush_clients().unwrap();
+            let mut events = Vec::new();
+            loop {
+                let mut header = [0; 8];
+                self.peer.read_exact(&mut header).unwrap();
+                let object = word(&header);
+                let opcode = word(&header[4..]) as u16;
+                let size = (word(&header[4..]) >> 16) as usize;
+                assert!(size >= 8);
+                let mut body = vec![0; size - 8];
+                self.peer.read_exact(&mut body).unwrap();
+                assert!(!(object == 1 && opcode == 0), "wl_display.error: {body:?}");
+                if object == callback && opcode == 0 {
+                    return events;
+                }
+                events.push((object, opcode, body));
+            }
+        }
+
+        fn xdg_surface(&mut self) -> (u32, u32) {
+            let wl = self.id();
+            self.request(self.compositor, 0, &[wl]);
+            let xdg = self.id();
+            self.request(self.shell, 2, &[xdg, wl]);
+            (wl, xdg)
+        }
+
+        fn toplevel(&mut self) -> (u32, u32, u32) {
+            let (wl, xdg) = self.xdg_surface();
+            let role = self.id();
+            self.request(xdg, 1, &[role]);
+            self.roundtrip();
+            (wl, xdg, role)
+        }
+
+        fn popup(&mut self, xdg: u32, parent: u32, positioner: u32) -> u32 {
+            let role = self.id();
+            self.request(xdg, 2, &[role, parent, positioner]);
+            self.roundtrip();
+            role
+        }
+
+        fn seed_scene_state(&mut self, surface: &WlSurface, root: &WlSurface) {
+            let callback = self.id();
+            self.request(surface.id().protocol_id(), 3, &[callback]); // wl_surface.frame
+            self.roundtrip();
+            let callback = smithay::wayland::compositor::with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                    .pending()
+                    .frame_callbacks
+                    .pop()
+                    .unwrap()
+            });
+            self.state
+                .pending_frame_callbacks
+                .push(PendingFrameCallback {
+                    root_surface: Some(root.id()),
+                    source_surface: surface.clone(),
+                    callback,
+                    trace_commit: None,
+                });
+            self.state.surface_positions.insert(surface.id(), (1, 2));
+            self.state
+                .pointer_surface_buffers
+                .insert(surface.id(), (10, 10));
+            self.state.drag_state = Some((surface.id(), (1.0, 2.0)));
+            self.state.start_drag_request = Some(surface.id());
+            let keyboard = self.state.seat.get_keyboard().unwrap();
+            keyboard.set_focus(
+                &mut self.state,
+                Some(surface.clone()),
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+            );
+        }
+
+        fn assert_retired(&self, surface: &WlSurface) {
+            assert!(!self.state.surface_positions.contains_key(&surface.id()));
+            assert!(
+                !self
+                    .state
+                    .pointer_surface_buffers
+                    .contains_key(&surface.id())
+            );
+            assert!(self.state.pending_frame_callbacks.is_empty());
+            assert!(self.state.drag_state.is_none());
+            assert!(self.state.start_drag_request.is_none());
+            assert!(
+                self.state
+                    .seat
+                    .get_keyboard()
+                    .unwrap()
+                    .current_focus()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_trace_ids_survive_retries_and_newer_commits() {
+        let mut scene = Scene::new(PresentationMode::Desktop);
+        scene.toplevel();
+        let root = scene.state.toplevels[0].wl_surface().id();
+        scene.state.trace_frames.insert(root.clone(), 11);
+        assert_eq!(scene.state.trace_frames_for(Some(&root)), [11]);
+        assert_eq!(scene.state.trace_frames_for(Some(&root)), [11]);
+        scene.state.trace_frames.insert(root.clone(), 12);
+        scene.state.retire_trace_frames(&[11]);
+        assert_eq!(scene.state.trace_frames_for(Some(&root)), [12]);
+        scene.state.retire_trace_frames(&[12]);
+        assert!(scene.state.trace_frames_for(None).is_empty());
+    }
+
+    #[test]
+    fn toplevel_role_destruction_and_recreation_are_independent_of_wl_surface() {
+        for mode in [PresentationMode::Desktop, PresentationMode::Rootless] {
+            let mut scene = Scene::new(mode);
+            let (wl, xdg, role) = scene.toplevel();
+            let old = scene.state.toplevels[0].clone();
+            let surface = old.wl_surface().clone();
+            scene.seed_scene_state(&surface, &surface);
+            scene.state.trace_frames.insert(surface.id(), 1);
+            let _ = scene.messages.try_iter().collect::<Vec<_>>();
+            scene.request(role, 0, &[]);
+            scene.roundtrip();
+            assert!(surface.is_alive());
+            assert!(scene.state.toplevels.is_empty());
+            assert!(scene.state.layout.tiles.is_empty());
+            assert!(!scene.state.rootless_dirty_surfaces.contains(&surface.id()));
+            assert!(!scene.state.trace_frames.contains_key(&surface.id()));
+            scene.assert_retired(&surface);
+            let messages: Vec<_> = scene.messages.try_iter().collect();
+            assert_eq!(messages.iter().filter(|message| matches!(
+                message, CompositorMessage::RootlessToplevelDestroyed(id) if id == &surface.id()
+            )).count(), usize::from(mode.is_rootless()));
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, CompositorMessage::SurfaceDestroyed(_)))
+            );
+
+            let replacement = scene.id();
+            scene.request(xdg, 1, &[replacement]);
+            scene.roundtrip();
+            assert_eq!(scene.state.toplevels.len(), 1);
+            assert_ne!(scene.state.toplevels[0].xdg_toplevel(), old.xdg_toplevel());
+            assert_eq!(scene.state.toplevels[0].wl_surface(), &surface);
+            if mode == PresentationMode::Desktop {
+                assert_eq!(
+                    scene.state.layout.tiles[0]
+                        .toplevel
+                        .xdg_toplevel()
+                        .id()
+                        .protocol_id(),
+                    replacement
+                );
+            }
+            scene.state.toplevel_destroyed(old); // stale role identity must be harmless
+            assert_eq!(scene.state.toplevels.len(), 1);
+            scene.request(replacement, 0, &[]);
+            scene.request(xdg, 0, &[]);
+            scene.request(wl, 0, &[]);
+            scene.roundtrip();
+            assert_eq!(
+                scene
+                    .messages
+                    .try_iter()
+                    .filter(|message| matches!(
+                        message, CompositorMessage::SurfaceDestroyed(id) if id == &surface.id()
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn popup_role_destruction_repaints_its_owner_and_allows_recreation() {
+        let mut scene = Scene::new(PresentationMode::Rootless);
+        let (_, parent, _) = scene.toplevel();
+        let root = scene.state.toplevels[0].wl_surface().clone();
+        let (_, xdg) = scene.xdg_surface();
+        let positioner = scene.id();
+        scene.request(scene.shell, 1, &[positioner]);
+        scene.request(positioner, 1, &[4, 4]);
+        scene.request(positioner, 2, &[0, 0, 4, 4]);
+        let role = scene.popup(xdg, parent, positioner);
+        let old = scene.state.popups[0].clone();
+        let surface = old.wl_surface().clone();
+        scene.seed_scene_state(&surface, &root);
+        scene.state.rootless_dirty_surfaces.clear();
+        let _ = scene.messages.try_iter().collect::<Vec<_>>();
+        scene.request(role, 0, &[]);
+        scene.roundtrip();
+        assert!(surface.is_alive());
+        assert!(scene.state.popups.is_empty());
+        assert_eq!(scene.state.toplevels.len(), 1);
+        assert!(scene.state.rootless_dirty_surfaces.contains(&root.id()));
+        assert!(scene.state.needs_redraw);
+        scene.assert_retired(&surface);
+        assert!(scene.messages.try_iter().next().is_none());
+        scene.popup(xdg, parent, positioner);
+        assert_eq!(scene.state.popups.len(), 1);
+        assert_ne!(scene.state.popups[0].xdg_popup(), old.xdg_popup());
+        scene.state.popup_destroyed(old);
+        assert_eq!(scene.state.popups.len(), 1);
+    }
+
+    #[test]
+    fn every_non_cursor_wl_surface_destruction_notifies_both_presentations() {
+        for mode in [PresentationMode::Desktop, PresentationMode::Rootless] {
+            let mut scene = Scene::new(mode);
+            let wl = scene.id();
+            scene.request(scene.compositor, 0, &[wl]);
+            scene.request(wl, 0, &[]);
+            scene.roundtrip();
+            assert_eq!(
+                scene
+                    .messages
+                    .try_iter()
+                    .filter(|message| matches!(
+                        message, CompositorMessage::SurfaceDestroyed(id) if id.protocol_id() == wl
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod pointer_axis_tests {
     use super::PointerAxisTracker;
     use smithay::backend::input::AxisSource;
@@ -2328,6 +2891,26 @@ mod clipboard_tests {
         reader.read_to_end(&mut received).unwrap();
         producer.join().unwrap().unwrap();
         assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn clipboard_writer_releases_a_disconnected_receiver_without_waiting_for_timeout() {
+        let (receiver, sender) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(receiver);
+        let (completed, result) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let error =
+                    super::write_clipboard_payload(sender.into(), b"clipboard").unwrap_err();
+                completed.send(error.kind()).unwrap();
+            })
+            .unwrap();
+        assert_eq!(
+            result
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]

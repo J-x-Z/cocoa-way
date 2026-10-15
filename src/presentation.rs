@@ -102,10 +102,18 @@ pub fn configure_toplevel(
     toplevel.send_configure();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootlessRenderOutcome {
+    Submitted(usize),
+    DeferredSubmission,
+    RetryDrawable,
+    Suspended,
+}
+
 pub fn render_rootless_window(
     rootless: &mut RootlessWindow,
     popups: &[smithay::wayland::shell::xdg::PopupSurface],
-) -> Option<usize> {
+) -> RootlessRenderOutcome {
     use smithay::reexports::wayland_server::Resource;
 
     let current_scale = rootless.renderer.window.scale_factor();
@@ -129,13 +137,13 @@ pub fn render_rootless_window(
     }
     let size = rootless.renderer.window.inner_size();
     if size.width == 0 || size.height == 0 {
-        return None;
+        return RootlessRenderOutcome::Suspended;
     }
     if size.width != rootless.renderer.width || size.height != rootless.renderer.height {
         rootless.renderer.resize(size.width, size.height);
     }
     if !rootless.renderer.clear(0.08, 0.08, 0.1, 1.0) {
-        return None;
+        return RootlessRenderOutcome::RetryDrawable;
     }
     let scale = rootless.scale_factor;
     let root_surface = rootless.toplevel.wl_surface();
@@ -163,13 +171,21 @@ pub fn render_rootless_window(
         render_toplevel_tree(&mut rootless.renderer, &rootless.toplevel, (0, 0), scale);
     rendered += render_toplevel_popups(&mut rootless.renderer, root_surface, popups, (0, 0), scale);
 
+    let deferred = toplevel_has_pending_buffer_uploads(&rootless.toplevel, popups);
+    if deferred {
+        rootless.renderer.discard_trace_frame();
+    }
     match rootless.renderer.swap_buffers() {
         Ok(true) => {}
-        Ok(false) => return None,
+        Ok(false) => return RootlessRenderOutcome::RetryDrawable,
         Err(error) => {
             log::error!("Failed to present rootless window: {error}");
-            return None;
+            return RootlessRenderOutcome::RetryDrawable;
         }
+    }
+    if deferred {
+        // A cached fallback can be presented without completing the new commit.
+        return RootlessRenderOutcome::DeferredSubmission;
     }
     if let Some((buffer_width, buffer_height)) =
         rootless.renderer.cached_surface_size(&root_surface.id())
@@ -211,7 +227,7 @@ pub fn render_rootless_window(
             rootless.last_render_metrics = Some(metrics);
         }
     }
-    Some(rendered)
+    RootlessRenderOutcome::Submitted(rendered)
 }
 
 pub fn render_toplevel_tree(
@@ -262,6 +278,60 @@ pub fn render_toplevel_popups(
     rendered
 }
 
+/// Check after rendering and before clearing dirty state or sending callbacks.
+/// Cached fallback draws do not complete a retained commit awaiting upload.
+pub fn toplevel_has_pending_buffer_uploads(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+    popups: &[smithay::wayland::shell::xdg::PopupSurface],
+) -> bool {
+    let root = toplevel.wl_surface();
+    surface_tree_has_pending_buffer_uploads(root)
+        || popups.iter().any(|popup| {
+            popup_root_and_location(popup, popups)
+                .is_some_and(|(popup_root, _)| &popup_root == root)
+                && surface_tree_has_pending_buffer_uploads(popup.wl_surface())
+        })
+}
+
+fn surface_tree_has_pending_buffer_uploads(
+    root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> bool {
+    use smithay::reexports::wayland_server::Resource;
+    use smithay::wayland::compositor::{
+        BufferAssignment, SurfaceAttributes, TraversalAction, with_surface_tree_downward,
+    };
+
+    let pending = std::cell::Cell::new(false);
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, _| {
+            if pending.get() {
+                TraversalAction::Break
+            } else {
+                TraversalAction::DoChildren(())
+            }
+        },
+        |surface, states, _| {
+            if surface.is_alive()
+                && matches!(
+                    states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .buffer
+                        .as_ref(),
+                    Some(BufferAssignment::NewBuffer(_))
+                )
+            {
+                pending.set(true);
+            }
+        },
+        |_, _, _| !pending.get(),
+    );
+    pending.get()
+}
+
 pub fn surface_under(
     rootless: &RootlessWindow,
     popups: &[smithay::wayland::shell::xdg::PopupSurface],
@@ -270,26 +340,92 @@ pub fn surface_under(
     smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     smithay::utils::Point<f64, smithay::utils::Logical>,
 )> {
-    let root_surface = rootless.toplevel.wl_surface();
+    toplevel_surface_under_with_sizes(&rootless.toplevel, popups, (0, 0).into(), location, &|id| {
+        rootless.renderer.cached_surface_size(id)
+    })
+}
+
+/// Hit the desktop in reverse draw order, including popups/subsurfaces outside
+/// their tile. Both `location` and the returned surface origin are desktop
+/// logical coordinates; pass the origin unchanged to Smithay pointer motion.
+pub fn desktop_surface_under(
+    renderer: &crate::metal_renderer::MetalRenderer,
+    tiles: &[crate::layout::Tile],
+    popups: &[smithay::wayland::shell::xdg::PopupSurface],
+    location: smithay::utils::Point<f64, smithay::utils::Logical>,
+) -> Option<(
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
+)> {
+    desktop_surface_under_with_sizes(tiles, popups, location, &|id| {
+        renderer.cached_surface_size(id)
+    })
+}
+
+fn desktop_surface_under_with_sizes(
+    tiles: &[crate::layout::Tile],
+    popups: &[smithay::wayland::shell::xdg::PopupSurface],
+    location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    buffer_size: &impl Fn(&smithay::reexports::wayland_server::backend::ObjectId) -> Option<(i32, i32)>,
+) -> Option<(
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
+)> {
+    // Match rendering: each tile's tree, then its popups, then the next tile.
+    // A tile rectangle is not a clip or an input region.
+    tiles.iter().rev().find_map(|tile| {
+        toplevel_surface_under_with_sizes(
+            &tile.toplevel,
+            popups,
+            tile.position,
+            location,
+            buffer_size,
+        )
+    })
+}
+
+fn toplevel_surface_under_with_sizes(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+    popups: &[smithay::wayland::shell::xdg::PopupSurface],
+    window_origin: smithay::utils::Point<i32, smithay::utils::Logical>,
+    location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    buffer_size: &impl Fn(&smithay::reexports::wayland_server::backend::ObjectId) -> Option<(i32, i32)>,
+) -> Option<(
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
+)> {
+    if !toplevel.alive() || !location.x.is_finite() || !location.y.is_finite() {
+        return None;
+    }
+    let root_surface = toplevel.wl_surface();
     for popup in popups.iter().rev() {
         let Some((popup_root, popup_location)) = popup_root_and_location(popup, popups) else {
             continue;
         };
         if &popup_root == root_surface
-            && let Some(hit) = surface_tree_hit(
-                &rootless.renderer,
-                popup.wl_surface(),
-                popup_location,
-                location,
-            )
+            && let Some(origin) = checked_location_sum(window_origin, popup_location)
+            && let Some(hit) = surface_tree_hit(buffer_size, popup.wl_surface(), origin, location)
         {
             return Some(hit);
         }
     }
-    let root_origin = toplevel_window_geometry(&rootless.toplevel)
-        .map(|geometry| (-geometry.loc.x, -geometry.loc.y).into())
-        .unwrap_or_else(|| (0, 0).into());
-    surface_tree_hit(&rootless.renderer, root_surface, root_origin, location)
+    let root_origin = if let Some(geometry) = toplevel_window_geometry(toplevel) {
+        (
+            window_origin.x.checked_sub(geometry.loc.x)?,
+            window_origin.y.checked_sub(geometry.loc.y)?,
+        )
+            .into()
+    } else {
+        window_origin
+    };
+    surface_tree_hit(buffer_size, root_surface, root_origin, location)
+}
+
+fn checked_location_sum(
+    left: smithay::utils::Point<i32, smithay::utils::Logical>,
+    right: smithay::utils::Point<i32, smithay::utils::Logical>,
+) -> Option<smithay::utils::Point<i32, smithay::utils::Logical>> {
+    Some((left.x.checked_add(right.x)?, left.y.checked_add(right.y)?).into())
 }
 
 fn toplevel_window_geometry(
@@ -311,11 +447,21 @@ fn popup_root_and_location(
     smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     smithay::utils::Point<i32, smithay::utils::Logical>,
 )> {
+    use smithay::reexports::wayland_server::Resource;
+
+    if !popup.alive() {
+        return None;
+    }
     let mut parent = popup.get_parent_surface()?;
     let mut location = popup
         .with_committed_state(|state| state.map(|state| state.geometry.loc).unwrap_or_default());
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(popup.wl_surface().id());
     loop {
-        while let Some(subsurface_parent) = smithay::wayland::compositor::get_parent(&parent) {
+        if !parent.is_alive() || !visited.insert(parent.id()) {
+            return None;
+        }
+        if let Some(subsurface_parent) = smithay::wayland::compositor::get_parent(&parent) {
             let offset = smithay::wayland::compositor::with_states(&parent, |states| {
                 states
                     .cached_state
@@ -323,8 +469,9 @@ fn popup_root_and_location(
                     .current()
                     .location
             });
-            location += offset;
+            location = checked_location_sum(location, offset)?;
             parent = subsurface_parent;
+            continue;
         }
         let Some(parent_popup) = popups
             .iter()
@@ -332,9 +479,10 @@ fn popup_root_and_location(
         else {
             break;
         };
-        location += parent_popup.with_committed_state(|state| {
+        let offset = parent_popup.with_committed_state(|state| {
             state.map(|state| state.geometry.loc).unwrap_or_default()
         });
+        location = checked_location_sum(location, offset)?;
         parent = parent_popup.get_parent_surface()?;
     }
     Some((parent, location))
@@ -346,6 +494,7 @@ fn render_surface_tree(
     origin: (i32, i32),
     scale: f64,
 ) -> usize {
+    use crate::metal_renderer::PixelDrawResult;
     use smithay::reexports::wayland_server::Resource;
     use smithay::wayland::compositor::{
         BufferAssignment, SubsurfaceCachedState, SurfaceAttributes, TraversalAction,
@@ -393,7 +542,7 @@ fn render_surface_tree(
                 Some(BufferAssignment::NewBuffer(buffer)) => {
                     let buffer_scale = current.buffer_scale.max(1);
                     let buffer_id = buffer.id();
-                    if crate::render::with_buffer_pixels(
+                    let result = crate::render::with_buffer_pixels(
                         &buffer,
                         |width, height, bytes_per_row, pixels, alpha| {
                             let buffer_damage = buffer_damage_rects(
@@ -433,18 +582,19 @@ fn render_surface_tree(
                                 pixels,
                                 alpha,
                                 &buffer_damage,
-                            );
-                            rendered += 1;
+                            )
                         },
                     )
-                    .is_none()
-                        && renderer.draw_from_cache(&surface_id, x, y, scale, viewport_destination)
-                    {
-                        rendered += 1;
-                    }
-                    // Cocoa-Way copies SHM pixels into a Metal texture before
-                    // presenting, so the client can reuse this buffer now.
-                    buffer.release();
+                    // Snapshot preparation failures are terminal for this commit.
+                    .unwrap_or(PixelDrawResult::Rejected);
+                    rendered += finish_buffer_upload(
+                        current,
+                        buffer,
+                        damage,
+                        result,
+                        || renderer.draw_from_cache(&surface_id, x, y, scale, viewport_destination),
+                        |buffer| buffer.release(),
+                    );
                 }
                 Some(BufferAssignment::Removed) => renderer.evict_texture(&surface_id),
                 None => {
@@ -457,6 +607,38 @@ fn render_surface_tree(
         |_, _, _| true,
     );
     rendered
+}
+
+fn finish_buffer_upload(
+    current: &mut smithay::wayland::compositor::SurfaceAttributes,
+    buffer: smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    damage: Vec<smithay::wayland::compositor::Damage>,
+    result: crate::metal_renderer::PixelDrawResult,
+    draw_cached: impl FnOnce() -> bool,
+    release: impl FnOnce(&smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer),
+) -> usize {
+    use crate::metal_renderer::PixelDrawResult;
+    use smithay::wayland::compositor::BufferAssignment;
+
+    match result {
+        PixelDrawResult::Deferred => {
+            // The surface lock prevents a newer commit while we restore this
+            // assignment and its original (not buffer-converted) damage.
+            current.buffer = Some(BufferAssignment::NewBuffer(buffer));
+            current.damage = damage;
+            let _ = draw_cached();
+            0
+        }
+        PixelDrawResult::Drawn => {
+            release(&buffer);
+            1
+        }
+        PixelDrawResult::Rejected => {
+            let rendered = usize::from(draw_cached());
+            release(&buffer);
+            rendered
+        }
+    }
 }
 
 fn buffer_damage_rects(
@@ -501,7 +683,7 @@ fn buffer_damage_rects(
 }
 
 fn surface_tree_hit(
-    renderer: &crate::metal_renderer::MetalRenderer,
+    buffer_size: &impl Fn(&smithay::reexports::wayland_server::backend::ObjectId) -> Option<(i32, i32)>,
     root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     origin: smithay::utils::Point<i32, smithay::utils::Logical>,
     point: smithay::utils::Point<f64, smithay::utils::Logical>,
@@ -519,44 +701,52 @@ fn surface_tree_hit(
         root,
         origin,
         |_, states, location| {
+            if hit.borrow().is_some() {
+                return TraversalAction::Break;
+            }
             let offset = states
                 .cached_state
                 .get::<SubsurfaceCachedState>()
                 .current()
                 .location;
-            TraversalAction::DoChildren(*location + offset)
+            match checked_location_sum(*location, offset) {
+                Some(location) => TraversalAction::DoChildren(location),
+                None => TraversalAction::SkipChildren,
+            }
         },
         |surface, states, location| {
+            // Smithay's post-filter runs after all siblings, including any
+            // below the parent. Never let a later processor overwrite a hit.
+            if hit.borrow().is_some() || !surface.is_alive() {
+                return;
+            }
             let offset = states
                 .cached_state
                 .get::<SubsurfaceCachedState>()
                 .current()
                 .location;
-            let surface_location = *location + offset;
+            let Some(surface_location) = checked_location_sum(*location, offset) else {
+                return;
+            };
             let surface_id = surface.id();
-            let Some((buffer_width, buffer_height)) = renderer.cached_surface_size(&surface_id)
-            else {
+            let Some(size) = buffer_size(&surface_id) else {
                 return;
             };
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             let current = attributes.current();
-            let viewport_destination = states
+            let viewport = *states
                 .cached_state
                 .get::<smithay::wayland::viewporter::ViewportCachedState>()
-                .current()
-                .dst;
-            let buffer_scale = current.buffer_scale.max(1);
-            let width = viewport_destination
-                .map(|destination| destination.w)
-                .unwrap_or(buffer_width / buffer_scale);
-            let height = viewport_destination
-                .map(|destination| destination.h)
-                .unwrap_or(buffer_height / buffer_scale);
+                .current();
+            let size = surface_logical_size(
+                size,
+                current.buffer_scale,
+                current.buffer_transform,
+                viewport,
+            );
             let local = point - surface_location.to_f64();
-            let within_buffer = local.x >= 0.0
-                && local.y >= 0.0
-                && local.x < f64::from(width)
-                && local.y < f64::from(height);
+            let within_buffer =
+                local.x >= 0.0 && local.y >= 0.0 && local.x < size.w && local.y < size.h;
             let within_input = current.input_region.as_ref().is_none_or(|region| {
                 region.contains((local.x.floor() as i32, local.y.floor() as i32))
             });
@@ -569,9 +759,665 @@ fn surface_tree_hit(
     hit.into_inner()
 }
 
+/// Logical surface bounds after buffer transform/scale and optional viewport.
+/// A source crop changes the size even when no destination was specified.
+pub(crate) fn surface_logical_size(
+    buffer_size: (i32, i32),
+    buffer_scale: i32,
+    transform: smithay::reexports::wayland_server::protocol::wl_output::Transform,
+    viewport: smithay::wayland::viewporter::ViewportCachedState,
+) -> smithay::utils::Size<f64, smithay::utils::Logical> {
+    use smithay::reexports::wayland_server::protocol::wl_output::Transform;
+
+    if let Some(size) = viewport.size() {
+        return size.to_f64();
+    }
+    let (width, height) = match transform {
+        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
+            (buffer_size.1, buffer_size.0)
+        }
+        _ => buffer_size,
+    };
+    let scale = f64::from(buffer_scale.max(1));
+    (f64::from(width) / scale, f64::from(height) / scale).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PresentationMode, honor_rootless_maximize};
+    use crate::metal_renderer::PixelDrawResult;
+
+    use smithay::{
+        delegate_compositor, delegate_xdg_shell,
+        reexports::wayland_server::{
+            Client, Display, DisplayHandle, Resource,
+            backend::{ClientData, ObjectId},
+            protocol::{
+                wl_buffer::WlBuffer, wl_output::Transform, wl_seat::WlSeat, wl_surface::WlSurface,
+            },
+        },
+        utils::{Logical, Point, Rectangle, Serial},
+        wayland::{
+            compositor::{
+                self, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+                Damage, RectangleKind, RegionAttributes, SubsurfaceCachedState, SurfaceAttributes,
+            },
+            shell::xdg::{
+                PopupCachedState, PopupConfigure, PopupState, PopupSurface, PositionerState,
+                SurfaceCachedState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            },
+            viewporter::ViewportCachedState,
+        },
+    };
+    use std::{
+        collections::HashMap,
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        sync::Arc,
+    };
+
+    #[derive(Default)]
+    struct TestClient(CompositorClientState);
+    impl ClientData for TestClient {}
+
+    struct TestState {
+        compositor: CompositorState,
+        shell: XdgShellState,
+        toplevels: Vec<ToplevelSurface>,
+        popups: Vec<PopupSurface>,
+    }
+
+    impl CompositorHandler for TestState {
+        fn compositor_state(&mut self) -> &mut CompositorState {
+            &mut self.compositor
+        }
+        fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+            &client.get_data::<TestClient>().unwrap().0
+        }
+        fn commit(&mut self, _surface: &WlSurface) {}
+    }
+
+    impl XdgShellHandler for TestState {
+        fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+            &mut self.shell
+        }
+        fn new_toplevel(&mut self, surface: ToplevelSurface) {
+            self.toplevels.push(surface);
+        }
+        fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+            self.popups.push(surface);
+        }
+        fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
+        fn reposition_request(
+            &mut self,
+            _surface: PopupSurface,
+            _positioner: PositionerState,
+            _token: u32,
+        ) {
+        }
+    }
+
+    delegate_compositor!(TestState);
+    delegate_xdg_shell!(TestState);
+
+    // Real Smithay trees over a socket pair, with modeled committed geometry
+    // and texture sizes. No Metal device, native window, or pixel upload needed.
+    struct Scene {
+        display: Display<TestState>,
+        state: TestState,
+        socket: UnixStream,
+        client: Client,
+        next_id: u32,
+        compositor: u32,
+        subcompositor: u32,
+        shell: u32,
+        sizes: HashMap<ObjectId, (i32, i32)>,
+        subsurfaces: HashMap<ObjectId, u32>,
+    }
+
+    impl Scene {
+        fn new() -> Self {
+            let display = Display::new().unwrap();
+            let mut dh = display.handle();
+            let state = TestState {
+                compositor: CompositorState::new::<TestState>(&dh),
+                shell: XdgShellState::new::<TestState>(&dh),
+                toplevels: Vec::new(),
+                popups: Vec::new(),
+            };
+            let (socket, server) = UnixStream::pair().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let client = dh
+                .insert_client(server, Arc::new(TestClient::default()))
+                .unwrap();
+            let mut scene = Self {
+                display,
+                state,
+                socket,
+                client,
+                next_id: 2,
+                compositor: 0,
+                subcompositor: 0,
+                shell: 0,
+                sizes: HashMap::new(),
+                subsurfaces: HashMap::new(),
+            };
+            let registry = scene.id();
+            scene.request(1, 1, &[registry]);
+            let globals: HashMap<_, _> = scene
+                .sync()
+                .into_iter()
+                .filter_map(|(id, opcode, body)| {
+                    if id != registry || opcode != 0 {
+                        return None;
+                    }
+                    let length = Self::word(&body[4..]) as usize;
+                    let interface = String::from_utf8(body[8..8 + length - 1].to_vec()).unwrap();
+                    Some((interface, Self::word(&body)))
+                })
+                .collect();
+            scene.compositor = scene.bind(registry, globals["wl_compositor"], "wl_compositor");
+            scene.subcompositor =
+                scene.bind(registry, globals["wl_subcompositor"], "wl_subcompositor");
+            scene.shell = scene.bind(registry, globals["xdg_wm_base"], "xdg_wm_base");
+            scene.sync();
+            scene
+        }
+
+        fn word(bytes: &[u8]) -> u32 {
+            u32::from_ne_bytes(bytes[..4].try_into().unwrap())
+        }
+        fn id(&mut self) -> u32 {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
+        fn write_request(&mut self, object: u32, opcode: u16, body: &[u8]) {
+            let mut bytes = object.to_ne_bytes().to_vec();
+            bytes.extend((((body.len() as u32 + 8) << 16) | opcode as u32).to_ne_bytes());
+            bytes.extend(body);
+            self.socket.write_all(&bytes).unwrap();
+        }
+
+        fn request(&mut self, object: u32, opcode: u16, args: &[u32]) {
+            let body: Vec<_> = args.iter().flat_map(|arg| arg.to_ne_bytes()).collect();
+            self.write_request(object, opcode, &body);
+        }
+
+        fn bind(&mut self, registry: u32, global: u32, interface: &str) -> u32 {
+            let id = self.id();
+            let mut body = global.to_ne_bytes().to_vec();
+            body.extend(((interface.len() + 1) as u32).to_ne_bytes());
+            body.extend(interface.as_bytes());
+            body.push(0);
+            body.resize(body.len().next_multiple_of(4), 0);
+            body.extend(1u32.to_ne_bytes());
+            body.extend(id.to_ne_bytes());
+            self.write_request(registry, 0, &body);
+            id
+        }
+
+        fn sync(&mut self) -> Vec<(u32, u16, Vec<u8>)> {
+            let callback = self.id();
+            self.request(1, 0, &[callback]);
+            self.display.dispatch_clients(&mut self.state).unwrap();
+            self.display.flush_clients().unwrap();
+            let mut events = Vec::new();
+            loop {
+                let mut header = [0; 8];
+                self.socket.read_exact(&mut header).unwrap();
+                let id = Self::word(&header);
+                let opcode = Self::word(&header[4..]) as u16;
+                let size = (Self::word(&header[4..]) >> 16) as usize;
+                assert!(size >= 8);
+                let mut body = vec![0; size - 8];
+                self.socket.read_exact(&mut body).unwrap();
+                assert!(
+                    !(id == 1 && opcode == 0),
+                    "unexpected protocol error: {body:?}"
+                );
+                if id == callback {
+                    return events;
+                }
+                events.push((id, opcode, body));
+            }
+        }
+
+        fn surface(&mut self, size: (i32, i32)) -> WlSurface {
+            let id = self.id();
+            self.request(self.compositor, 0, &[id]);
+            self.sync();
+            let surface = self
+                .client
+                .object_from_protocol_id::<WlSurface>(&self.display.handle(), id)
+                .unwrap();
+            self.sizes.insert(surface.id(), size);
+            surface
+        }
+
+        fn toplevel(&mut self, size: (i32, i32)) -> (ToplevelSurface, u32) {
+            let surface = self.surface(size);
+            let xdg = self.id();
+            let toplevel = self.id();
+            self.request(self.shell, 2, &[xdg, surface.id().protocol_id()]);
+            self.request(xdg, 1, &[toplevel]);
+            self.sync();
+            (self.state.toplevels.last().unwrap().clone(), xdg)
+        }
+
+        fn popup(
+            &mut self,
+            parent: u32,
+            origin: (i32, i32),
+            size: (i32, i32),
+        ) -> (PopupSurface, u32) {
+            let surface = self.surface(size);
+            let xdg = self.id();
+            let positioner = self.id();
+            let popup = self.id();
+            self.request(self.shell, 2, &[xdg, surface.id().protocol_id()]);
+            self.request(self.shell, 1, &[positioner]);
+            self.request(positioner, 1, &[size.0 as u32, size.1 as u32]);
+            self.request(positioner, 2, &[0, 0, 1, 1]);
+            self.request(xdg, 2, &[popup, parent, positioner]);
+            self.sync();
+            let popup = self.state.popups.last().unwrap().clone();
+            compositor::with_states(&surface, |states| {
+                states
+                    .cached_state
+                    .get::<PopupCachedState>()
+                    .current()
+                    .last_acked = Some(PopupConfigure {
+                    serial: 1.into(),
+                    state: PopupState {
+                        geometry: Rectangle::new(origin.into(), size.into()),
+                        positioner: PositionerState::default(),
+                    },
+                    reposition_token: None,
+                });
+            });
+            (popup, xdg)
+        }
+
+        fn subsurface(
+            &mut self,
+            parent: &WlSurface,
+            origin: (i32, i32),
+            size: (i32, i32),
+        ) -> WlSurface {
+            let surface = self.surface(size);
+            let sub = self.id();
+            self.request(
+                self.subcompositor,
+                1,
+                &[sub, surface.id().protocol_id(), parent.id().protocol_id()],
+            );
+            self.sync();
+            compositor::with_states(&surface, |states| {
+                states
+                    .cached_state
+                    .get::<SubsurfaceCachedState>()
+                    .current()
+                    .location = origin.into();
+            });
+            self.subsurfaces.insert(surface.id(), sub);
+            surface
+        }
+
+        fn hit(
+            &self,
+            tiles: &[crate::layout::Tile],
+            point: (f64, f64),
+        ) -> Option<(WlSurface, Point<f64, Logical>)> {
+            super::desktop_surface_under_with_sizes(
+                tiles,
+                &self.state.popups,
+                point.into(),
+                &|id| self.sizes.get(id).copied(),
+            )
+        }
+    }
+
+    fn input_region(surface: &WlSurface, region: Option<RegionAttributes>) {
+        compositor::with_states(surface, |states| {
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .input_region = region;
+        });
+    }
+
+    fn tile(toplevel: ToplevelSurface, origin: (i32, i32)) -> crate::layout::Tile {
+        crate::layout::Tile::new(toplevel, origin.into(), (100, 100).into())
+    }
+
+    // Ownership/release bookkeeping needs only an inert protocol handle. The
+    // injected release callback records calls without a GPU or SHM allocation.
+    fn inert_buffer(dh: &DisplayHandle) -> WlBuffer {
+        WlBuffer::from_id(dh, ObjectId::null()).unwrap()
+    }
+
+    fn original_upload_damage() -> Vec<Damage> {
+        vec![
+            Damage::Surface(Rectangle::new((-2, 3).into(), (7, 9).into())),
+            Damage::Buffer(Rectangle::new((8, 11).into(), (13, 17).into())),
+        ]
+    }
+
+    #[test]
+    fn deferred_upload_retains_assignment_and_original_damage_without_release() {
+        let display = Display::<()>::new().unwrap();
+        let buffer = inert_buffer(&display.handle());
+        for cached in [false, true] {
+            let mut current = SurfaceAttributes::default();
+            let damage = original_upload_damage();
+            let damage_allocation = damage.as_ptr();
+            let releases = std::cell::Cell::new(0);
+            let cache_draws = std::cell::Cell::new(0);
+            let rendered = super::finish_buffer_upload(
+                &mut current,
+                buffer.clone(),
+                damage,
+                PixelDrawResult::Deferred,
+                || {
+                    cache_draws.set(cache_draws.get() + 1);
+                    cached
+                },
+                |_| releases.set(releases.get() + 1),
+            );
+            assert_eq!(rendered, 0);
+            assert_eq!(releases.get(), 0);
+            assert_eq!(cache_draws.get(), 1);
+            assert!(
+                matches!(current.buffer.as_ref(), Some(BufferAssignment::NewBuffer(retained)) if retained == &buffer)
+            );
+            assert_eq!(current.damage, original_upload_damage());
+            assert_eq!(current.damage.as_ptr(), damage_allocation);
+        }
+    }
+
+    #[test]
+    fn deferred_upload_retries_then_releases_once_after_copy() {
+        let display = Display::<()>::new().unwrap();
+        let buffer = inert_buffer(&display.handle());
+        let mut current = SurfaceAttributes::default();
+        current.buffer = Some(BufferAssignment::NewBuffer(buffer));
+        current.damage = original_upload_damage();
+        let releases = std::cell::Cell::new(0);
+        for result in [
+            PixelDrawResult::Deferred,
+            PixelDrawResult::Deferred,
+            PixelDrawResult::Drawn,
+        ] {
+            let Some(BufferAssignment::NewBuffer(buffer)) = current.buffer.take() else {
+                panic!("deferred upload lost its buffer assignment");
+            };
+            let damage = std::mem::take(&mut current.damage);
+            assert_eq!(damage, original_upload_damage());
+            let rendered = super::finish_buffer_upload(
+                &mut current,
+                buffer,
+                damage,
+                result,
+                || {
+                    assert_ne!(result, PixelDrawResult::Drawn);
+                    true
+                },
+                |_| releases.set(releases.get() + 1),
+            );
+            assert_eq!(rendered, usize::from(result == PixelDrawResult::Drawn));
+            assert_eq!(
+                releases.get(),
+                usize::from(result == PixelDrawResult::Drawn)
+            );
+        }
+        assert!(current.buffer.is_none());
+        assert!(current.damage.is_empty());
+    }
+
+    #[test]
+    fn rejected_upload_releases_once_and_can_draw_the_previous_cache() {
+        let display = Display::<()>::new().unwrap();
+        for cached in [false, true] {
+            let mut current = SurfaceAttributes::default();
+            let releases = std::cell::Cell::new(0);
+            let rendered = super::finish_buffer_upload(
+                &mut current,
+                inert_buffer(&display.handle()),
+                original_upload_damage(),
+                PixelDrawResult::Rejected,
+                || cached,
+                |_| releases.set(releases.get() + 1),
+            );
+            assert_eq!(rendered, usize::from(cached));
+            assert_eq!(releases.get(), 1);
+            assert!(current.buffer.is_none());
+            assert!(current.damage.is_empty());
+        }
+    }
+
+    #[test]
+    fn pending_upload_query_covers_subsurfaces_and_popups_of_only_this_toplevel() {
+        let mut scene = Scene::new();
+        let (root, xdg) = scene.toplevel((100, 100));
+        let (other, other_xdg) = scene.toplevel((100, 100));
+        let (popup, _) = scene.popup(xdg, (5, 5), (20, 20));
+        let (other_popup, _) = scene.popup(other_xdg, (5, 5), (20, 20));
+        let child = scene.subsurface(root.wl_surface(), (1, 1), (10, 10));
+        let popup_child = scene.subsurface(popup.wl_surface(), (1, 1), (10, 10));
+        let buffer = inert_buffer(&scene.display.handle());
+        let pending = |surface: &WlSurface, assignment| {
+            compositor::with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .buffer = assignment;
+            });
+        };
+        pending(
+            other_popup.wl_surface(),
+            Some(BufferAssignment::NewBuffer(buffer.clone())),
+        );
+        assert!(!super::toplevel_has_pending_buffer_uploads(
+            &root,
+            &scene.state.popups
+        ));
+        assert!(super::toplevel_has_pending_buffer_uploads(
+            &other,
+            &scene.state.popups
+        ));
+        for surface in [root.wl_surface(), &child, popup.wl_surface(), &popup_child] {
+            pending(surface, Some(BufferAssignment::NewBuffer(buffer.clone())));
+            assert!(super::toplevel_has_pending_buffer_uploads(
+                &root,
+                &scene.state.popups
+            ));
+            pending(surface, Some(BufferAssignment::Removed));
+            assert!(!super::toplevel_has_pending_buffer_uploads(
+                &root,
+                &scene.state.popups
+            ));
+            pending(surface, None);
+        }
+    }
+
+    #[test]
+    fn desktop_hits_popups_outside_the_tile_and_nested_popup_subsurfaces() {
+        let mut scene = Scene::new();
+        let (root, xdg) = scene.toplevel((100, 100));
+        let (popup, popup_xdg) = scene.popup(xdg, (120, 15), (40, 30));
+        let (nested, _) = scene.popup(popup_xdg, (10, -10), (20, 20));
+        let child = scene.subsurface(nested.wl_surface(), (-5, 2), (10, 10));
+        let tiles = [tile(root, (100, 50))];
+        assert_eq!(
+            scene.hit(&tiles, (225.0, 80.0)),
+            Some((popup.wl_surface().clone(), (220.0, 65.0).into()))
+        );
+        assert_eq!(
+            scene.hit(&tiles, (240.0, 60.0)),
+            Some((nested.wl_surface().clone(), (230.0, 55.0).into()))
+        );
+        assert_eq!(
+            scene.hit(&tiles, (226.5, 58.5)),
+            Some((child, (225.0, 57.0).into()))
+        );
+    }
+
+    #[test]
+    fn desktop_subsurface_offsets_and_input_regions_are_surface_local() {
+        let mut scene = Scene::new();
+        let (root, _) = scene.toplevel((100, 100));
+        compositor::with_states(root.wl_surface(), |states| {
+            states
+                .cached_state
+                .get::<SurfaceCachedState>()
+                .current()
+                .geometry = Some(Rectangle::new((10, 20).into(), (90, 80).into()));
+        });
+        let child = scene.subsurface(root.wl_surface(), (30, 40), (60, 30));
+        let grandchild = scene.subsurface(&child, (5, -10), (20, 10));
+        let tiles = [tile(root.clone(), (100, 200))];
+        input_region(
+            &child,
+            Some(RegionAttributes {
+                rects: vec![
+                    (
+                        RectangleKind::Add,
+                        Rectangle::new((8, 4).into(), (20, 12).into()),
+                    ),
+                    (
+                        RectangleKind::Subtract,
+                        Rectangle::new((10, 6).into(), (4, 4).into()),
+                    ),
+                ],
+            }),
+        );
+        assert_eq!(
+            scene.hit(&tiles, (128.5, 224.5)),
+            Some((child.clone(), (120.0, 220.0).into()))
+        );
+        assert_eq!(
+            scene.hit(&tiles, (131.0, 227.0)),
+            Some((root.wl_surface().clone(), (90.0, 180.0).into()))
+        );
+        input_region(&child, Some(RegionAttributes::default()));
+        assert_eq!(
+            scene.hit(&tiles, (127.5, 213.5)),
+            Some((grandchild, (125.0, 210.0).into()))
+        );
+        input_region(root.wl_surface(), Some(RegionAttributes::default()));
+        assert!(scene.hit(&tiles, (105.0, 205.0)).is_none());
+    }
+
+    #[test]
+    fn desktop_hit_order_matches_tile_draw_order_and_input_passthrough() {
+        let mut scene = Scene::new();
+        let (lower, lower_xdg) = scene.toplevel((100, 100));
+        let (popup, _) = scene.popup(lower_xdg, (120, 15), (40, 30));
+        let (upper, _) = scene.toplevel((100, 100));
+        let tiles = [tile(lower, (0, 0)), tile(upper.clone(), (100, 0))];
+        assert_eq!(
+            scene.hit(&tiles, (125.0, 20.0)),
+            Some((upper.wl_surface().clone(), (100.0, 0.0).into()))
+        );
+        input_region(upper.wl_surface(), Some(RegionAttributes::default()));
+        assert_eq!(
+            scene.hit(&tiles, (125.0, 20.0)),
+            Some((popup.wl_surface().clone(), (120.0, 15.0).into()))
+        );
+        scene.sizes.remove(&popup.wl_surface().id());
+        assert!(scene.hit(&tiles, (125.0, 20.0)).is_none());
+        assert!(scene.hit(&tiles, (f64::NAN, 20.0)).is_none());
+    }
+
+    #[test]
+    fn desktop_parent_hit_is_not_overwritten_by_a_subsurface_below_it() {
+        let mut scene = Scene::new();
+        let (root, _) = scene.toplevel((100, 100));
+        let child = scene.subsurface(root.wl_surface(), (5, 5), (20, 20));
+        let sub = scene.subsurfaces[&child.id()];
+        scene.request(sub, 3, &[root.wl_surface().id().protocol_id()]); // place_below
+        scene.sync();
+        let tiles = [tile(root.clone(), (100, 50))];
+        assert_eq!(
+            scene.hit(&tiles, (110.0, 60.0)),
+            Some((root.wl_surface().clone(), (100.0, 50.0).into()))
+        );
+        input_region(root.wl_surface(), Some(RegionAttributes::default()));
+        assert_eq!(
+            scene.hit(&tiles, (110.0, 60.0)),
+            Some((child, (105.0, 55.0).into()))
+        );
+    }
+
+    #[test]
+    fn desktop_hit_bounds_use_committed_viewport_source_and_destination() {
+        let mut scene = Scene::new();
+        let (root, _) = scene.toplevel((200, 100));
+        let tiles = [tile(root.clone(), (0, 0))];
+        compositor::with_states(root.wl_surface(), |states| {
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .buffer_scale = 2;
+            states
+                .cached_state
+                .get::<ViewportCachedState>()
+                .current()
+                .src = Some(Rectangle::new((10.0, 5.0).into(), (30.0, 20.0).into()));
+        });
+        assert!(scene.hit(&tiles, (29.5, 19.5)).is_some());
+        assert!(scene.hit(&tiles, (30.0, 10.0)).is_none());
+        compositor::with_states(root.wl_surface(), |states| {
+            states
+                .cached_state
+                .get::<ViewportCachedState>()
+                .current()
+                .dst = Some((80, 40).into());
+        });
+        assert!(scene.hit(&tiles, (79.5, 39.5)).is_some());
+        assert!(scene.hit(&tiles, (80.0, 10.0)).is_none());
+    }
+
+    #[test]
+    fn logical_surface_bounds_apply_transform_before_buffer_scale() {
+        assert_eq!(
+            super::surface_logical_size(
+                (200, 100),
+                2,
+                Transform::_90,
+                ViewportCachedState::default()
+            ),
+            (50.0, 100.0).into()
+        );
+        assert_eq!(
+            super::surface_logical_size(
+                (200, 100),
+                2,
+                Transform::Flipped270,
+                ViewportCachedState::default()
+            ),
+            (50.0, 100.0).into()
+        );
+        assert_eq!(
+            super::surface_logical_size(
+                (200, 100),
+                0,
+                Transform::Normal,
+                ViewportCachedState::default()
+            ),
+            (200.0, 100.0).into()
+        );
+    }
 
     #[test]
     fn desktop_is_the_compatible_default() {

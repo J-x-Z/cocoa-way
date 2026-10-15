@@ -1,4 +1,8 @@
 pub enum CompositorMessage {
+    ProcessOutput {
+        message: Box<CompositorMessage>,
+        _permit: crate::process_output::LogPermit,
+    },
     GuestClipboard {
         generation: u64,
         pasteboard_change_count: isize,
@@ -7,7 +11,7 @@ pub enum CompositorMessage {
     Maximize(bool),
     Fullscreen(bool),
     RootlessToplevelCreated(smithay::reexports::wayland_server::backend::ObjectId),
-    RootlessSurfaceDestroyed(smithay::reexports::wayland_server::backend::ObjectId),
+    SurfaceDestroyed(smithay::reexports::wayland_server::backend::ObjectId),
     RootlessToplevelDestroyed(smithay::reexports::wayland_server::backend::ObjectId),
     RootlessToplevelTitleChanged(smithay::reexports::wayland_server::backend::ObjectId),
     RootlessMaximize {
@@ -32,27 +36,38 @@ pub enum CompositorMessage {
     DisconnectClassicConnections,
     CheckContainerSession(usize),
     StartContainerSession(usize),
+    ResumeContainerSession {
+        index: usize,
+        generation: u64,
+    },
+    StartContainerSessionIfCurrent {
+        index: usize,
+        signature: String,
+    },
     StopContainerSession(usize),
     ForceStopContainerSession(usize),
     ContainerSessionChecked {
         index: usize,
-        launch_after: bool,
+        generation: u64,
         result:
             Result<crate::container_sessions::CheckReport, crate::container_sessions::LaunchError>,
     },
     ContainerSessionLaunchProgress {
         index: usize,
+        generation: u64,
         step: crate::application_model::LaunchStep,
         detail: String,
     },
     ContainerSessionLaunchFinished {
         index: usize,
+        generation: u64,
         display_slot: String,
         result:
             Result<crate::container_sessions::LaunchReport, crate::container_sessions::LaunchError>,
     },
     DedicatedDisplayStarted {
         index: usize,
+        generation: u64,
         display_slot: String,
         runtime_dir: String,
         display: String,
@@ -61,6 +76,7 @@ pub enum CompositorMessage {
     },
     DedicatedDisplayFailed {
         index: usize,
+        generation: u64,
         display_slot: String,
         error: String,
     },

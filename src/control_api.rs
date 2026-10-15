@@ -1,22 +1,76 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::cell::Cell;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::container_mode;
 use crate::container_sessions::{self, ContainerSession};
+#[allow(dead_code)]
+#[path = "control_client.rs"]
+mod control_io;
 use crate::control_protocol::{ControlRequest, ControlResponse};
 use crate::diagnostics;
 use crate::event_loop_signal::Sender;
 use crate::messages::CompositorMessage;
 use crate::runtime_paths::{build_child_path, find_command_path};
+use control_io::{
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, connect_before, read_frame_before, write_before,
+};
 
 const CONTROL_SOCKET_ENV: &str = "COCOA_WAY_CONTROL_SOCKET";
-const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_ACTIVE_HANDLERS: usize = 8;
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+thread_local! {
+    // Inventory probes share the connection budget rather than each starting a new one.
+    static REQUEST_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+struct HandlerPermit(Arc<AtomicUsize>);
+
+impl HandlerPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_ACTIVE_HANDLERS).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(active.clone()))
+    }
+}
+
+impl Drop for HandlerPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn spawn_connection(
+    stream: UnixStream,
+    sender: Sender<CompositorMessage>,
+    path: PathBuf,
+    active: &Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    let permit = HandlerPermit::acquire(active).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, "control server is busy")
+    })?;
+    let deadline = Instant::now() + TOTAL_TIMEOUT;
+    std::thread::Builder::new()
+        .name("cocoa-way-control-request".into())
+        .spawn(move || {
+            let _permit = permit;
+            handle_connection(stream, &sender, &path, deadline);
+        })?;
+    Ok(())
+}
 
 pub fn socket_path() -> PathBuf {
     std::env::var_os(CONTROL_SOCKET_ENV)
@@ -46,13 +100,27 @@ fn start_at(path: PathBuf, sender: Sender<CompositorMessage>) -> Result<PathBuf,
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("failed to secure control socket directory: {error}"))?;
     }
-    if path.exists() && UnixStream::connect(&path).is_ok() {
-        return Err(format!(
-            "another Cocoa-Way control server is active at {}",
-            path.display()
-        ));
-    }
     if path.exists() {
+        match connect_before(&path, Instant::now() + WRITE_TIMEOUT) {
+            Ok(_) => {
+                return Err(format!(
+                    "another Cocoa-Way control server is active at {}",
+                    path.display()
+                ));
+            }
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                return Err(format!(
+                    "cannot safely replace control socket {}: {error}",
+                    path.display()
+                ));
+            }
+            Err(_) => {}
+        }
         std::fs::remove_file(&path)
             .map_err(|error| format!("failed to replace stale control socket: {error}"))?;
     }
@@ -65,16 +133,16 @@ fn start_at(path: PathBuf, sender: Sender<CompositorMessage>) -> Result<PathBuf,
     std::thread::Builder::new()
         .name("cocoa-way-control".into())
         .spawn(move || {
+            let active = Arc::new(AtomicUsize::new(0));
             for connection in listener.incoming() {
                 match connection {
                     Ok(stream) => {
-                        let connection_sender = sender.clone();
-                        let connection_path = thread_path.clone();
-                        let _ = std::thread::Builder::new()
-                            .name("cocoa-way-control-request".into())
-                            .spawn(move || {
-                                handle_connection(stream, &connection_sender, &connection_path)
-                            });
+                        if let Err(error) =
+                            spawn_connection(stream, sender.clone(), thread_path.clone(), &active)
+                            && error.kind() != std::io::ErrorKind::WouldBlock
+                        {
+                            log::warn!("Control request worker failed: {error}");
+                        }
                     }
                     Err(error) => log::warn!("Control socket accept failed: {error}"),
                 }
@@ -88,25 +156,44 @@ pub fn remove_socket(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-fn handle_connection(mut stream: UnixStream, sender: &Sender<CompositorMessage>, path: &Path) {
-    let request = {
-        let mut line = String::new();
-        let mut reader = BufReader::new((&stream).take(MAX_REQUEST_BYTES));
-        match reader.read_line(&mut line) {
-            Ok(0) => Err("empty control request".to_string()),
-            Ok(_) => serde_json::from_str::<ControlRequest>(&line)
-                .map_err(|error| format!("invalid control request: {error}")),
-            Err(error) => Err(format!("failed to read control request: {error}")),
-        }
-    };
+fn handle_connection(
+    mut stream: UnixStream,
+    sender: &Sender<CompositorMessage>,
+    path: &Path,
+    deadline: Instant,
+) {
+    REQUEST_DEADLINE.with(|budget| budget.set(Some(deadline)));
+    let request = read_frame_before(
+        &mut stream,
+        MAX_REQUEST_BYTES,
+        deadline.min(Instant::now() + READ_TIMEOUT),
+    )
+    .map_err(|error| format!("failed to read control request: {error}"))
+    .and_then(|line| {
+        serde_json::from_slice::<ControlRequest>(&line)
+            .map_err(|error| format!("invalid control request: {error}"))
+    });
     let response = match request {
-        Ok(request) => dispatch(request, sender, path),
+        Ok(request) if Instant::now() < deadline => dispatch(request, sender, path),
+        Ok(_) => ControlResponse::failure("invalid", "control request deadline exceeded"),
         Err(error) => ControlResponse::failure("invalid", error),
     };
     if let Ok(mut encoded) = serde_json::to_vec(&response) {
+        if encoded.len() > MAX_RESPONSE_BYTES {
+            encoded = serde_json::to_vec(&ControlResponse::failure(
+                &response.command,
+                "control response exceeds the 4 MiB frame limit",
+            ))
+            .unwrap_or_default();
+        }
         encoded.push(b'\n');
-        let _ = stream.write_all(&encoded);
+        let _ = write_before(
+            &mut stream,
+            &encoded,
+            deadline.min(Instant::now() + WRITE_TIMEOUT),
+        );
     }
+    REQUEST_DEADLINE.with(|budget| budget.set(None));
 }
 
 fn dispatch(
@@ -170,7 +257,10 @@ fn queue_session_command(
         Err(error) => return ControlResponse::failure(command, error),
     };
     let message = match command {
-        "launch" | "start" => CompositorMessage::StartContainerSession(index),
+        "launch" | "start" => CompositorMessage::StartContainerSessionIfCurrent {
+            index,
+            signature: container_sessions::session_to_toml(&session),
+        },
         "stop" => CompositorMessage::StopContainerSession(index),
         "check" => CompositorMessage::CheckContainerSession(index),
         _ => unreachable!(),
@@ -643,6 +733,13 @@ fn run_command(
     child_path: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
+    let timeout = REQUEST_DEADLINE.with(|budget| match budget.get() {
+        Some(deadline) => deadline
+            .checked_duration_since(Instant::now())
+            .map(|remaining| remaining.min(timeout))
+            .ok_or_else(|| "control request deadline exceeded".to_string()),
+        None => Ok(timeout),
+    })?;
     let mut command = Command::new(path);
     command.env("PATH", child_path).args(args);
     crate::runtime_commands::capture(command, timeout).map_err(|error| error.to_string())
@@ -652,6 +749,107 @@ fn run_command(
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+
+    fn test_sender() -> Sender<CompositorMessage> {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        Sender::with_waker(sender, || {})
+    }
+
+    #[test]
+    fn handler_limit_rejects_peers_and_recovers_capacity() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut idle = Vec::new();
+        for _ in 0..MAX_ACTIVE_HANDLERS {
+            let (server, peer) = UnixStream::pair().unwrap();
+            spawn_connection(server, test_sender(), PathBuf::from("unused"), &active).unwrap();
+            idle.push(peer);
+        }
+        assert_eq!(active.load(Ordering::Acquire), MAX_ACTIVE_HANDLERS);
+        let (server, mut rejected) = UnixStream::pair().unwrap();
+        assert_eq!(
+            spawn_connection(server, test_sender(), PathBuf::from("unused"), &active)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let error = read_frame_before(
+            &mut rejected,
+            MAX_RESPONSE_BYTES,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        drop(idle);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while active.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        spawn_connection(server, test_sender(), PathBuf::from("unused"), &active).unwrap();
+        peer.write_all(b"{\"command\":\"unsupported-test\"}\n")
+            .unwrap();
+        let response = read_frame_before(
+            &mut peer,
+            MAX_RESPONSE_BYTES,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .contains("unsupported command")
+        );
+        while active.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn idle_handler_obeys_total_deadline() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            handle_connection(
+                server,
+                &test_sender(),
+                Path::new("unused"),
+                Instant::now() + Duration::from_millis(50),
+            )
+        });
+        let error = read_frame_before(
+            &mut peer,
+            MAX_RESPONSE_BYTES,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        worker.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dropping_an_unstarted_handler_releases_its_permit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let permit = HandlerPermit::acquire(&active).unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        drop(permit);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn expired_inventory_budget_does_not_spawn_a_command() {
+        REQUEST_DEADLINE.with(|budget| budget.set(Some(Instant::now())));
+        let result = run_command(
+            Path::new("/must-not-execute"),
+            &[],
+            "",
+            Duration::from_secs(3),
+        );
+        REQUEST_DEADLINE.with(|budget| budget.set(None));
+        assert!(result.unwrap_err().contains("deadline exceeded"));
+    }
 
     #[test]
     fn structured_command_data_is_preserved_even_when_the_service_is_stopped() {
@@ -855,7 +1053,11 @@ mod tests {
 
     #[test]
     fn unix_socket_returns_a_json_status_response() {
-        let directory = tempfile::tempdir().unwrap();
+        // macOS Unix socket paths must fit sun_path even when TMPDIR is long.
+        let directory = tempfile::Builder::new()
+            .prefix("cw-ctl-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let socket = directory.path().join("control.sock");
         let (sender, _receiver) = std::sync::mpsc::channel();
         let sender = Sender::with_waker(sender, || {});

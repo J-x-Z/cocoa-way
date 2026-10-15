@@ -1,0 +1,49 @@
+diff --git a/src/wayland/shell/xdg/handlers/surface.rs b/src/wayland/shell/xdg/handlers/surface.rs
+--- a/src/wayland/shell/xdg/handlers/surface.rs
++++ b/src/wayland/shell/xdg/handlers/surface.rs
+@@ -1,3 +1,4 @@
++use std::collections::HashSet;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
+ use std::sync::Mutex;
+@@ -172,6 +173,27 @@ where
+                 let surface = &data.wl_surface;
+                 let shell = &data.wm_base;
+-
++
++                let mut ancestor = parent_surface.clone();
++                let mut visited = HashSet::new();
++                visited.insert(surface.id());
++                while let Some(parent) = ancestor {
++                    if !visited.insert(parent.id()) {
++                        shell.post_error(
++                            xdg_wm_base::Error::InvalidPopupParent,
++                            "xdg_popup parent ancestry contains a cycle",
++                        );
++                        return;
++                    }
++
++                    // Drop each surface's locks before following its parent link.
++                    ancestor = compositor::with_states(&parent, |states| {
++                        states
++                            .data_map
++                            .get::<XdgPopupSurfaceData>()
++                            .and_then(|attributes| attributes.lock().unwrap().parent.clone())
++                    });
++                }
++
+                 let attributes = XdgPopupSurfaceRoleAttributes {
+                     parent: parent_surface,
+                     server_pending: Some(PopupState {
+diff --git a/src/wayland/shm/handlers.rs b/src/wayland/shm/handlers.rs
+--- a/src/wayland/shm/handlers.rs
++++ b/src/wayland/shm/handlers.rs
+@@ -189,6 +189,7 @@ where
+             Request::Resize { size } => {
+                 if size <= 0 {
+                     pool.post_error(wl_shm::Error::InvalidFd, "invalid wl_shm_pool size");
++                    return;
+                 }
+-
++
+                 if let Err(err) = arc_pool.resize(NonZeroUsize::try_from(size as usize).unwrap()) {

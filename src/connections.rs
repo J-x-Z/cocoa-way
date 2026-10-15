@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -309,13 +310,16 @@ fn resolve_display_target(
         if !name.starts_with("cwd-") {
             continue;
         }
-        let Ok(slot) = fs::read_to_string(runtime_dir.join("display.slot")) else {
+        let Some(directory) = TrustedDisplayDirectory::open(&runtime_dir) else {
             continue;
         };
-        if slot.trim() != requested_slot {
+        let Some(slot) = directory.marker("display.slot") else {
+            continue;
+        };
+        if slot.trim() != requested_slot || !directory.managed_is_live() {
             continue;
         }
-        if let Some(display) = find_wayland_socket(&runtime_dir) {
+        if let Some(display) = find_wayland_socket(&runtime_dir, &directory) {
             return Ok(DisplayTarget {
                 runtime_dir: runtime_dir.display().to_string(),
                 display,
@@ -343,33 +347,208 @@ fn validate_display_target(
         ));
     }
     let socket = Path::new(runtime_dir).join(display);
-    if !socket.exists() {
+    if fs::symlink_metadata(&socket).is_err() {
         return Err(format!(
             "Cocoa-Way display socket '{}' does not exist",
             socket.display()
         ));
     }
+    let directory = TrustedDisplayDirectory::open(Path::new(runtime_dir))
+        .filter(|directory| {
+            directory.socket(display) && directory.still_current(Path::new(runtime_dir))
+        })
+        .ok_or_else(|| {
+            format!(
+                "Cocoa-Way display '{}' has unsafe ownership, permissions, or file type",
+                socket.display()
+            )
+        })?;
+    drop(directory);
     Ok(DisplayTarget {
         runtime_dir: runtime_dir.to_string(),
         display: display.to_string(),
     })
 }
 
-fn find_wayland_socket(runtime_dir: &Path) -> Option<String> {
-    let mut sockets = fs::read_dir(runtime_dir)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("wayland-") && entry.path().exists() {
-                Some(name)
-            } else {
-                None
+const MAX_DISPLAY_MARKER_BYTES: u64 = 256;
+
+fn trusted_metadata(metadata: &fs::Metadata, uid: u32, directory: bool) -> bool {
+    metadata.uid() == uid && metadata.mode() & (if directory { 0o077 } else { 0o022 }) == 0
+}
+
+// Pin the directory and inspect children relative to it. Never open a FIFO in blocking mode.
+pub(crate) struct TrustedDisplayDirectory(fs::File);
+
+impl TrustedDisplayDirectory {
+    pub(crate) fn open(path: &Path) -> Option<Self> {
+        let path = path.components().collect::<PathBuf>();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for ancestor in parent
+            .ancestors()
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        {
+            let metadata = fs::symlink_metadata(ancestor).ok()?;
+            // Only root-owned system aliases (not user-controlled redirects) may be followed.
+            if metadata.file_type().is_symlink() {
+                if metadata.uid() != 0 {
+                    return None;
+                }
+            } else if !metadata.is_dir()
+                || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
+                || (metadata.mode() & 0o022 != 0
+                    && !(metadata.uid() == 0 && metadata.mode() & 0o1000 != 0))
+            {
+                return None;
             }
+        }
+        let parent = fs::canonicalize(parent).ok()?;
+        for ancestor in parent.ancestors() {
+            let metadata = fs::symlink_metadata(ancestor).ok()?;
+            let uid = metadata.uid();
+            if !metadata.is_dir()
+                || (uid != 0 && uid != unsafe { libc::geteuid() })
+                || (metadata.mode() & 0o022 != 0 && !(uid == 0 && metadata.mode() & 0o1000 != 0))
+            {
+                return None;
+            }
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+            .ok()?;
+        let metadata = file.metadata().ok()?;
+        (metadata.is_dir() && trusted_metadata(&metadata, unsafe { libc::geteuid() }, true))
+            .then_some(Self(file))
+    }
+
+    pub(crate) fn marker(&self, name: &str) -> Option<String> {
+        if !matches!(name, "display.slot" | "display.parent" | "display.worker") {
+            return None;
+        }
+        let name = std::ffi::CString::new(name).ok()?;
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || !trusted_metadata(&metadata, unsafe { libc::geteuid() }, false)
+            || metadata.len() > MAX_DISPLAY_MARKER_BYTES
+        {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_DISPLAY_MARKER_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_DISPLAY_MARKER_BYTES {
+            return None;
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    fn socket(&self, name: &str) -> bool {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return false;
+        }
+        let Ok(name) = std::ffi::CString::new(name) else {
+            return false;
+        };
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        (unsafe {
+            libc::fstatat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                &mut metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) == 0
+        }) && metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
+            && metadata.st_uid == unsafe { libc::geteuid() }
+            && metadata.st_mode & 0o022 == 0
+    }
+
+    fn socket_names(&self) -> Option<Vec<String>> {
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let directory = unsafe { libc::fdopendir(fd) };
+        if directory.is_null() {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        struct Entries(*mut libc::DIR);
+        impl Drop for Entries {
+            fn drop(&mut self) {
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+        let entries = Entries(directory);
+        let mut names = Vec::new();
+        loop {
+            let entry = unsafe { libc::readdir(entries.0) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if let Ok(name) = name.to_str()
+                && name.starts_with("wayland-")
+                && self.socket(name)
+            {
+                names.push(name.to_string());
+            }
+        }
+        Some(names)
+    }
+
+    pub(crate) fn still_current(&self, path: &Path) -> bool {
+        let path = path.components().collect::<PathBuf>();
+        self.0
+            .metadata()
+            .ok()
+            .zip(fs::symlink_metadata(&path).ok())
+            .is_some_and(|(opened, current)| {
+                current.is_dir()
+                    && opened.dev() == current.dev()
+                    && opened.ino() == current.ino()
+                    && trusted_metadata(&current, unsafe { libc::geteuid() }, true)
+            })
+    }
+
+    fn managed_is_live(&self) -> bool {
+        ["display.parent", "display.worker"].iter().all(|name| {
+            self.marker(name)
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+                .is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
         })
-        .collect::<Vec<_>>();
+    }
+}
+
+fn find_wayland_socket(runtime_dir: &Path, directory: &TrustedDisplayDirectory) -> Option<String> {
+    let mut sockets = directory.socket_names()?;
     sockets.sort();
-    sockets.into_iter().next()
+    directory
+        .still_current(runtime_dir)
+        .then(|| sockets.into_iter().next())
+        .flatten()
 }
 
 fn resolve_waypipe_path(configured: Option<&str>) -> Option<PathBuf> {
@@ -446,9 +625,124 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
+    fn private_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    #[test]
+    fn display_markers_reject_fifo_symlink_oversize_and_writable_files() {
+        use std::os::unix::fs::symlink;
+        let temp = private_directory();
+        let directory = TrustedDisplayDirectory::open(temp.path()).unwrap();
+        let marker = temp.path().join("display.slot");
+        let cpath = std::ffi::CString::new(marker.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(directory.marker("display.slot").is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        fs::remove_file(&marker).unwrap();
+        let other = temp.path().join("other");
+        fs::write(&other, "display-1").unwrap();
+        symlink(&other, &marker).unwrap();
+        assert!(directory.marker("display.slot").is_none());
+        fs::remove_file(&marker).unwrap();
+        fs::write(&marker, vec![b'x'; MAX_DISPLAY_MARKER_BYTES as usize + 1]).unwrap();
+        assert!(directory.marker("display.slot").is_none());
+        fs::write(&marker, "display-1\n").unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(directory.marker("display.slot").is_none());
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            directory.marker("display.slot").as_deref(),
+            Some("display-1\n")
+        );
+    }
+
+    #[test]
+    fn display_discovery_rejects_unsafe_directories_and_non_socket_targets() {
+        use std::os::unix::fs::symlink;
+        let temp = private_directory();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = TrustedDisplayDirectory::open(&runtime).unwrap();
+        fs::write(runtime.join("wayland-0"), "not a socket").unwrap();
+        let socket = runtime.join("wayland-1");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&socket, runtime.join("wayland-00")).unwrap();
+        assert_eq!(
+            find_wayland_socket(&runtime, &directory).as_deref(),
+            Some("wayland-1")
+        );
+        assert!(!directory.socket("../runtime/wayland-1"));
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(find_wayland_socket(&runtime, &directory).is_none());
+        let alias = temp.path().join("alias");
+        symlink(&runtime, &alias).unwrap();
+        assert!(TrustedDisplayDirectory::open(&alias).is_none());
+        assert!(
+            TrustedDisplayDirectory::open(Path::new(&format!("{}/", alias.display()))).is_none()
+        );
+        let nested = runtime.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(TrustedDisplayDirectory::open(&alias.join("nested")).is_none());
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(TrustedDisplayDirectory::open(&runtime).is_none());
+        assert!(!directory.still_current(&runtime));
+    }
+
+    #[test]
+    fn trusted_metadata_checks_the_expected_owner_without_chown() {
+        let temp = private_directory();
+        let metadata = fs::symlink_metadata(temp.path()).unwrap();
+        assert!(trusted_metadata(&metadata, metadata.uid(), true));
+        assert!(!trusted_metadata(
+            &metadata,
+            metadata.uid().wrapping_add(1),
+            true
+        ));
+    }
+
+    #[test]
+    fn replacing_the_runtime_path_with_a_fifo_does_not_affect_pinned_discovery() {
+        let temp = private_directory();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let _listener = UnixListener::bind(runtime.join("wayland-1")).unwrap();
+        let directory = TrustedDisplayDirectory::open(&runtime).unwrap();
+        fs::rename(&runtime, temp.path().join("moved")).unwrap();
+        let cpath = std::ffi::CString::new(runtime.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(find_wayland_socket(&runtime, &directory).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn managed_displays_require_both_bounded_live_pid_markers() {
+        let temp = private_directory();
+        let directory = TrustedDisplayDirectory::open(temp.path()).unwrap();
+        fs::write(
+            temp.path().join("display.parent"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        assert!(!directory.managed_is_live());
+        let worker = temp.path().join("display.worker");
+        fs::write(&worker, "0").unwrap();
+        assert!(!directory.managed_is_live());
+        fs::write(&worker, std::process::id().to_string()).unwrap();
+        assert!(directory.managed_is_live());
+    }
+
     #[test]
     fn default_display_requires_a_live_socket() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_directory();
         let socket = temp.path().join("wayland-1");
         let _listener = UnixListener::bind(&socket).unwrap();
         let target =
@@ -465,7 +759,7 @@ mod tests {
 
     #[test]
     fn ssh_launch_matches_the_script_defaults() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_directory();
         let socket = temp.path().join("wayland-1");
         let _listener = UnixListener::bind(&socket).unwrap();
         let capture = temp.path().join("capture.txt");

@@ -85,6 +85,9 @@ jobs:
           PLIST
           sed -i '' "s/VERSION_PLACEHOLDER/${VERSION}/g" "${APP_DIR}/Contents/Info.plist"
 
+      - name: Bundle example image resources
+        run: bash scripts/bundle-example-resources.sh Cocoa-Way.app/Contents/Resources/container-images
+
       - name: Bundle runtime dylibs
         run: |
           chmod +x ./scripts/bundle-macos-app.sh
@@ -92,6 +95,7 @@ jobs:
 
       - name: Verify bundled dylibs
         run: |
+          bash scripts/bundle-example-resources.sh --check Cocoa-Way.app/Contents/Resources/container-images
           test -f Cocoa-Way.app/Contents/Resources/xkb/rules/evdev
           test -f Cocoa-Way.app/Contents/Resources/xkb/keycodes/evdev
           test -f Cocoa-Way.app/Contents/Resources/xkb/symbols/us
