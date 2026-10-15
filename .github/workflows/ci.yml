@@ -5,6 +5,12 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,16 +18,20 @@ env:
 jobs:
   macos:
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, verified 2026-10-15
         with:
+          toolchain: stable
           components: rustfmt
 
       - name: Install dependencies
@@ -30,11 +40,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Verify vendored sources
-        run: python3 scripts/vendor-smithay.py
+      - name: Test supply-chain guards
+        run: python3 scripts/test-supplychain.py
+
+      - name: Install pinned advisory scanner
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Check current advisories, locked macOS graphs, vendor and provenance
+        run: python3 scripts/check-supplychain.py --verify-upstreams
 
       - name: Run tests
         run: cargo test --workspace --locked
 
       - name: Build release binaries
         run: cargo build --release --bins --locked
+
+      - name: Exercise release bundling and transitive dylib checks
+        run: python3 scripts/supplychain-bundle.py target/supplychain/Cocoa-Way.app
+
+      - name: Ensure validation did not mutate dependency inputs
+        run: git diff --exit-code -- Cargo.toml Cargo.lock test-client/Cargo.toml vendor Formula

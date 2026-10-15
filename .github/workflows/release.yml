@@ -5,131 +5,78 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-macos:
     runs-on: macos-latest
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          submodules: recursive
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, verified 2026-10-15
+        with:
+          toolchain: stable
 
       - name: Install dependencies
         run: brew install libxkbcommon pkg-config
 
-      - name: Verify release version
+      - name: Verify release version and architecture
         run: |
-          PACKAGE_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "cocoa-way"))')
+          test "$(uname -m)" = arm64
+          PACKAGE_VERSION=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "cocoa-way"))')
           test "${GITHUB_REF_NAME}" = "v${PACKAGE_VERSION}"
 
-      - name: Verify vendored sources
-        run: python3 scripts/vendor-smithay.py
+      - name: Test supply-chain guards
+        run: python3 scripts/test-supplychain.py
+
+      - name: Install pinned advisory scanner
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Check current advisories, locked macOS graphs, vendor and provenance
+        run: python3 scripts/check-supplychain.py --verify-upstreams
+
+      - name: Run tests
+        run: cargo test --workspace --locked
 
       - name: Build for arm64
         run: cargo build --release --bins --locked
 
-      - name: Create .app Bundle
-        run: |
-          APP_NAME="Cocoa-Way"
-          APP_DIR="${APP_NAME}.app"
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p "${APP_DIR}/Contents/MacOS"
-          mkdir -p "${APP_DIR}/Contents/Frameworks"
-          mkdir -p "${APP_DIR}/Contents/Resources"
-          
-          cp target/release/cocoa-way "${APP_DIR}/Contents/MacOS/"
-          cp target/release/cocoa-wayctl "${APP_DIR}/Contents/MacOS/"
-          cp target/release/cocoa-way-mcp "${APP_DIR}/Contents/MacOS/"
-          cp assets/icon.png "${APP_DIR}/Contents/Resources/AppIcon.png"
-          
-          cat > "${APP_DIR}/Contents/Info.plist" << 'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>cocoa-way</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.jxz.cocoa-way</string>
-              <key>CFBundleName</key>
-              <string>Cocoa-Way</string>
-              <key>CFBundleDisplayName</key>
-              <string>Cocoa-Way</string>
-              <key>CFBundleVersion</key>
-              <string>VERSION_PLACEHOLDER</string>
-              <key>CFBundleShortVersionString</key>
-              <string>VERSION_PLACEHOLDER</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>CFBundleIconFile</key>
-              <string>AppIcon</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>11.0</string>
-              <key>NSHighResolutionCapable</key>
-              <true/>
-              <key>LSApplicationCategoryType</key>
-              <string>public.app-category.developer-tools</string>
-          </dict>
-          </plist>
-          PLIST
-          sed -i '' "s/VERSION_PLACEHOLDER/${VERSION}/g" "${APP_DIR}/Contents/Info.plist"
+      - name: Create and verify app with the CI-tested bundling path
+        run: python3 scripts/supplychain-bundle.py Cocoa-Way.app --version "${GITHUB_REF_NAME#v}" --arch arm64
 
-      - name: Bundle example image resources
-        run: bash scripts/bundle-example-resources.sh Cocoa-Way.app/Contents/Resources/container-images
-
-      - name: Bundle runtime dylibs
-        run: |
-          chmod +x ./scripts/bundle-macos-app.sh
-          ./scripts/bundle-macos-app.sh Cocoa-Way.app
-
-      - name: Verify bundled dylibs
-        run: |
-          bash scripts/bundle-example-resources.sh --check Cocoa-Way.app/Contents/Resources/container-images
-          test -f Cocoa-Way.app/Contents/Resources/xkb/rules/evdev
-          test -f Cocoa-Way.app/Contents/Resources/xkb/keycodes/evdev
-          test -f Cocoa-Way.app/Contents/Resources/xkb/symbols/us
-          for executable in cocoa-way cocoa-wayctl cocoa-way-mcp; do
-            ! otool -L "Cocoa-Way.app/Contents/MacOS/${executable}" | grep -E '/(opt/homebrew|usr/local|nix)/'
-            ! otool -L "Cocoa-Way.app/Contents/MacOS/${executable}" | grep -i pixman
-          done
-          codesign --verify --deep --strict --verbose=2 Cocoa-Way.app
-          Cocoa-Way.app/Contents/MacOS/cocoa-wayctl --help >/dev/null
-          Cocoa-Way.app/Contents/MacOS/cocoa-way-mcp </dev/null
+      - name: Ensure validation did not mutate dependency inputs
+        run: git diff --exit-code -- Cargo.toml Cargo.lock test-client/Cargo.toml vendor Formula
 
       - name: Create ZIP archive
-        run: |
-          zip -r "Cocoa-Way-${{ github.ref_name }}-arm64-macos.zip" Cocoa-Way.app
+        run: zip -r "Cocoa-Way-${GITHUB_REF_NAME}-arm64-macos.zip" Cocoa-Way.app
 
       - name: Create DMG
-        run: |
-          hdiutil create -volname "Cocoa-Way" -srcfolder Cocoa-Way.app -ov -format UDZO "Cocoa-Way-${{ github.ref_name }}-arm64-macos.dmg"
+        run: hdiutil create -volname "Cocoa-Way" -srcfolder Cocoa-Way.app -ov -format UDZO "Cocoa-Way-${GITHUB_REF_NAME}-arm64-macos.dmg"
+
+      - name: Calculate SHA256
+        run: shasum -a 256 "Cocoa-Way-${GITHUB_REF_NAME}-arm64-macos.zip" "Cocoa-Way-${GITHUB_REF_NAME}-arm64-macos.dmg" > SHA256SUMS
 
       - name: Upload Release Assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          fail_on_unmatched_files: true
           files: |
             Cocoa-Way-${{ github.ref_name }}-arm64-macos.zip
             Cocoa-Way-${{ github.ref_name }}-arm64-macos.dmg
+            SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Calculate SHA256
-        id: sha
-        run: |
-          SHA=$(shasum -a 256 "Cocoa-Way-${{ github.ref_name }}-arm64-macos.zip" | cut -d ' ' -f 1)
-          echo "sha256=$SHA" >> $GITHUB_OUTPUT
-          echo "SHA256: $SHA"
-
-    outputs:
-      sha256: ${{ steps.sha.outputs.sha256 }}

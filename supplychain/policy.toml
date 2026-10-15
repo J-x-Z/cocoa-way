@@ -1,0 +1,74 @@
+reviewed = 2026-10-15
+# Evidence snapshot only. CI fetches CURRENT RustSec data, not this revision.
+rustsec_review_revision = "edb58f5974b83eb8302332821cb6d389777aa351"
+cargo_audit_version = "0.22.2"
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+# Resolved in Cargo.lock without changing any source modules or major APIs:
+# RUSTSEC-2026-0186: memmap2 0.9.5 -> 0.9.11 (xkbcommon -> Smithay, macOS).
+# RUSTSEC-2026-0097: rand 0.9.2 -> 0.9.3 (Smithay; old graph had no log feature).
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml 0.37.5 -> 0.41.0 through
+# wayland-scanner 0.31.7 -> 0.31.11 (build-time protocol XML, not runtime input).
+# RUSTSEC-2026-0007: bytes 1.10.1 -> 1.11.1 (Android JNI/combine lock-only).
+# RUSTSEC-2025-0014: humantime notice was withdrawn; unused env_logger removal
+# also removes humantime. RUSTSEC-2025-0055 is already fixed by subscriber 0.3.22.
+
+# No global cargo-audit ignores. Both notices remain in the saved audit report.
+# The API guard is deliberately conservative: even a mention in Rust comments
+# fails review. It is not a proof about arbitrary generated code or FFI.
+[[exceptions]]
+id = "RUSTSEC-2026-0196"
+package = "cgmath"
+version = "0.18.0"
+kind = "unmaintained"
+expires = 2027-01-15
+reason = "Smithay 0.7 uses cgmath matrices. No patched release exists; replacing Smithay's math API is out of scope. Retain the maintenance warning, require the exact consumer and source/API guard."
+source = "https://rustsec.org/advisories/RUSTSEC-2026-0196.html"
+
+[[exceptions]]
+id = "RUSTSEC-2026-0197"
+package = "cgmath"
+version = "0.18.0"
+kind = "unsound"
+expires = 2027-01-15
+reason = "Matrix2/3/4::swap_columns aliases mutable columns for equal indices. No patched release exists. No repository or Smithay source uses this API; reject new consumers or any Rust token naming it."
+source = "https://github.com/rustsec/advisory-db/blob/edb58f5974b83eb8302332821cb6d389777aa351/crates/cgmath/RUSTSEC-2026-0197.md"
+
+[cgmath]
+version = "0.18.0"
+checksum = "1a98d30140e3296250832bbaaff83b27dcd6fa3cc70fb6f1f3e5c9c0023b5317"
+consumers = ["smithay@0.7.0"]
+forbidden_rust_tokens = ["swap_columns"]
+
+# Verified with git ls-remote in the named upstream repositories AND GitHub's
+# commit API (all four commits have verification.verified=true), 2026-10-15.
+[[actions]]
+repository = "actions/checkout"
+reference = "refs/tags/v4.4.0"
+sha = "11d5960a326750d5838078e36cf38b85af677262"
+
+[[actions]]
+repository = "actions/setup-python"
+reference = "refs/tags/v7.0.0"
+sha = "5fda3b95a4ea91299a34e894583c3862153e4b97"
+
+[[actions]]
+repository = "dtolnay/rust-toolchain"
+reference = "refs/heads/stable"
+sha = "686976e191b89faba57d3206551f0f330d8cb249"
+
+[[actions]]
+repository = "softprops/action-gh-release"
+reference = "refs/tags/v2.6.2"
+sha = "3bb12739c298aeb8a4eeaf626c5b8d85266b0e65"
+
+[formula]
+# Real public release, downloaded and hashed, not a future release placeholder.
+# This archive predates this branch's fixes; updating a Formula does not publish
+# the working tree. The tag is unsigned, so this checksum is integrity evidence,
+# not an independent publisher signature.
+version = "2.1.0"
+url = "https://github.com/J-x-Z/cocoa-way/archive/refs/tags/v2.1.0.tar.gz"
+sha256 = "107b9aeeebd3efbd7702c03fd1580634f1786ae4e32c55c5c4a9f029f66b549a"
+tag_object = "6a3191e490e55bafd7eb5770e9bbbdf5315c8ea0"
+commit = "e18c0b3e42cc1c6200ebf28a2d28f15ab56b2609"
