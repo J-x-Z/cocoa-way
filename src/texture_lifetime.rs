@@ -1,11 +1,17 @@
 //! CPU ownership model; Metal command buffers retain the actual GPU resources.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
+
+#[path = "render_budget.rs"]
+mod render_budget;
+pub(crate) use render_budget::{BudgetError, BudgetWake, TextureBudget, TextureReservation};
 
 pub(crate) const MAX_FRAMES: usize = 3;
 const MAX_VERSIONS: usize = MAX_FRAMES;
 const REDRAW_WAITING: usize = 1 << (usize::BITS - 1);
+const DRAINING: usize = REDRAW_WAITING >> 1;
+const FRAME_COUNT: usize = !(REDRAW_WAITING | DRAINING);
 
 #[derive(Default)]
 pub(crate) struct FrameGate {
@@ -23,6 +29,7 @@ impl FrameGate {
             Arc::new(FrameLifetime {
                 gate: self.clone(),
                 completed: AtomicBool::new(false),
+                reservations: Mutex::new(Vec::new()),
             })
         })
     }
@@ -31,12 +38,20 @@ impl FrameGate {
         self.state.fetch_or(REDRAW_WAITING, Ordering::AcqRel);
     }
 
+    /// Budget pressure may require reusing the only current texture, rather than
+    /// continually adding cached fallback readers while waiting for it to idle.
+    pub(crate) fn defer_until_idle(&self) {
+        self.state
+            .fetch_or(DRAINING | REDRAW_WAITING, Ordering::AcqRel);
+    }
+
     fn admit(&self, reserve: bool) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            let ready = state & !REDRAW_WAITING < MAX_FRAMES;
+            let count = state & FRAME_COUNT;
+            let ready = count < MAX_FRAMES && (state & DRAINING == 0 || count == 0);
             let next = if ready {
-                state + usize::from(reserve)
+                (state & !DRAINING) + usize::from(reserve)
             } else {
                 state | REDRAW_WAITING
             };
@@ -53,13 +68,18 @@ impl FrameGate {
     fn release(&self) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            debug_assert!(state & !REDRAW_WAITING > 0);
-            let next = (state - 1) & !REDRAW_WAITING;
+            debug_assert!(state & FRAME_COUNT > 0);
+            let draining = state & DRAINING != 0 && (state & FRAME_COUNT) > 1;
+            let next = if draining {
+                state - 1
+            } else {
+                (state - 1) & !REDRAW_WAITING
+            };
             match self
                 .state
                 .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => return state & REDRAW_WAITING != 0,
+                Ok(_) => return !draining && state & REDRAW_WAITING != 0,
                 Err(current) => state = current,
             }
         }
@@ -70,15 +90,39 @@ impl FrameGate {
 pub(crate) struct FrameLifetime {
     gate: Arc<FrameGate>,
     completed: AtomicBool,
+    reservations: Mutex<Vec<Arc<TextureReservation>>>,
 }
 
 impl FrameLifetime {
-    /// Signal success OR GPU error. Returns whether deferred redraw demand needs waking.
+    /// Signal success OR GPU error. Wake deferred demand or reclaim retired cache slots.
     pub(crate) fn complete(&self) -> bool {
         if self.completed.swap(true, Ordering::AcqRel) {
             return false;
         }
-        self.gate.release()
+        let reclaim = {
+            let mut reservations = self.reservations.lock().unwrap();
+            let reclaim = reservations
+                .iter()
+                .any(|reservation| reservation.is_retired());
+            for reservation in reservations.iter() {
+                reservation.end_read();
+            }
+            reservations.clear();
+            reclaim
+        };
+        self.gate.release() || reclaim
+    }
+
+    pub(crate) fn retain_reservation(&self, reservation: &Arc<TextureReservation>) {
+        let mut reservations = self.reservations.lock().unwrap();
+        if !self.completed.load(Ordering::Acquire)
+            && !reservations
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, reservation))
+        {
+            reservation.begin_read();
+            reservations.push(reservation.clone());
+        }
     }
 }
 
@@ -130,6 +174,12 @@ impl<T> TextureVersions<T> {
             .map(|version| &version.resource)
     }
 
+    pub(crate) fn current_busy(&mut self) -> bool {
+        self.versions
+            .get_mut(self.current)
+            .is_some_and(|version| !version.writable())
+    }
+
     pub(crate) fn mark_read(&mut self, frame: &Arc<FrameLifetime>) {
         let version = &mut self.versions[self.current];
         version.writable();
@@ -141,6 +191,22 @@ impl<T> TextureVersions<T> {
         {
             version.readers.push(reader);
         }
+    }
+
+    /// The current image is the only surviving copy after wl_buffer.release.
+    /// Reclaim only idle alternate versions, never the current image or a reader.
+    pub(crate) fn prune_idle(&mut self) {
+        let mut index = 0;
+        let mut current = self.current;
+        self.versions.retain_mut(|version| {
+            let keep = index == self.current || !version.writable();
+            if !keep && index < self.current {
+                current -= 1;
+            }
+            index += 1;
+            keep
+        });
+        self.current = current;
     }
 
     /// The callback can CPU-write only the idle resource it receives. `is_current`
@@ -182,7 +248,6 @@ impl<T> TextureVersions<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     type Pixels = Arc<Mutex<[u8; 4]>>;
 
@@ -350,5 +415,91 @@ mod tests {
         assert_eq!(versions.update(|_, _| None), Err(UpdateError::Rejected));
         assert_eq!(*versions.current().unwrap().lock().unwrap(), [1; 4]);
         assert_eq!(versions.versions.len(), 1);
+    }
+
+    #[test]
+    fn budget_survives_cache_eviction_until_last_gpu_reader_completes() {
+        let budget = TextureBudget::new(8, 2);
+        let wakeups = Arc::new(AtomicUsize::new(0));
+        let callback_wakeups = wakeups.clone();
+        let wake = BudgetWake::new(move || {
+            callback_wakeups.fetch_add(1, Ordering::Relaxed);
+        });
+        let reservation = budget.reserve(4, &wake).unwrap();
+        let weak = Arc::downgrade(&reservation);
+        let gate = Arc::new(FrameGate::default());
+        let first = gate.begin().unwrap();
+        let second = gate.begin().unwrap();
+        first.retain_reservation(&reservation);
+        first.retain_reservation(&reservation);
+        second.retain_reservation(&reservation);
+        assert_eq!(first.reservations.lock().unwrap().len(), 1);
+        drop(reservation); // Simulate evicting/dropping the renderer cache.
+        assert!(weak.upgrade().is_some());
+        assert!(budget.reserve(8, &wake).is_none());
+        first.complete();
+        assert!(weak.upgrade().is_some());
+        assert!(budget.reserve(8, &wake).is_none());
+        assert_eq!(wakeups.load(Ordering::Relaxed), 0);
+        std::thread::spawn(move || second.complete())
+            .join()
+            .unwrap();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(wakeups.load(Ordering::Relaxed), 1);
+        assert!(budget.reserve(8, &wake).is_some());
+        assert!(!first.complete());
+    }
+
+    #[test]
+    fn pruning_reclaims_only_idle_alternates_and_preserves_current_image() {
+        let gate = Arc::new(FrameGate::default());
+        let mut versions = TextureVersions::new();
+        upload(&mut versions, [1; 4]).unwrap();
+        let first = gate.begin().unwrap();
+        versions.mark_read(&first);
+        upload(&mut versions, [2; 4]).unwrap();
+        versions.prune_idle();
+        assert_eq!(versions.versions.len(), 2);
+        first.complete();
+        versions.prune_idle();
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(*versions.current().unwrap().lock().unwrap(), [2; 4]);
+        // An idle current slot remains the only complete copy of released SHM.
+        versions.prune_idle();
+        assert_eq!(versions.versions.len(), 1);
+    }
+
+    #[test]
+    fn retired_completion_requests_reclamation_without_polling_current_images() {
+        let budget = TextureBudget::shared();
+        let wake = BudgetWake::new(|| {});
+        let reservation = budget.reserve(4, &wake).unwrap();
+        let gate = Arc::new(FrameGate::default());
+        let frame = gate.begin().unwrap();
+        frame.retain_reservation(&reservation);
+        reservation.set_retired(true);
+        assert!(frame.complete());
+        assert!(!frame.complete());
+        reservation.set_retired(false); // Reuse an idle version as the current image.
+        let frame = gate.begin().unwrap();
+        frame.retain_reservation(&reservation);
+        assert!(!frame.complete()); // A cached fallback cannot start a redraw loop.
+    }
+
+    #[test]
+    fn budget_pressure_drains_fallback_readers_before_retrying_in_place() {
+        let gate = Arc::new(FrameGate::default());
+        let first = gate.begin().unwrap();
+        let fallback = gate.begin().unwrap();
+        gate.defer_until_idle();
+        assert!(!gate.ready());
+        assert!(gate.begin().is_none());
+        assert!(!first.complete());
+        assert!(!gate.ready());
+        assert!(fallback.complete());
+        assert!(gate.ready());
+        let retry = gate.begin().unwrap();
+        assert!(!retry.complete());
+        assert_eq!(gate.state.load(Ordering::Acquire), 0);
     }
 }

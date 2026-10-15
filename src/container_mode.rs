@@ -22,7 +22,7 @@ use crate::application_model::{
     ApplicationInstanceSnapshot, DisplayStatus, InstanceStatus, LaunchStep, OperationTask,
     ProfileStatus, RuntimeStatus, TaskStatus, TaskStep, TaskStepStatus,
 };
-use crate::container_sessions::{self, ContainerSession};
+use crate::container_sessions::{self, ContainerSession, ProfileId};
 use crate::event_loop_signal::Sender;
 use crate::messages::CompositorMessage;
 use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quote};
@@ -37,12 +37,13 @@ static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
 static HANDLER: Mutex<Option<usize>> = Mutex::new(None);
 static SELECTED_NAV: Mutex<usize> = Mutex::new(0);
 static SELECTED_TAB: Mutex<usize> = Mutex::new(0);
-static SELECTED_SESSION: Mutex<Option<usize>> = Mutex::new(None);
+static SELECTED_SESSION: Mutex<Option<ProfileId>> = Mutex::new(None);
+static PROFILE_VIEW: Mutex<Vec<ProfileId>> = Mutex::new(Vec::new());
 static ACTIVITY: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static SESSION_STATES: Mutex<Vec<(usize, SessionState)>> = Mutex::new(Vec::new());
-static SESSION_LOGS: Mutex<Vec<(usize, Vec<String>)>> = Mutex::new(Vec::new());
+static SESSION_STATES: Mutex<Vec<(ProfileId, SessionState)>> = Mutex::new(Vec::new());
+static SESSION_LOGS: Mutex<Vec<(ProfileId, Vec<String>)>> = Mutex::new(Vec::new());
 static OPERATION_TASKS: Mutex<Vec<OperationTask>> = Mutex::new(Vec::new());
-static AUTO_VALIDATION_REQUESTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static AUTO_VALIDATION_REQUESTED: Mutex<Vec<ProfileId>> = Mutex::new(Vec::new());
 static IMAGE_TASK_ACTIVE: Mutex<Option<String>> = Mutex::new(None);
 static IMAGE_TASK_DETAIL: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_PULL_SESSION: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -135,6 +136,7 @@ struct HealthCheckSummary {
 struct ActiveSessionSnapshot {
     instance: ApplicationInstanceSnapshot,
     display_runtime_dir: Option<String>,
+    profile_id: ProfileId,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -291,52 +293,97 @@ impl Default for AddSessionDefaults {
 }
 
 fn send(msg: CompositorMessage) {
-    if let Ok(g) = SENDER.lock() {
-        if let Some(tx) = g.as_ref() {
-            let _ = tx.send(msg);
+    let sender = SENDER.lock().ok().and_then(|sender| sender.clone());
+    if let Some(sender) = sender {
+        let _ = sender.send(msg);
+    }
+}
+
+trait ProfileKey: Copy {
+    fn profile_id(self) -> Option<ProfileId>;
+}
+impl ProfileKey for usize {
+    fn profile_id(self) -> Option<ProfileId> {
+        PROFILE_VIEW.lock().unwrap().get(self).copied()
+    }
+}
+impl ProfileKey for ProfileId {
+    fn profile_id(self) -> Option<ProfileId> {
+        Some(self)
+    }
+}
+fn profile_id_at(index: impl ProfileKey) -> Option<ProfileId> {
+    index.profile_id()
+}
+
+fn view_index(id: ProfileId) -> Option<usize> {
+    PROFILE_VIEW
+        .lock()
+        .unwrap()
+        .iter()
+        .position(|stored| *stored == id)
+}
+
+fn session_for_view(index: usize) -> Option<ContainerSession> {
+    container_sessions::resolve_session(profile_id_at(index)?).ok()
+}
+
+fn bind_profile_control(control: &AnyObject, index: usize) {
+    if let Some(id) = profile_id_at(index) {
+        unsafe {
+            let _: () = msg_send![control, setIdentifier: &*NSString::from_str(&id.to_string())];
         }
     }
 }
 
+fn profile_action_index(sender: &AnyObject) -> Option<usize> {
+    let identifier: Option<Retained<NSString>> = unsafe { msg_send_id![sender, identifier] };
+    let id = identifier?.to_string().parse::<ProfileId>().ok()?;
+    // Never reinterpret a stale tag as the profile now occupying that position.
+    if container_sessions::resolve_session(id).is_err() {
+        show_error_alert(
+            "This application profile no longer exists. Refresh the application list.",
+        );
+        return None;
+    }
+    view_index(id)
+}
+
 fn schedule_automatic_profile_validation(sessions: &[ContainerSession]) {
-    for (index, _) in sessions.iter().enumerate() {
+    for (index, session) in sessions.iter().enumerate() {
         if session_state(index).is_some() {
             continue;
         }
         let should_validate = {
             let mut requested = AUTO_VALIDATION_REQUESTED.lock().unwrap();
-            if requested.contains(&index) {
+            if requested.contains(&session.id) {
                 false
             } else {
-                requested.push(index);
+                requested.push(session.id);
                 true
             }
         };
         if should_validate {
-            send(CompositorMessage::CheckContainerSession(index));
+            if let Some(id) = profile_id_at(index) {
+                send(CompositorMessage::CheckContainerSession(id));
+            }
         }
     }
 }
 
-fn invalidate_profile_validation(index: usize) {
+fn invalidate_profile_validation(index: impl ProfileKey) {
     SESSION_STATES
         .lock()
         .unwrap()
-        .retain(|(stored, _)| *stored != index);
+        .retain(|(stored, _)| Some(*stored) != profile_id_at(index));
     AUTO_VALIDATION_REQUESTED
         .lock()
         .unwrap()
-        .retain(|stored| *stored != index);
-}
-
-fn invalidate_all_profile_validation() {
-    SESSION_STATES.lock().unwrap().clear();
-    AUTO_VALIDATION_REQUESTED.lock().unwrap().clear();
+        .retain(|stored| Some(*stored) != profile_id_at(index));
 }
 
 fn remember_launch_request(index: usize) {
-    let sessions = container_sessions::load_sessions();
-    let message = match sessions.get(index) {
+    let message = match session_for_view(index) {
         Some(session) => {
             clear_session_logs(index);
             start_launch_task(index, &session.name);
@@ -347,14 +394,14 @@ fn remember_launch_request(index: usize) {
                     "Launching {} through {} with command: {}",
                     session.name,
                     runtime_label(&session.runtime),
-                    session_display_command(session)
+                    session_display_command(&session)
                 ),
             );
             format!(
                 "Launch requested: {} via {} ({})",
                 session.name,
                 runtime_label(&session.runtime),
-                session_display_command(session)
+                session_display_command(&session)
             )
         }
         None => format!(
@@ -366,6 +413,7 @@ fn remember_launch_request(index: usize) {
 }
 
 fn push_activity(message: String) {
+    let message = crate::process_output::redaction::redact(&message);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -511,12 +559,22 @@ fn active_task_count() -> usize {
         .count()
 }
 
-fn launch_task_key(index: usize) -> String {
-    format!("launch-profile-{index}")
+fn launch_task_key(index: impl ProfileKey) -> String {
+    format!(
+        "launch-profile-{}",
+        profile_id_at(index)
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+    )
 }
 
-fn stop_task_key(index: usize) -> String {
-    format!("stop-profile-{index}")
+fn stop_task_key(index: impl ProfileKey) -> String {
+    format!(
+        "stop-profile-{}",
+        profile_id_at(index)
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+    )
 }
 
 fn runtime_task_key(runtime: &str) -> String {
@@ -567,7 +625,7 @@ fn runtime_system_state(runtime: &str) -> Option<RuntimeSystemState> {
         .cloned()
 }
 
-fn start_launch_task(index: usize, name: &str) {
+fn start_launch_task(index: impl ProfileKey, name: &str) {
     start_operation_task(
         launch_task_key(index),
         "Launch application",
@@ -576,7 +634,32 @@ fn start_launch_task(index: usize, name: &str) {
     );
 }
 
-pub fn record_launch_progress(index: usize, step: LaunchStep, detail: &str) {
+pub fn ensure_launch_task(id: ProfileId, name: &str) {
+    if !latest_operation_task(&launch_task_key(id)).is_some_and(|task| task.status.is_active()) {
+        start_launch_task(id, name);
+    }
+}
+
+pub fn ensure_stop_task(id: ProfileId, name: &str) {
+    if !latest_operation_task(&stop_task_key(id)).is_some_and(|task| task.status.is_active()) {
+        start_operation_task(
+            stop_task_key(id),
+            "Stop application",
+            name,
+            [
+                "Ask application to exit",
+                "Stop application process",
+                "Stop Waypipe worker",
+                "Release display",
+                "Stop container",
+                "Mark instance exited",
+            ],
+        );
+    }
+}
+
+pub fn record_launch_progress(id: ProfileId, step: LaunchStep, detail: &str) {
+    let index = id;
     let key = launch_task_key(index);
     update_operation_task_step(
         &key,
@@ -586,14 +669,15 @@ pub fn record_launch_progress(index: usize, step: LaunchStep, detail: &str) {
     );
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|profile| profile.name.as_str())
         .unwrap_or("Application");
     if let Some((_, state)) = SESSION_STATES
         .lock()
         .unwrap()
         .iter_mut()
-        .find(|(stored, _)| *stored == index)
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
     {
         state.profile = ProfileStatus::Ready;
         state.instance = Some(InstanceStatus::Starting);
@@ -607,9 +691,37 @@ pub fn record_launch_progress(index: usize, step: LaunchStep, detail: &str) {
     }
 }
 
-pub fn record_launch_cancelled(index: usize, detail: &str) {
+pub fn record_launch_cancelling(id: ProfileId, detail: &str) {
+    let key = launch_task_key(id);
+    if let Some(task) = OPERATION_TASKS
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .rev()
+        .find(|task| task.key == key)
+    {
+        task.status = TaskStatus::Running;
+        task.detail = Some(detail.into());
+        task.updated_at_unix_ms = now_unix_ms();
+    }
+    set_session_state(id, "Stopping", detail.into());
+    push_activity(detail.into());
+    unsafe {
+        rebuild_window();
+    }
+}
+
+pub fn record_launch_cancelled(id: ProfileId, detail: &str) {
+    let index = id;
     let key = launch_task_key(index);
     finish_operation_task(&key, TaskStatus::Cancelled, detail.to_string());
+    if latest_operation_task(&stop_task_key(id)).is_some_and(|task| task.status.is_active()) {
+        finish_operation_task(
+            &stop_task_key(id),
+            TaskStatus::Completed,
+            detail.to_string(),
+        );
+    }
     set_session_state(index, "Stopped", detail.into());
     push_activity(detail.into());
     unsafe {
@@ -617,12 +729,13 @@ pub fn record_launch_cancelled(index: usize, detail: &str) {
     }
 }
 
-pub fn record_force_stop_available(index: usize) {
+pub fn record_force_stop_available(id: ProfileId) {
+    let index = id;
     if let Some((_, state)) = SESSION_STATES
         .lock()
         .unwrap()
         .iter_mut()
-        .find(|(stored, _)| *stored == index)
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
     {
         state.force_stop_available = true;
         state.detail =
@@ -630,14 +743,15 @@ pub fn record_force_stop_available(index: usize) {
     }
     push_activity(format!(
         "Application #{} did not exit gracefully; Force Stop is available",
-        index + 1
+        index
     ));
     unsafe {
         rebuild_window();
     }
 }
 
-pub fn record_stop_progress(index: usize, step: &str, detail: &str) {
+pub fn record_stop_progress(id: ProfileId, step: &str, detail: &str) {
+    let index = id;
     update_operation_task_step(
         &stop_task_key(index),
         step,
@@ -812,7 +926,7 @@ fn worker_performance_snapshot(runtime_dir: &str) -> Option<PerformanceSnapshot>
     (now_unix_ms().saturating_sub(snapshot.sampled_at_unix_ms) <= 5_000).then_some(snapshot)
 }
 
-fn active_session_performance(index: usize) -> Option<PerformanceSnapshot> {
+fn active_session_performance(index: impl ProfileKey) -> Option<PerformanceSnapshot> {
     let active = active_session(index)?;
     performance_for_active_session(&active)
 }
@@ -944,7 +1058,7 @@ pub(crate) fn control_cursor_paths() -> Vec<serde_json::Value> {
 pub fn record_active_container_sessions(
     sessions: Vec<(
         u64,
-        usize,
+        ProfileId,
         u128,
         Option<u32>,
         u32,
@@ -958,7 +1072,7 @@ pub fn record_active_container_sessions(
         .map(
             |(
                 instance_id,
-                profile_index,
+                profile_id,
                 started_at_unix_ms,
                 container_pid,
                 waypipe_pid,
@@ -969,7 +1083,7 @@ pub fn record_active_container_sessions(
                 ActiveSessionSnapshot {
                     instance: ApplicationInstanceSnapshot {
                         id: instance_id,
-                        profile_index,
+                        profile_id,
                         status: InstanceStatus::Running,
                         started_at_unix_ms,
                         container_pid,
@@ -978,6 +1092,7 @@ pub fn record_active_container_sessions(
                         display_pid,
                     },
                     display_runtime_dir,
+                    profile_id,
                 }
             },
         )
@@ -1143,12 +1258,12 @@ pub(crate) fn control_runtime_states() -> Vec<(String, RuntimeStatus, String)> {
         .collect()
 }
 
-fn active_session(index: usize) -> Option<ActiveSessionSnapshot> {
+fn active_session(index: impl ProfileKey) -> Option<ActiveSessionSnapshot> {
     ACTIVE_SESSIONS
         .lock()
         .unwrap()
         .iter()
-        .find(|session| session.instance.profile_index == index)
+        .find(|session| Some(session.profile_id) == profile_id_at(index))
         .cloned()
 }
 
@@ -1157,13 +1272,13 @@ fn active_sessions_snapshot() -> Vec<ActiveSessionSnapshot> {
 }
 
 pub(crate) fn control_active_sessions()
--> Vec<(u64, usize, u128, Option<u32>, u32, String, Option<u32>)> {
+-> Vec<(u64, ProfileId, u128, Option<u32>, u32, String, Option<u32>)> {
     active_sessions_snapshot()
         .into_iter()
         .map(|session| {
             (
                 session.instance.id,
-                session.instance.profile_index,
+                session.profile_id,
                 session.instance.started_at_unix_ms,
                 session.instance.container_pid,
                 session.instance.waypipe_pid,
@@ -1174,23 +1289,23 @@ pub(crate) fn control_active_sessions()
         .collect()
 }
 
-pub(crate) fn control_session_state(index: usize) -> Option<(String, String)> {
+pub(crate) fn control_session_state(index: ProfileId) -> Option<(String, String)> {
     SESSION_STATES
         .lock()
         .unwrap()
         .iter()
-        .find(|(stored, _)| *stored == index)
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
         .map(|(_, state)| (session_state_label(state).to_string(), state.detail.clone()))
 }
 
 fn active_display_conflict(index: usize) -> Option<String> {
     let sessions = container_sessions::load_sessions();
-    let requested = sessions.get(index)?;
+    let requested = session_for_view(index)?;
     let active_sessions = ACTIVE_SESSIONS.lock().unwrap();
     let default_in_use = active_sessions.iter().any(|active| {
-        active.instance.profile_index != index && active.instance.display_slot == "default"
+        Some(active.profile_id) != profile_id_at(index) && active.instance.display_slot == "default"
     });
-    let requested_target = session_display_target(requested);
+    let requested_target = session_display_target(&requested);
     let requested_slot = match requested_target.as_str() {
         "auto" if !default_in_use => "default".to_string(),
         "auto" | "dedicated" => {
@@ -1202,11 +1317,13 @@ fn active_display_conflict(index: usize) -> Option<String> {
     active_sessions
         .iter()
         .find(|active| {
-            active.instance.profile_index != index && active.instance.display_slot == requested_slot
+            Some(active.profile_id) != profile_id_at(index)
+                && active.instance.display_slot == requested_slot
         })
         .and_then(|active| {
             sessions
-                .get(active.instance.profile_index)
+                .iter()
+                .find(|session| session.id == active.profile_id)
                 .map(|session| session.name.clone())
         })
 }
@@ -1273,22 +1390,28 @@ pub(crate) fn control_activity_snapshot(limit: usize) -> Vec<String> {
     activity[start..].to_vec()
 }
 
-fn push_session_log(index: usize, source: &str, line: &str) {
+fn push_session_log(index: impl ProfileKey, source: &str, line: &str) {
     let mut logs = SESSION_LOGS.lock().unwrap();
     let formatted = format!("[{}] {}", source, clean_session_log_line(line));
-    if let Some((_, lines)) = logs.iter_mut().find(|(stored, _)| *stored == index) {
+    if let Some((_, lines)) = logs
+        .iter_mut()
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
+    {
         lines.push(formatted);
         if lines.len() > 200 {
             let overflow = lines.len() - 200;
             lines.drain(0..overflow);
         }
     } else {
-        logs.push((index, vec![formatted]));
+        if let Some(id) = profile_id_at(index) {
+            logs.push((id, vec![formatted]));
+        }
     }
 }
 
 fn clean_session_log_line(line: &str) -> String {
     let stripped = strip_ansi_sequences(line);
+    let stripped = crate::process_output::redaction::redact(&stripped);
     let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     if is_niri_locale_warning(&collapsed) {
         "niri: locale1 watcher is unavailable in this container; this is non-fatal when the desktop is running.".into()
@@ -1342,9 +1465,12 @@ fn strip_ansi_sequences(line: &str) -> String {
     output
 }
 
-fn clear_session_logs(index: usize) {
+fn clear_session_logs(index: impl ProfileKey) {
     let mut logs = SESSION_LOGS.lock().unwrap();
-    if let Some((_, lines)) = logs.iter_mut().find(|(stored, _)| *stored == index) {
+    if let Some((_, lines)) = logs
+        .iter_mut()
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
+    {
         lines.clear();
     }
 }
@@ -1361,20 +1487,51 @@ fn normalize_profile(profile: &str) -> Option<String> {
     Some(normalized.into())
 }
 
-fn session_logs(index: usize) -> Vec<String> {
+fn session_logs(index: impl ProfileKey) -> Vec<String> {
     SESSION_LOGS
         .lock()
         .unwrap()
         .iter()
-        .find(|(stored, _)| *stored == index)
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
         .map(|(_, lines)| lines.clone())
         .unwrap_or_default()
 }
 
-pub(crate) fn control_session_logs(index: usize, limit: usize) -> Vec<String> {
+pub(crate) fn control_session_logs(index: ProfileId, limit: usize) -> Vec<String> {
     let logs = session_logs(index);
     let start = logs.len().saturating_sub(limit);
-    logs[start..].to_vec()
+    let session = container_sessions::load_sessions()
+        .into_iter()
+        .find(|session| session.id == index);
+    let mut redactor = session
+        .as_ref()
+        .map(profile_diagnostic_redactor)
+        .unwrap_or_default();
+    logs[start..]
+        .iter()
+        .map(|line| redactor.redact(line))
+        .collect()
+}
+
+fn profile_diagnostic_redactor(
+    session: &ContainerSession,
+) -> crate::process_output::redaction::Redactor {
+    crate::process_output::redaction::Redactor::with_secrets(
+        session
+            .env
+            .iter()
+            .filter_map(|entry| entry.split_once('=').map(|(_, value)| value.to_string())),
+    )
+}
+
+fn diagnostic_lines(lines: Vec<String>) -> Vec<String> {
+    let text = crate::process_output::redaction::output(lines.join("\n").as_bytes());
+    crate::process_output::lines(text.as_bytes())
+        .filter_map(Result::ok)
+        .map(|line| clean_session_log_line(&line))
+        .filter(|line| !line.trim().is_empty())
+        .take(256)
+        .collect()
 }
 
 fn smoke_image_reference() -> &'static str {
@@ -1460,6 +1617,7 @@ fn request_smoke_image_build() {
 
 fn smoke_session() -> ContainerSession {
     ContainerSession {
+        id: ProfileId::UNSAVED,
         name: "Niri Desktop".into(),
         image: smoke_image_reference().into(),
         runtime: "container".into(),
@@ -1487,21 +1645,17 @@ fn add_or_select_smoke_session() {
         .position(|session| session.image == smoke_image_reference())
     {
         *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-        *SELECTED_SESSION.lock().unwrap() = Some(index);
+        *SELECTED_SESSION.lock().unwrap() = Some(sessions[index].id);
         push_activity("Selected existing example session.".into());
         return;
     }
 
     let session = smoke_session();
     match container_sessions::append_session(&session) {
-        Ok(()) => {
-            let sessions = container_sessions::load_sessions();
+        Ok(id) => {
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            let index = sessions.len().checked_sub(1);
-            *SELECTED_SESSION.lock().unwrap() = index;
-            if let Some(index) = index {
-                invalidate_profile_validation(index);
-            }
+            *SELECTED_SESSION.lock().unwrap() = Some(id);
+            invalidate_profile_validation(id);
             push_activity(format!("Restored example session: {}", session.image));
             send(CompositorMessage::ReloadMenu);
         }
@@ -1532,10 +1686,13 @@ fn session_state_label(state: &SessionState) -> &'static str {
         .unwrap_or_else(|| state.profile.label())
 }
 
-fn set_session_state(index: usize, label: &'static str, detail: String) {
+fn set_session_state(index: impl ProfileKey, label: &'static str, detail: String) {
     let (profile, instance) = state_from_legacy_label(label);
     let mut states = SESSION_STATES.lock().unwrap();
-    if let Some((_, state)) = states.iter_mut().find(|(stored, _)| *stored == index) {
+    if let Some((_, state)) = states
+        .iter_mut()
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
+    {
         state.profile = profile;
         state.instance = instance;
         state.detail = detail;
@@ -1547,7 +1704,10 @@ fn set_session_state(index: usize, label: &'static str, detail: String) {
         }
     } else {
         states.push((
-            index,
+            match profile_id_at(index) {
+                Some(id) => id,
+                None => return,
+            },
             SessionState {
                 profile,
                 instance,
@@ -1560,12 +1720,12 @@ fn set_session_state(index: usize, label: &'static str, detail: String) {
     }
 }
 
-fn session_state(index: usize) -> Option<SessionState> {
+fn session_state(index: impl ProfileKey) -> Option<SessionState> {
     SESSION_STATES
         .lock()
         .unwrap()
         .iter()
-        .find(|(stored, _)| *stored == index)
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
         .map(|(_, state)| state.clone())
 }
 
@@ -1606,15 +1766,17 @@ fn checked_instance_status(
     (runtime_running && tracked_by_this_process).then_some(InstanceStatus::Running)
 }
 
-pub fn record_launch_success(index: usize, report: &container_sessions::LaunchReport) {
+pub fn record_launch_success(id: ProfileId, report: &container_sessions::LaunchReport) {
+    let index = id;
     invalidate_ui_command_cache();
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let detail = format!(
-        "{} is running. Runtime: {}; container: {}; command: {}; host socket: {}; container socket: {}; waypipe pid: {}",
+        "{} transport processes started; application window readiness is not inferred from process startup. Runtime: {}; container: {}; command: {}; host socket: {}; container socket: {}; waypipe pid: {}",
         name,
         report.runtime,
         report.container_name,
@@ -1627,7 +1789,10 @@ pub fn record_launch_success(index: usize, report: &container_sessions::LaunchRe
     finish_operation_task(
         &launch_task_key(index),
         TaskStatus::Completed,
-        format!("{} is running", name),
+        format!(
+            "{} transport processes started; inspect the display and logs to verify the application",
+            name
+        ),
     );
     push_activity(format!("Started: {}", detail));
     unsafe {
@@ -1635,25 +1800,33 @@ pub fn record_launch_success(index: usize, report: &container_sessions::LaunchRe
     }
 }
 
-pub fn record_launch_already_running(index: usize) {
+pub fn record_launch_already_running(id: ProfileId) {
+    let index = id;
     let sessions = container_sessions::load_sessions();
     let detail = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| {
             format!(
                 "{} is already running. Stop it before launching again.",
                 session.name
             )
         })
-        .unwrap_or_else(|| format!("Session #{} is already running.", index + 1));
+        .unwrap_or_else(|| format!("Session #{} is already running.", index));
     set_session_state(index, "Running", detail.clone());
+    finish_operation_task(
+        &launch_task_key(index),
+        TaskStatus::Completed,
+        detail.clone(),
+    );
     push_activity(format!("Launch ignored: {}", detail));
     unsafe {
         rebuild_window();
     }
 }
 
-pub fn record_launch_blocked(index: usize, detail: &str) {
+pub fn record_launch_blocked(id: ProfileId, detail: &str) {
+    let index = id;
     *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
     *SELECTED_SESSION.lock().unwrap() = Some(index);
     set_session_state(index, "Blocked", detail.into());
@@ -1668,10 +1841,12 @@ pub fn record_launch_blocked(index: usize, detail: &str) {
     }
 }
 
-pub fn record_check_success(index: usize, report: &container_sessions::CheckReport) {
+pub fn record_check_success(id: ProfileId, report: &container_sessions::CheckReport) {
+    let index = id;
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let tracked = active_session(index).is_some();
@@ -1693,7 +1868,7 @@ pub fn record_check_success(index: usize, report: &container_sessions::CheckRepo
         .lock()
         .unwrap()
         .iter_mut()
-        .find(|(stored, _)| *stored == index)
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
     {
         state.failed_step = None;
         state.health_check = Some(HealthCheckSummary {
@@ -1705,7 +1880,7 @@ pub fn record_check_success(index: usize, report: &container_sessions::CheckRepo
     AUTO_VALIDATION_REQUESTED
         .lock()
         .unwrap()
-        .retain(|stored| *stored != index);
+        .retain(|stored| Some(*stored) != profile_id_at(index));
     push_activity(format!("Profile validated: {}", detail));
     unsafe {
         rebuild_window();
@@ -1734,10 +1909,12 @@ fn check_report_detail(
     detail
 }
 
-pub fn record_check_failure(index: usize, error: &container_sessions::LaunchError) {
+pub fn record_check_failure(id: ProfileId, error: &container_sessions::LaunchError) {
+    let index = id;
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let detail = format!("{} check failed: {}", name, error);
@@ -1754,7 +1931,7 @@ pub fn record_check_failure(index: usize, error: &container_sessions::LaunchErro
         .lock()
         .unwrap()
         .iter_mut()
-        .find(|(stored, _)| *stored == index)
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
     {
         state.profile = profile_status;
         state.instance = None;
@@ -1764,7 +1941,7 @@ pub fn record_check_failure(index: usize, error: &container_sessions::LaunchErro
     AUTO_VALIDATION_REQUESTED
         .lock()
         .unwrap()
-        .retain(|stored| *stored != index);
+        .retain(|stored| Some(*stored) != profile_id_at(index));
     push_activity(detail);
     unsafe {
         rebuild_window();
@@ -1785,10 +1962,12 @@ fn check_failure_profile_status(error: &container_sessions::LaunchError) -> Prof
     }
 }
 
-pub fn record_launch_failure(index: usize, error: &container_sessions::LaunchError) {
+pub fn record_launch_failure(id: ProfileId, error: &container_sessions::LaunchError) {
+    let index = id;
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let detail = format!("{} failed to start: {}", name, error);
@@ -1806,7 +1985,7 @@ pub fn record_launch_failure(index: usize, error: &container_sessions::LaunchErr
         .lock()
         .unwrap()
         .iter_mut()
-        .find(|(stored, _)| *stored == index)
+        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
     {
         state.instance = Some(InstanceStatus::Failed);
     }
@@ -1817,7 +1996,8 @@ pub fn record_launch_failure(index: usize, error: &container_sessions::LaunchErr
     }
 }
 
-pub fn record_session_log(index: usize, source: &str, line: &str) {
+pub fn record_session_log(id: ProfileId, source: &str, line: &str) {
+    let index = id;
     push_session_log(index, source, line);
     push_activity(format!("{}: {}", source, clean_session_log_line(line)));
     unsafe {
@@ -2328,20 +2508,13 @@ pub fn record_runtime_container_details_loaded(
     if !selected_matches {
         return;
     }
-    let clean_lines = |lines: Vec<String>| {
-        lines
-            .into_iter()
-            .map(|line| clean_session_log_line(&line))
-            .filter(|line| !line.trim().is_empty())
-            .collect::<Vec<_>>()
-    };
     *RUNTIME_CONTAINER_DETAILS.lock().unwrap() = Some(RuntimeContainerDetails {
         runtime: runtime.to_string(),
         name: name.to_string(),
-        info: clean_lines(info),
-        logs: clean_lines(logs),
-        stats: clean_lines(stats),
-        error,
+        info: diagnostic_lines(info),
+        logs: diagnostic_lines(logs),
+        stats: diagnostic_lines(stats),
+        error: error.map(|error| crate::process_output::redaction::redact(&error)),
     });
     unsafe {
         rebuild_window();
@@ -2492,11 +2665,13 @@ pub fn record_runtime_system_action_finished(
     }
 }
 
-pub fn record_stop_success(index: usize) {
+pub fn record_stop_success(id: ProfileId) {
+    let index = id;
     invalidate_ui_command_cache();
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let detail = format!("{} stopped.", name);
@@ -2508,10 +2683,12 @@ pub fn record_stop_success(index: usize) {
     }
 }
 
-pub fn record_stop_failure(index: usize, error: &str) {
+pub fn record_stop_failure(id: ProfileId, error: &str) {
+    let index = id;
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let detail = format!("{} stop failed: {}", name, error);
@@ -2523,10 +2700,12 @@ pub fn record_stop_failure(index: usize, error: &str) {
     }
 }
 
-pub fn record_terminal_opened(index: usize) {
+pub fn record_terminal_opened(id: ProfileId) {
+    let index = id;
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     push_activity(format!("Terminal opened for {}.", name));
@@ -2535,10 +2714,12 @@ pub fn record_terminal_opened(index: usize) {
     }
 }
 
-pub fn record_terminal_open_failed(index: usize, error: &str) {
+pub fn record_terminal_open_failed(id: ProfileId, error: &str) {
+    let index = id;
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let detail = format!("Terminal failed for {}: {}", name, error);
@@ -2549,11 +2730,13 @@ pub fn record_terminal_open_failed(index: usize, error: &str) {
     }
 }
 
-pub fn record_process_exit(index: usize, process: &str, status: &str) {
+pub fn record_process_exit(id: ProfileId, process: &str, status: &str) {
+    let index = id;
     invalidate_ui_command_cache();
     let sessions = container_sessions::load_sessions();
     let name = sessions
-        .get(index)
+        .iter()
+        .find(|session| session.id == index)
         .map(|session| session.name.as_str())
         .unwrap_or("Unknown application");
     let detail = format!("{} exited because {} ended with {}.", name, process, status);
@@ -2594,8 +2777,7 @@ unsafe fn show_add_session_dialog_with_defaults(defaults: AddSessionDefaults) {
 }
 
 unsafe fn show_edit_session_dialog(index: usize) {
-    let sessions = container_sessions::load_sessions();
-    let Some(session) = sessions.get(index).cloned() else {
+    let Some(session) = session_for_view(index) else {
         show_error_alert("Application profile no longer exists.");
         return;
     };
@@ -2606,7 +2788,7 @@ unsafe fn show_edit_session_dialog(index: usize) {
 
 unsafe fn duplicate_session_profile(index: usize) {
     let sessions = container_sessions::load_sessions();
-    let Some(source) = sessions.get(index).cloned() else {
+    let Some(source) = session_for_view(index) else {
         show_error_alert("Application profile no longer exists.");
         return;
     };
@@ -2614,14 +2796,10 @@ unsafe fn duplicate_session_profile(index: usize) {
     duplicate.name = unique_duplicate_name(&sessions, &source.name);
 
     match container_sessions::append_session(&duplicate) {
-        Ok(()) => {
-            let sessions = container_sessions::load_sessions();
+        Ok(id) => {
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            let index = sessions.len().checked_sub(1);
-            *SELECTED_SESSION.lock().unwrap() = index;
-            if let Some(index) = index {
-                invalidate_profile_validation(index);
-            }
+            *SELECTED_SESSION.lock().unwrap() = Some(id);
+            invalidate_profile_validation(id);
             push_activity(format!(
                 "Duplicated application profile: {}",
                 duplicate.name
@@ -2640,8 +2818,7 @@ unsafe fn duplicate_session_profile(index: usize) {
 }
 
 unsafe fn export_session_profile(index: usize) {
-    let sessions = container_sessions::load_sessions();
-    let Some(session) = sessions.get(index) else {
+    let Some(session) = session_for_view(index) else {
         show_error_alert("Application profile no longer exists.");
         return;
     };
@@ -2668,7 +2845,7 @@ unsafe fn export_session_profile(index: usize) {
     };
     match std::fs::write(
         path.to_string(),
-        container_sessions::session_to_toml(session),
+        container_sessions::session_to_toml(&session),
     ) {
         Ok(()) => push_activity(format!("Exported application profile: {}", session.name)),
         Err(error) => show_error_alert(&format!("Failed to export profile: {}", error)),
@@ -2676,8 +2853,7 @@ unsafe fn export_session_profile(index: usize) {
 }
 
 unsafe fn show_raw_session_profile(index: usize) {
-    let sessions = container_sessions::load_sessions();
-    let Some(session) = sessions.get(index) else {
+    let Some(session) = session_for_view(index) else {
         show_error_alert("Application profile no longer exists.");
         return;
     };
@@ -2693,7 +2869,7 @@ unsafe fn show_raw_session_profile(index: usize) {
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 560.0, 300.0)] };
     let field = add_label(
         &view,
-        &container_sessions::session_to_toml(session),
+        &container_sessions::session_to_toml(&session),
         rect(0.0, 0.0, 560.0, 300.0),
         mtm,
         TextStyle::Mono,
@@ -2709,8 +2885,7 @@ unsafe fn show_raw_session_profile(index: usize) {
 }
 
 unsafe fn show_session_resources_dialog(index: usize) {
-    let sessions = container_sessions::load_sessions();
-    let Some(mut session) = sessions.get(index).cloned() else {
+    let Some(mut session) = session_for_view(index) else {
         show_error_alert("Application profile no longer exists.");
         return;
     };
@@ -2805,9 +2980,9 @@ unsafe fn show_session_resources_dialog(index: usize) {
             return;
         }
     }
-    match container_sessions::replace_session(index, &session) {
+    match container_sessions::replace_session(session.id, &session) {
         Ok(()) => {
-            invalidate_profile_validation(index);
+            invalidate_profile_validation(session.id);
             push_activity(format!(
                 "Saved resource settings for {}; effective on the next launch.",
                 session.name
@@ -3182,6 +3357,7 @@ unsafe fn show_session_dialog(
     let profile = normalize_profile(&profile);
     let runtime_args = default_gui_runtime_args(&runtime, profile.as_deref());
     let mut session = ContainerSession {
+        id: ProfileId::UNSAVED,
         name: if name.is_empty() {
             default_session_name(&image)
         } else {
@@ -3213,7 +3389,8 @@ unsafe fn show_session_dialog(
         env,
     };
 
-    let result = if let Some((index, original)) = edit_target {
+    let result = if let Some((_index, original)) = edit_target {
+        session.id = original.id;
         session.app = original.app;
         session.socket = original.socket;
         session.container_socket = original.container_socket;
@@ -3221,20 +3398,18 @@ unsafe fn show_session_dialog(
         session.waypipe_compress = original.waypipe_compress;
         session.waypipe_threads = original.waypipe_threads;
         session.runtime_args = original.runtime_args;
-        container_sessions::replace_session(index, &session).map(|_| Some(index))
+        container_sessions::replace_session(session.id, &session).map(|_| Some(session.id))
     } else {
-        container_sessions::append_session(&session).map(|_| None)
+        container_sessions::append_session(&session).map(Some)
     };
 
     match result {
         Ok(selected_index) => {
             send(CompositorMessage::ReloadMenu);
-            let sessions = container_sessions::load_sessions();
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            let selected_index = selected_index.or_else(|| sessions.len().checked_sub(1));
             *SELECTED_SESSION.lock().unwrap() = selected_index;
-            if let Some(index) = selected_index {
-                invalidate_profile_validation(index);
+            if let Some(id) = selected_index {
+                invalidate_profile_validation(id);
             }
             push_activity(format!(
                 "{} session: {} ({})",
@@ -3702,16 +3877,13 @@ unsafe fn show_create_volume_dialog() {
 }
 
 unsafe fn delete_container_session(index: usize) {
-    let sessions = container_sessions::load_sessions();
-    let Some(session) = sessions.get(index) else {
+    let Some(session) = session_for_view(index) else {
         show_error_alert("Application profile no longer exists.");
         return;
     };
-    if sessions.iter().enumerate().any(|(index, _)| {
-        active_session(index).is_some() || session_can_stop(session_state(index).as_ref())
-    }) {
+    if active_session(index).is_some() || session_can_stop(session_state(index).as_ref()) {
         show_error_alert(
-            "Stop all application instances and wait for pending launches before deleting a profile.",
+            "Stop this application and wait for its pending launches and cleanup before deleting its profile.",
         );
         return;
     }
@@ -3719,11 +3891,15 @@ unsafe fn delete_container_session(index: usize) {
         return;
     }
 
-    match container_sessions::remove_session(index) {
+    match container_sessions::remove_session(session.id) {
         Ok(()) => {
             *SELECTED_SESSION.lock().unwrap() = None;
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            invalidate_all_profile_validation();
+            invalidate_profile_validation(session.id);
+            SESSION_LOGS
+                .lock()
+                .unwrap()
+                .retain(|(id, _)| *id != session.id);
             push_activity(format!("Deleted application profile: {}", session.name));
             send(CompositorMessage::ReloadMenu);
             unsafe {
@@ -3941,16 +4117,18 @@ fn confirm_close_managed_display(slot: &str) -> bool {
     }
 }
 
-fn confirm_stop_apple_runtime() -> Option<Vec<usize>> {
+fn confirm_stop_apple_runtime() -> Option<Vec<ProfileId>> {
     let sessions = container_sessions::load_sessions();
     let mut running = active_sessions_snapshot()
         .into_iter()
         .filter_map(|active| {
-            let session = sessions.get(active.instance.profile_index)?;
+            let session = sessions
+                .iter()
+                .find(|session| session.id == active.profile_id)?;
             if normalized_runtime_key(&session.runtime) != "apple" {
                 return None;
             }
-            Some((active.instance.profile_index, session.name.clone()))
+            Some((active.profile_id, session.name.clone()))
         })
         .collect::<Vec<_>>();
     running.sort_by_key(|(index, _)| *index);
@@ -4155,8 +4333,7 @@ fn show_error_alert(message: &str) {
 }
 
 fn remember_stop_request(index: usize) {
-    let sessions = container_sessions::load_sessions();
-    let message = match sessions.get(index) {
+    let message = match session_for_view(index) {
         Some(session) => {
             start_operation_task(
                 stop_task_key(index),
@@ -4239,8 +4416,7 @@ declare_class!(
 
         #[method(launchContainerSession:)]
         fn launch_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
+            let Some(index) = profile_action_index(sender) else { return; };
             if let Some(conflict) = active_display_conflict(index) {
                 let message = format!(
                     "Default display is already used by '{}'. Stop that session before launching another one.",
@@ -4249,34 +4425,32 @@ declare_class!(
                 set_session_state(index, "Blocked", message.clone());
                 push_activity(format!("Launch blocked: {}", message));
                 *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-                *SELECTED_SESSION.lock().unwrap() = Some(index);
+                *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
                 show_error_alert(&message);
                 unsafe { rebuild_window(); }
                 return;
             }
             remember_launch_request(index);
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = Some(index);
-            send(CompositorMessage::StartContainerSession(index));
+            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
+            if let Some(id) = profile_id_at(index) { send(CompositorMessage::StartContainerSession(id)); }
             unsafe { rebuild_window(); }
         }
 
         #[method(checkContainerSession:)]
         fn check_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
+            let Some(index) = profile_action_index(sender) else { return; };
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = Some(index);
+            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
             set_session_state(index, "Checking", "Running launch preflight checks.".into());
             push_activity(format!("Check requested for session #{}", index + 1));
-            send(CompositorMessage::CheckContainerSession(index));
+            if let Some(id) = profile_id_at(index) { send(CompositorMessage::CheckContainerSession(id)); }
             unsafe { rebuild_window(); }
         }
 
         #[method(stopContainerSession:)]
         fn stop_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
+            let Some(index) = profile_action_index(sender) else { return; };
             if !session_can_stop(session_state(index).as_ref()) {
                 let name = container_sessions::load_sessions()
                     .get(index)
@@ -4284,50 +4458,46 @@ declare_class!(
                     .unwrap_or_else(|| format!("session #{}", index + 1));
                 push_activity(format!("Stop ignored: {} is not running.", name));
                 *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-                *SELECTED_SESSION.lock().unwrap() = Some(index);
+                *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
                 unsafe { rebuild_window(); }
                 return;
             }
             remember_stop_request(index);
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = Some(index);
-            send(CompositorMessage::StopContainerSession(index));
+            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
+            if let Some(id) = profile_id_at(index) { send(CompositorMessage::StopContainerSession(id)); }
             unsafe { rebuild_window(); }
         }
 
         #[method(forceStopContainerSession:)]
         fn force_stop_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
+            let Some(index) = profile_action_index(sender) else { return; };
             push_activity(format!("Force Stop requested for application #{}", index + 1));
-            send(CompositorMessage::ForceStopContainerSession(index));
+            if let Some(id) = profile_id_at(index) { send(CompositorMessage::ForceStopContainerSession(id)); }
             unsafe { rebuild_window(); }
         }
 
         #[method(openContainerTerminal:)]
         fn open_container_terminal(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
+            let Some(index) = profile_action_index(sender) else { return; };
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = Some(index);
+            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
             *SELECTED_TAB.lock().unwrap() = 2;
             push_activity(format!("Terminal requested for session #{}", index + 1));
-            send(CompositorMessage::OpenContainerTerminal(index));
+            if let Some(id) = profile_id_at(index) { send(CompositorMessage::OpenContainerTerminal(id)); }
             unsafe { rebuild_window(); }
         }
 
         #[method(copyApplicationDiagnostics:)]
         fn copy_application_diagnostics(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
-            let sessions = container_sessions::load_sessions();
-            let Some(session) = sessions.get(index) else {
+            let Some(index) = profile_action_index(sender) else { return; };
+            let Some(session) = session_for_view(index) else {
                 show_error_alert("Application profile no longer exists.");
                 return;
             };
             let state = session_state(index);
             let active = active_session(index);
-            let logs = control_session_logs(index, 80);
+            let logs = control_session_logs(session.id, 80);
             let (status, detail) = state
                 .as_ref()
                 .map(|state| (session_state_label(state), state.detail.as_str()))
@@ -4357,14 +4527,15 @@ declare_class!(
                 session.name,
                 runtime_label(&session.runtime),
                 session.image,
-                session_display_command(session),
-                session_display_summary(session),
-                session_presentation_summary(session),
+                session_display_command(&session),
+                session_display_summary(&session),
+                session_presentation_summary(&session),
                 status,
                 detail,
                 active_detail,
                 recent_logs,
             );
+            let diagnostics = profile_diagnostic_redactor(&session).redact(&diagnostics);
             unsafe {
                 let pasteboard = NSPasteboard::generalPasteboard();
                 pasteboard.clearContents();
@@ -4501,8 +4672,7 @@ declare_class!(
 
         #[method(releaseDisplayAttachment:)]
         fn release_display_attachment(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
+            let Some(index) = profile_action_index(sender) else { return; };
             if !session_can_stop(session_state(index).as_ref()) {
                 push_activity(format!(
                     "Display release ignored: application #{} is not running.",
@@ -4512,7 +4682,7 @@ declare_class!(
                 return;
             }
             remember_stop_request(index);
-            send(CompositorMessage::StopContainerSession(index));
+            if let Some(id) = profile_id_at(index) { send(CompositorMessage::StopContainerSession(id)); }
             unsafe { rebuild_window(); }
         }
 
@@ -4544,29 +4714,27 @@ declare_class!(
 
         #[method(editContainerSession:)]
         fn edit_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            unsafe { show_edit_session_dialog(tag.max(0) as usize); }
+            let Some(index) = profile_action_index(sender) else { return; };
+            unsafe { show_edit_session_dialog(index); }
         }
 
         #[method(changeContainerSessionPresentation:)]
         fn change_container_session_presentation(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
+            let Some(index) = profile_action_index(sender) else { return; };
             if active_session(index).is_some() {
                 show_error_alert("Stop this application before changing its presentation mode.");
                 unsafe { rebuild_window(); }
                 return;
             }
             let selected: isize = unsafe { msg_send![sender, indexOfSelectedItem] };
-            let sessions = container_sessions::load_sessions();
-            let Some(mut session) = sessions.get(index).cloned() else {
+            let Some(mut session) = session_for_view(index) else {
                 show_error_alert("Application profile no longer exists.");
                 unsafe { rebuild_window(); }
                 return;
             };
             let presentation = if selected == 1 { "rootless" } else { "desktop" };
             session.presentation = Some(presentation.into());
-            match container_sessions::replace_session(index, &session) {
+            match container_sessions::replace_session(session.id, &session) {
                 Ok(()) => {
                     invalidate_profile_validation(index);
                     push_activity(format!(
@@ -4587,15 +4755,14 @@ declare_class!(
 
         #[method(duplicateContainerSession:)]
         fn duplicate_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            unsafe { duplicate_session_profile(tag.max(0) as usize); }
+            let Some(index) = profile_action_index(sender) else { return; };
+            unsafe { duplicate_session_profile(index); }
         }
 
         #[method(applicationProfileMoreAction:)]
         fn application_profile_more_action(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Some(index) = profile_action_index(sender) else { return; };
             let selected: isize = unsafe { msg_send![sender, indexOfSelectedItem] };
-            let index = tag.max(0) as usize;
             match selected {
                 1 => unsafe { duplicate_session_profile(index) },
                 2 => unsafe { export_session_profile(index) },
@@ -4609,8 +4776,8 @@ declare_class!(
 
         #[method(viewRawContainerSession:)]
         fn view_raw_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            unsafe { show_raw_session_profile(tag.max(0) as usize); }
+            let Some(index) = profile_action_index(sender) else { return; };
+            unsafe { show_raw_session_profile(index); }
         }
 
         #[method(newImageContainerSession:)]
@@ -4647,9 +4814,9 @@ declare_class!(
 
         #[method(buildSmokeContainerSessionImage:)]
         fn build_smoke_container_session_image(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Some(index) = profile_action_index(sender) else { return; };
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = Some(tag.max(0) as usize);
+            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
             request_smoke_image_build();
             unsafe { rebuild_window(); }
         }
@@ -4666,8 +4833,8 @@ declare_class!(
                 return;
             };
             for index in running_profiles {
-                remember_stop_request(index);
-                send(CompositorMessage::ForceStopContainerSession(index));
+                if let Some(view) = view_index(index) { remember_stop_request(view); }
+                if let Some(id) = profile_id_at(index) { send(CompositorMessage::ForceStopContainerSession(id)); }
             }
             send(CompositorMessage::RuntimeSystemAction {
                 runtime: "apple".into(),
@@ -4678,15 +4845,13 @@ declare_class!(
 
         #[method(pullContainerSessionImage:)]
         fn pull_container_session_image(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
-            let sessions = container_sessions::load_sessions();
-            let Some(session) = sessions.get(index) else {
+            let Some(index) = profile_action_index(sender) else { return; };
+            let Some(session) = session_for_view(index) else {
                 show_error_alert("Application profile no longer exists.");
                 return;
             };
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = Some(index);
+            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
             push_activity(format!(
                 "Pull requested for missing image: {}",
                 session.image
@@ -4706,9 +4871,9 @@ declare_class!(
 
         #[method(loadContainerSessionImage:)]
         fn load_container_session_image(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Some(index) = profile_action_index(sender) else { return; };
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = Some(tag.max(0) as usize);
+            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
             unsafe { show_load_image_dialog(); }
         }
 
@@ -5100,8 +5265,7 @@ declare_class!(
 
         #[method(deleteContainerSession:)]
         fn delete_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let index = tag.max(0) as usize;
+            let Some(index) = profile_action_index(sender) else { return; };
             unsafe { delete_container_session(index); }
         }
 
@@ -5149,11 +5313,11 @@ declare_class!(
 
         #[method(selectContainerSession:)]
         fn select_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Some(index) = profile_action_index(sender) else { return; };
             if *SELECTED_NAV.lock().unwrap() != NAV_RUNNING {
                 *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
             }
-            *SELECTED_SESSION.lock().unwrap() = Some(tag.max(0) as usize);
+            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
             *SELECTED_IMAGE.lock().unwrap() = None;
             *SELECTED_VOLUME.lock().unwrap() = None;
             *SELECTED_RUNTIME_CONTAINER.lock().unwrap() = None;
@@ -5206,6 +5370,9 @@ pub fn show(sender: Sender<CompositorMessage>, mtm: MainThreadMarker) {
 }
 
 unsafe fn rebuild_window() {
+    if crate::lifecycle_producers::GLOBAL.closing() {
+        return;
+    }
     let Some(window_ptr) = *WINDOW.lock().unwrap() else {
         return;
     };
@@ -5219,6 +5386,9 @@ unsafe fn rebuild_window() {
 }
 
 unsafe fn refresh_window_without_focus() {
+    if crate::lifecycle_producers::GLOBAL.closing() {
+        return;
+    }
     let Some(window_ptr) = *WINDOW.lock().unwrap() else {
         return;
     };
@@ -5308,6 +5478,7 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     }
     let load_report = container_sessions::load_sessions_report();
     let sessions = load_report.sessions;
+    *PROFILE_VIEW.lock().unwrap() = sessions.iter().map(|session| session.id).collect();
     let config_error = load_report.error;
     schedule_automatic_profile_validation(&sessions);
     let handler = unsafe { ensure_handler() };
@@ -5560,24 +5731,16 @@ fn add_sidebar_background(
     content
 }
 
-fn selected_session_index(session_count: usize, selected_nav: usize) -> Option<usize> {
+fn selected_session_index(_session_count: usize, selected_nav: usize) -> Option<usize> {
     if !matches!(selected_nav, NAV_SESSIONS | NAV_RUNNING) {
         return None;
     }
-
-    let mut selected = SELECTED_SESSION.lock().unwrap();
-    match *selected {
-        Some(index)
-            if index < session_count
-                && (selected_nav != NAV_RUNNING || active_session(index).is_some()) =>
-        {
-            Some(index)
-        }
-        _ => {
-            *selected = None;
-            None
-        }
+    let id = *SELECTED_SESSION.lock().unwrap();
+    let index = id.and_then(view_index)?;
+    if selected_nav == NAV_RUNNING && active_session(index).is_none() {
+        return None;
     }
+    Some(index)
 }
 
 fn content_size(window: &NSWindow) -> (f64, f64) {
@@ -8381,7 +8544,7 @@ fn command_preview_lines(
 ) -> Vec<String> {
     match run_ui_command(command, child_path, args, Duration::from_secs(2)) {
         Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = crate::process_output::redaction::output(&output.stdout);
             let lines = stdout
                 .lines()
                 .filter(|line| !line.trim().is_empty())
@@ -8395,7 +8558,7 @@ fn command_preview_lines(
             }
         }
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = crate::process_output::redaction::output(&output.stderr);
             vec![
                 stderr
                     .lines()
@@ -9119,7 +9282,8 @@ impl VolumeRow {
 }
 
 fn first_stderr_line(output: &Output, fallback: &str) -> String {
-    let line = String::from_utf8_lossy(&output.stderr)
+    let sanitized = crate::process_output::redaction::output(&output.stderr);
+    let line = sanitized
         .lines()
         .next()
         .filter(|line| !line.trim().is_empty())
@@ -9515,16 +9679,16 @@ fn add_session_detail(
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*check, setTag: index as isize];
+        bind_profile_control(&check, index);
         let _: () = msg_send![&*check, setToolTip:
             &*NSString::from_str("Validate the profile, runtime, image, command, and transport without launching")];
-        let _: () = msg_send![&*primary, setTag: index as isize];
+        bind_profile_control(&primary, index);
         let _: () = msg_send![&*primary, setToolTip:
             &*NSString::from_str(primary_tooltip)];
         if launch_busy || transport_blocked {
             let _: () = msg_send![&*primary, setEnabled: false];
         }
-        let _: () = msg_send![&*stop, setTag: index as isize];
+        bind_profile_control(&stop, index);
         let _: () = msg_send![&*stop, setToolTip:
         &*NSString::from_str(if force_stop {
             "Immediately terminate the application after graceful stop timed out"
@@ -9559,13 +9723,13 @@ fn add_session_detail(
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*edit, setTag: index as isize];
+        bind_profile_control(&edit, index);
         let _: () = msg_send![&*edit, setToolTip:
             &*NSString::from_str("Edit this saved application profile. Running instances are not changed until their next launch.")];
         let _: () = msg_send![&*more, setTarget: handler];
         let _: () = msg_send![&*more, setAction:
             sel!(applicationProfileMoreAction:)];
-        let _: () = msg_send![&*more, setTag: index as isize];
+        bind_profile_control(&more, index);
         let _: () = msg_send![&*more, setToolTip:
         &*NSString::from_str(if stop_enabled || launch_busy {
             "Duplicate, export, or inspect this profile. Stop the running instance before deleting it."
@@ -9585,7 +9749,7 @@ fn add_session_detail(
         let _: () = msg_send![&*presentation, setTarget: handler];
         let _: () = msg_send![&*presentation, setAction:
             sel!(changeContainerSessionPresentation:)];
-        let _: () = msg_send![&*presentation, setTag: index as isize];
+        bind_profile_control(&presentation, index);
         let _: () = msg_send![&*presentation, setToolTip:
             &*NSString::from_str("Use desktop for a compositor such as niri/Hyprland, or rootless for native Wayland applications such as foot")];
         if active.is_some() {
@@ -9878,7 +10042,7 @@ fn add_session_info(
     );
     unsafe {
         let _: () = msg_send![&*logs, setTag: 1isize];
-        let _: () = msg_send![&*raw, setTag: index as isize];
+        bind_profile_control(&raw, index);
     }
 
     let launch_task = latest_operation_task(&launch_task_key(index))
@@ -10024,7 +10188,7 @@ fn add_full_check_card(
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*check, setTag: index as isize];
+        bind_profile_control(&check, index);
         let _: () = msg_send![&*logs, setTag: 1isize];
     }
     bottom
@@ -10299,9 +10463,9 @@ fn add_application_error_card(
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*retry, setTag: index as isize];
+        bind_profile_control(&retry, index);
         let _: () = msg_send![&*view_error, setTag: 1isize];
-        let _: () = msg_send![&*copy_diagnostics, setTag: index as isize];
+        bind_profile_control(&copy_diagnostics, index);
         let _: () = msg_send![&*copy_diagnostics, setToolTip:
             &*NSString::from_str("Copy profile, state, display, and recent logs")];
     }
@@ -10447,7 +10611,7 @@ fn add_missing_image_card(
             mtm,
         );
         unsafe {
-            let _: () = msg_send![&*build, setTag: index as isize];
+            bind_profile_control(&build, index);
             let _: () = msg_send![&*build, setToolTip:
                 &*NSString::from_str("Build the bundled example image with Apple Container")];
         }
@@ -10462,7 +10626,7 @@ fn add_missing_image_card(
             mtm,
         );
         unsafe {
-            let _: () = msg_send![&*pull, setTag: index as isize];
+            bind_profile_control(&pull, index);
             let _: () = msg_send![&*pull, setToolTip:
                 &*NSString::from_str("Pull the application image with Apple Container")];
         }
@@ -10477,7 +10641,7 @@ fn add_missing_image_card(
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*load, setTag: index as isize];
+        bind_profile_control(&load, index);
         let _: () = msg_send![&*load, setToolTip:
             &*NSString::from_str("Load an OCI archive into Apple Container")];
     }
@@ -10654,7 +10818,7 @@ fn add_session_logs(
     add_label(
         parent,
         "Live stdout/stderr from the container runtime and waypipe client is captured for this app session.",
-        rect(x + 22.0, y + 212.0, width - 44.0, 30.0),
+        rect(x + 22.0, y + 200.0, width - 44.0, 40.0),
         mtm,
         TextStyle::Body,
     );
@@ -10666,7 +10830,7 @@ fn add_session_logs(
         add_label(
             parent,
             &fallback,
-            rect(x + 22.0, y + 170.0, width - 44.0, 26.0),
+            rect(x + 22.0, y + 22.0, width - 44.0, 170.0),
             mtm,
             TextStyle::Caption,
         );
@@ -10740,7 +10904,7 @@ fn add_session_terminal(
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*button, setTag: index as isize];
+        bind_profile_control(&button, index);
         let _: () = msg_send![&*button, setToolTip:
             &*NSString::from_str("Open macOS Terminal and attach to this running GUI container")];
         if active_session(index).is_none() {
@@ -11221,7 +11385,11 @@ fn runtime_container_detail_output(
     if logs.is_empty() {
         logs.push("No recent container log output.".into());
     }
-    [info, stats, logs]
+    [
+        diagnostic_lines(info),
+        diagnostic_lines(stats),
+        diagnostic_lines(logs),
+    ]
 }
 
 struct RuntimeContainerDetailLayout {
@@ -11828,7 +11996,7 @@ unsafe fn add_session_row(
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*primary, setTag: index as isize];
+        bind_profile_control(&primary, index);
         let _: () = msg_send![&*primary, setToolTip:
             &*NSString::from_str(primary_tooltip)];
         if !process_active && (launch_busy || transport_blocked) {
@@ -11862,7 +12030,7 @@ unsafe fn add_session_row(
             mtm,
         );
         unsafe {
-            let _: () = msg_send![&*stop, setTag: index as isize];
+            bind_profile_control(&stop, index);
             let _: () = msg_send![&*stop, setToolTip:
             &*NSString::from_str(if force_stop {
                 "Immediately terminate an application that did not stop gracefully"
@@ -11889,7 +12057,7 @@ unsafe fn add_session_row(
     unsafe {
         let _: () = msg_send![&*more, setTarget: handler];
         let _: () = msg_send![&*more, setAction: sel!(applicationProfileMoreAction:)];
-        let _: () = msg_send![&*more, setTag: index as isize];
+        bind_profile_control(&more, index);
         let _: () = msg_send![&*more, setToolTip:
             &*NSString::from_str("More profile actions")];
     }
@@ -11897,7 +12065,7 @@ unsafe fn add_session_row(
 
 fn session_display_command(session: &ContainerSession) -> String {
     if let Some(command) = session.command.as_deref() {
-        return command.into();
+        return profile_diagnostic_redactor(session).redact(command);
     }
 
     match session.profile.as_deref() {
@@ -12263,6 +12431,9 @@ fn add_hit_button(
         button.setBordered(false);
         button.setTransparent(true);
         let _: () = msg_send![&*button, setTag: tag as isize];
+        if action == sel!(selectContainerSession:) {
+            bind_profile_control(&button, tag);
+        }
         parent.addSubview(&button);
     }
 }
@@ -12600,6 +12771,147 @@ mod runtime_container_detail_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_views_mask_profile_and_inspect_secrets_without_rewriting_configuration() {
+        let mut session = smoke_session();
+        session.env = vec!["ORDINARY=opaque-value".into()];
+        session.command = Some("run-app opaque-value".into());
+        assert_eq!(session_display_command(&session), "run-app [REDACTED]");
+        assert_eq!(session.command.as_deref(), Some("run-app opaque-value"));
+        assert_eq!(session.env, ["ORDINARY=opaque-value"]);
+        let result = diagnostic_lines(vec![
+            "[niri::dbus] unrelated log".into(),
+            "[test] inspect {\"Env\":[\"ORDINARY=hidden\"],\"state\":\"ready\"}".into(),
+        ]);
+        assert_eq!(result[0], "[niri::dbus] unrelated log");
+        assert!(result[1].starts_with("[test] inspect"));
+        assert!(result[1].contains("ready"));
+        assert!(!result.join("\n").contains("hidden"));
+        let incomplete = diagnostic_lines(vec!["{\"Env\":[\"ORDINARY=hidden\"".into()]);
+        assert!(!incomplete.join("\n").contains("hidden"));
+    }
+
+    #[test]
+    fn cancellation_remains_stopping_and_task_active_until_rollback_completes() {
+        let id = ProfileId::new().unwrap();
+        let key = launch_task_key(id);
+        start_operation_task(
+            &key,
+            "Launch application",
+            "Cancelling profile",
+            LaunchStep::ALL.map(LaunchStep::label),
+        );
+        update_operation_task_step(
+            &key,
+            LaunchStep::CheckRuntime.label(),
+            TaskStepStatus::Running,
+            None,
+        );
+        set_session_state(id, "Starting", "worker active".into());
+
+        record_launch_cancelling(id, "Cancelling; waiting for worker rollback.");
+        assert_eq!(
+            session_state(id).unwrap().instance,
+            Some(InstanceStatus::Stopping)
+        );
+        let task = latest_operation_task(&key).unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert!(
+            task.steps
+                .iter()
+                .any(|step| step.status == TaskStepStatus::Running)
+        );
+        assert!(task.detail.unwrap().contains("waiting for worker"));
+
+        record_stop_failure(id, "Rollback failed; resources remain reserved for retry.");
+        assert_ne!(
+            session_state(id).unwrap().instance,
+            Some(InstanceStatus::Exited)
+        );
+        assert!(latest_operation_task(&key).unwrap().status.is_active());
+
+        record_launch_cancelled(id, "Rollback completed; owned resources released.");
+        assert_eq!(
+            session_state(id).unwrap().instance,
+            Some(InstanceStatus::Exited)
+        );
+        assert_eq!(
+            latest_operation_task(&key).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        invalidate_profile_validation(id);
+        OPERATION_TASKS
+            .lock()
+            .unwrap()
+            .retain(|task| task.key != key);
+    }
+
+    #[test]
+    fn control_tasks_exist_without_a_gui_and_resuming_does_not_reset_progress() {
+        let id = ProfileId::new().unwrap();
+        ensure_launch_task(id, "Control fixture");
+        record_launch_progress(id, LaunchStep::CheckImage, "image check running");
+        let task = latest_operation_task(&launch_task_key(id)).unwrap();
+        ensure_launch_task(id, "Control fixture");
+        assert_eq!(latest_operation_task(&launch_task_key(id)).unwrap(), task);
+        ensure_stop_task(id, "Control fixture");
+        record_launch_cancelling(id, "waiting for rollback");
+        assert!(
+            latest_operation_task(&stop_task_key(id))
+                .unwrap()
+                .status
+                .is_active()
+        );
+        record_launch_cancelled(id, "rollback finished");
+        assert_eq!(
+            latest_operation_task(&stop_task_key(id)).unwrap().status,
+            TaskStatus::Completed
+        );
+        ensure_launch_task(id, "Control fixture");
+        record_launch_already_running(id);
+        assert_eq!(
+            latest_operation_task(&launch_task_key(id)).unwrap().status,
+            TaskStatus::Completed
+        );
+        invalidate_profile_validation(id);
+        let launch = launch_task_key(id);
+        let stop = stop_task_key(id);
+        OPERATION_TASKS
+            .lock()
+            .unwrap()
+            .retain(|task| task.key != launch && task.key != stop);
+    }
+
+    #[test]
+    fn status_and_log_ownership_use_ids_even_without_a_rendered_view() {
+        let first = ProfileId::new().unwrap();
+        let unrelated = ProfileId::new().unwrap();
+        set_session_state(first, "Running", "first instance".into());
+        set_session_state(unrelated, "Checking", "unrelated check".into());
+        push_session_log(first, "test", "first log");
+        push_session_log(unrelated, "test", "unrelated log");
+        assert_eq!(control_session_state(first).unwrap().1, "first instance");
+        assert_eq!(
+            control_session_state(unrelated).unwrap().1,
+            "unrelated check"
+        );
+        assert!(control_session_logs(unrelated, 10)[0].contains("unrelated log"));
+        invalidate_profile_validation(first);
+        clear_session_logs(first);
+        assert!(control_session_state(first).is_none());
+        assert!(control_session_logs(first, 10).is_empty());
+        assert_eq!(
+            control_session_state(unrelated).unwrap().1,
+            "unrelated check"
+        );
+        assert_eq!(control_session_logs(unrelated, 10).len(), 1);
+        invalidate_profile_validation(unrelated);
+        SESSION_LOGS
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != first && *id != unrelated);
+    }
 
     #[test]
     fn display_policies_show_actual_named_slots_and_rootless_ownership() {

@@ -8,6 +8,8 @@ use tracing_subscriber::prelude::*;
 
 const LOG_LIMIT: u64 = 256 * 1024;
 const RECORD_LIMIT: usize = 8 * 1024;
+const WORKER_RUNTIME_ENV: &str = "COCOA_WAY_DISPLAY_RUNTIME_DIR";
+const WORKER_REPORT_LIMIT: usize = 16 * 1024;
 
 pub fn log_directory() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -25,7 +27,22 @@ struct RotatingLog {
 impl RotatingLog {
     fn open(path: PathBuf, limit: u64) -> io::Result<Self> {
         let file = Self::open_file(&path)?;
-        let size = file.metadata()?.len();
+        let mut size = file.metadata()?.len();
+        if size > limit {
+            file.set_len(0)?;
+            size = 0;
+        }
+        let previous = path.with_extension("previous.log");
+        match std::fs::symlink_metadata(&previous) {
+            Ok(_) => {
+                let previous = Self::open_file(&previous)?;
+                if previous.metadata()?.len() > limit {
+                    previous.set_len(0)?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         Ok(Self {
             path,
             file,
@@ -35,16 +52,28 @@ impl RotatingLog {
     }
 
     fn open_file(path: &Path) -> io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+        {
+            return Err(io::Error::other(
+                "diagnostic log must be a private owned regular file",
+            ));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
     }
 
     fn write_record(&mut self, record: &[u8]) -> io::Result<()> {
-        let record = &record[..record.len().min(RECORD_LIMIT)];
+        let record = crate::process_output::redaction::record(record, RECORD_LIMIT);
+        let record = &record[..record.len().min(RECORD_LIMIT).min(self.limit as usize)];
         if self.size.saturating_add(record.len() as u64) > self.limit {
             let previous = self.path.with_extension("previous.log");
             std::fs::rename(&self.path, &previous)?;
@@ -84,7 +113,8 @@ impl Drop for DiagnosticRecord {
     fn drop(&mut self) {
         if !self.bytes.is_empty() {
             // Diagnostics must not block input or grow an unbounded queue.
-            let _ = self.sender.try_send(std::mem::take(&mut self.bytes));
+            let bytes = crate::process_output::redaction::record(&self.bytes, RECORD_LIMIT);
+            let _ = self.sender.try_send(bytes);
         }
     }
 }
@@ -100,10 +130,9 @@ impl<'a> MakeWriter<'a> for DiagnosticWriter {
     }
 }
 
-fn diagnostic_writer() -> io::Result<DiagnosticWriter> {
-    let directory = log_directory().ok_or_else(|| io::Error::other("HOME is not set"))?;
-    prepare_private_directory(&directory)?;
-    let mut log = RotatingLog::open(directory.join("cocoa-way.log"), LOG_LIMIT)?;
+fn diagnostic_writer_at(directory: &Path, filename: &str) -> io::Result<DiagnosticWriter> {
+    prepare_private_directory(directory)?;
+    let mut log = RotatingLog::open(directory.join(filename), LOG_LIMIT)?;
     log.write_record(
         format!(
             "\nCocoa-Way {} startup; host={}/{}; pid={}\n",
@@ -114,13 +143,85 @@ fn diagnostic_writer() -> io::Result<DiagnosticWriter> {
         )
         .as_bytes(),
     )?;
+    asynchronous_writer("cocoa-way-diagnostics-log", move |record| {
+        log.write_record(record)
+    })
+}
+
+fn diagnostic_writer(worker: bool) -> io::Result<DiagnosticWriter> {
+    if worker {
+        let directory = std::env::var_os(WORKER_RUNTIME_ENV)
+            .ok_or_else(|| io::Error::other("worker runtime directory is missing"))?;
+        diagnostic_writer_at(Path::new(&directory), "display.log")
+    } else {
+        let directory = log_directory().ok_or_else(|| io::Error::other("HOME is not set"))?;
+        diagnostic_writer_at(&directory, "cocoa-way.log")
+    }
+}
+
+fn bounded_report_part(arguments: std::fmt::Arguments<'_>) -> Vec<u8> {
+    struct Bounded(String);
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let mut count = text.len().min(RECORD_LIMIT.saturating_sub(self.0.len()));
+            while !text.is_char_boundary(count) {
+                count -= 1;
+            }
+            self.0.push_str(&text[..count]);
+            if count == text.len() {
+                Ok(())
+            } else {
+                Err(std::fmt::Error)
+            }
+        }
+    }
+    let mut buffer = Bounded(String::new());
+    let truncated = std::fmt::write(&mut buffer, arguments).is_err();
+    if truncated {
+        return b"[diagnostic report part truncated]\n".to_vec();
+    }
+    crate::process_output::redaction::record(buffer.0.as_bytes(), RECORD_LIMIT)
+}
+
+/// Explicit startup/panic reports remain available with worker stdio discarded.
+/// Bound formatting itself, not just the eventual write of a huge backtrace.
+pub fn write_worker_report(
+    directory: &Path,
+    filename: &str,
+    message: std::fmt::Arguments<'_>,
+    detail: Option<std::fmt::Arguments<'_>>,
+) -> io::Result<()> {
+    let mut components = Path::new(filename).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(io::Error::other("invalid worker report filename"));
+    }
+    prepare_private_directory(directory)?;
+    let mut report = bounded_report_part(message);
+    if let Some(detail) = detail {
+        report.push(b'\n');
+        report.extend(bounded_report_part(detail));
+    }
+    report.truncate(report.len().min(WORKER_REPORT_LIMIT));
+    while std::str::from_utf8(&report).is_err() {
+        report.pop();
+    }
+    let mut file = RotatingLog::open_file(&directory.join(filename))?;
+    file.set_len(0)?;
+    file.write_all(&report)
+}
+
+fn asynchronous_writer(
+    name: &str,
+    mut write: impl FnMut(&[u8]) -> io::Result<()> + Send + 'static,
+) -> io::Result<DiagnosticWriter> {
     let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(128);
     std::thread::Builder::new()
-        .name("cocoa-way-diagnostics-log".into())
+        .name(name.into())
         .spawn(move || {
             while let Ok(record) = receiver.recv() {
-                if let Err(error) = log.write_record(&record) {
-                    eprintln!("Cocoa-Way diagnostic log is unavailable: {error}");
+                if write(&record).is_err() {
                     break;
                 }
             }
@@ -130,21 +231,37 @@ fn diagnostic_writer() -> io::Result<DiagnosticWriter> {
 
 pub fn initialize_logging(filter: &str, worker: bool) {
     let filter = tracing_subscriber::EnvFilter::try_new(filter).unwrap_or_else(|error| {
-        eprintln!("Ignoring invalid RUST_LOG: {error}");
+        eprintln!(
+            "Ignoring invalid RUST_LOG: {}",
+            crate::process_output::redaction::redact(&error.to_string())
+        );
         tracing_subscriber::EnvFilter::new("cocoa_way=info,smithay=warn")
     });
-    let console = tracing_subscriber::fmt::layer()
-        .with_writer(io::stderr)
-        .with_filter(filter);
-    let file = if worker {
+    let mut stderr = io::stderr();
+    let console = if worker {
         None
     } else {
-        match diagnostic_writer() {
+        asynchronous_writer("cocoa-way-diagnostics-stderr", move |record| {
+            stderr.write_all(record)
+        })
+        .ok()
+        .map(|writer| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_filter(filter.clone())
+        })
+    };
+    let file = {
+        match diagnostic_writer(worker) {
             Ok(writer) => Some(
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)
                     .with_writer(writer)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                    .with_filter(if worker {
+                        filter
+                    } else {
+                        tracing_subscriber::EnvFilter::new("warn")
+                    }),
             ),
             Err(error) => {
                 eprintln!("Cocoa-Way could not create its diagnostic log: {error}");
@@ -248,7 +365,7 @@ pub fn environment_report() -> String {
         ));
     }
     lines.push("This check does not start runtimes or containers. Use the selected application's Check action to validate its image and runtime service.".into());
-    lines.join("\n")
+    crate::process_output::redaction::redact(&lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -320,5 +437,118 @@ mod tests {
         std::fs::write(&file, b"occupied").unwrap();
         assert!(prepare_private_directory(&file).is_err());
         assert!(prepare_private_directory(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn worker_log_is_private_bounded_rotated_and_sanitized() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("worker");
+        let writer = diagnostic_writer_at(&runtime, "display.log").unwrap();
+        for _ in 0..100 {
+            let mut record = writer.make_writer();
+            write!(record, "password=hidden {}\n", "x".repeat(6000)).unwrap();
+        }
+        writer
+            .sender
+            .send(b"final-worker-record\n".to_vec())
+            .unwrap();
+        drop(writer);
+        let path = runtime.join("display.log");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("final-worker-record")
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for path in [path.clone(), path.with_extension("previous.log")] {
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert!(metadata.len() <= LOG_LIMIT);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert!(!std::fs::read_to_string(path).unwrap().contains("hidden"));
+        }
+    }
+
+    #[test]
+    fn oversized_existing_logs_are_bounded_before_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("display.log");
+        let previous = path.with_extension("previous.log");
+        std::fs::write(&path, b"oversized current").unwrap();
+        std::fs::write(&previous, b"oversized previous").unwrap();
+        let mut log = RotatingLog::open(path.clone(), 8).unwrap();
+        log.write_record(b"ready\n").unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= 8);
+        assert!(std::fs::metadata(&previous).unwrap().len() <= 8);
+    }
+
+    #[test]
+    fn explicit_worker_reports_bound_formatting_redact_and_replace() {
+        struct Huge;
+        impl std::fmt::Display for Huge {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for _ in 0..100_000 {
+                    formatter.write_str("backtrace-frame\n")?;
+                }
+                panic!("bounded formatter must stop oversized reports");
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        write_worker_report(
+            directory.path(),
+            "panic.txt",
+            format_args!("panic password=hidden"),
+            Some(format_args!("{Huge}")),
+        )
+        .unwrap();
+        let path = directory.path().join("panic.txt");
+        let report = std::fs::read_to_string(&path).unwrap();
+        assert!(report.len() <= WORKER_REPORT_LIMIT);
+        assert!(report.contains("panic password=[REDACTED]"));
+        assert!(report.contains("truncated"));
+        assert!(!report.contains("hidden"));
+        write_worker_report(
+            directory.path(),
+            "panic.txt",
+            format_args!("replacement"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            write_worker_report(directory.path(), "../outside", format_args!("no"), None).is_err()
+        );
+    }
+
+    #[test]
+    fn log_and_report_destinations_reject_symlinks_hardlinks_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        let symlink = directory.path().join("symlink");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        let hardlink = directory.path().join("hardlink");
+        std::fs::hard_link(&target, &hardlink).unwrap();
+        let fifo = directory.path().join("fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        for name in ["symlink", "hardlink", "fifo"] {
+            assert!(RotatingLog::open(directory.path().join(name), LOG_LIMIT).is_err());
+            assert!(write_worker_report(directory.path(), name, format_args!("no"), None).is_err());
+        }
+        assert_eq!(std::fs::read(target).unwrap(), b"untouched");
     }
 }

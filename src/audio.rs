@@ -1,3 +1,4 @@
+use crate::container_sessions::ProfileId;
 use serde_json::json;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -24,13 +25,19 @@ struct AudioStatus {
     bytes_played: u64,
 }
 
-static AUDIO_STATUS: OnceLock<Mutex<HashMap<usize, AudioStatus>>> = OnceLock::new();
+static AUDIO_STATUS: OnceLock<Mutex<HashMap<ProfileId, AudioStatus>>> = OnceLock::new();
 
-fn statuses() -> &'static Mutex<HashMap<usize, AudioStatus>> {
+fn statuses() -> &'static Mutex<HashMap<ProfileId, AudioStatus>> {
     AUDIO_STATUS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn record_status(index: usize, session: &str, state: &str, detail: impl Into<String>, bytes: u64) {
+fn record_status(
+    index: ProfileId,
+    session: &str,
+    state: &str,
+    detail: impl Into<String>,
+    bytes: u64,
+) {
     if let Ok(mut statuses) = statuses().lock() {
         statuses.insert(
             index,
@@ -44,13 +51,14 @@ fn record_status(index: usize, session: &str, state: &str, detail: impl Into<Str
     }
 }
 
-fn clear_status(index: usize) {
+fn clear_status(index: ProfileId) {
     if let Ok(mut statuses) = statuses().lock() {
         statuses.remove(&index);
     }
 }
 
 pub fn snapshot() -> serde_json::Value {
+    let sessions = crate::container_sessions::load_sessions();
     let mut entries = statuses()
         .lock()
         .map(|statuses| {
@@ -58,7 +66,8 @@ pub fn snapshot() -> serde_json::Value {
                 .iter()
                 .map(|(index, status)| {
                     json!({
-                        "session_index": index,
+                        "profile_id": index,
+                        "session_index": sessions.iter().position(|session| session.id == *index),
                         "session": status.session,
                         "state": status.state,
                         "detail": status.detail,
@@ -69,18 +78,18 @@ pub fn snapshot() -> serde_json::Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    entries.sort_by_key(|entry| entry["session_index"].as_u64().unwrap_or(u64::MAX));
+    entries.sort_by_key(|entry| entry["profile_id"].as_str().unwrap_or_default().to_string());
     serde_json::Value::Array(entries)
 }
 
 pub struct AudioWorker {
-    index: usize,
+    index: ProfileId,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
 impl AudioWorker {
-    pub fn start(index: usize, session: String, socket: String) -> Self {
+    pub fn start(index: ProfileId, session: String, socket: String) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         record_status(
@@ -106,11 +115,15 @@ impl AudioWorker {
     }
 
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.request_stop();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
         clear_status(self.index);
+    }
+
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -121,7 +134,7 @@ impl Drop for AudioWorker {
 }
 
 fn run_audio_worker(
-    index: usize,
+    index: ProfileId,
     session: &str,
     socket: &str,
     stop: &AtomicBool,
@@ -167,7 +180,7 @@ fn run_audio_worker(
 }
 
 fn play_pcm_stream(
-    index: usize,
+    index: ProfileId,
     session: &str,
     mut stream: UnixStream,
     stop: &AtomicBool,

@@ -1,3 +1,4 @@
+use crate::container_sessions::ProfileId;
 use crate::event_loop_signal::Sender;
 use log::info;
 use smithay::input::keyboard::FilterResult;
@@ -28,6 +29,8 @@ mod input_policy;
 mod keymap;
 mod latency_trace;
 mod layout;
+mod lifecycle;
+mod lifecycle_producers;
 mod macos_gestures;
 mod menu_bar;
 mod messages;
@@ -41,16 +44,22 @@ mod profile_activity;
 mod render;
 mod runtime_commands;
 mod runtime_paths;
+mod session_lifecycle;
+mod shutdown;
 mod startup;
 mod state;
 mod wayland_source;
 
 use crate::state::AppState;
 use messages::CompositorMessage;
+use session_lifecycle::{
+    queue_display_cleanup, queue_launch_cleanup, reap_exited_container_sessions,
+    reap_exited_managed_displays, request_graceful_container_stop, stop_active_container_session,
+};
 
 struct ActiveContainerSession {
     instance_id: u64,
-    index: usize,
+    profile_id: ProfileId,
     launched_session: container_sessions::ContainerSession,
     owned_identity: container_sessions::OwnedContainerIdentity,
     _profile_activity: profile_activity::ProfileActivity,
@@ -75,10 +84,10 @@ struct PendingProfileOperation {
 }
 
 impl PendingProfileOperation {
-    fn reserve_runtime(&mut self, index: usize) -> Result<(), String> {
+    fn reserve_runtime(&mut self) -> Result<(), String> {
         if self.identity_reservation.is_none() {
             self.identity_reservation = Some(profile_activity::reserve_identity(
-                index,
+                self.session.id,
                 self.generation,
                 &self.session.runtime,
                 &container_sessions::container_name(&self.session),
@@ -89,13 +98,13 @@ impl PendingProfileOperation {
 }
 
 fn current_operation(
-    pending: &HashMap<usize, PendingProfileOperation>,
-    index: usize,
+    pending: &HashMap<ProfileId, PendingProfileOperation>,
+    index: ProfileId,
     generation: u64,
 ) -> bool {
-    pending
-        .get(&index)
-        .is_some_and(|operation| operation.generation == generation)
+    pending.get(&index).is_some_and(|operation| {
+        operation.session.id == index && operation.generation == generation
+    })
 }
 
 struct DisplayWorker {
@@ -279,15 +288,19 @@ fn choose_display_assignment(
 }
 
 fn active_display_conflict_index(
-    requested_index: usize,
+    requested_index: ProfileId,
     sessions: &[container_sessions::ContainerSession],
-    active_slots: impl IntoIterator<Item = (usize, String)>,
-) -> Option<usize> {
-    let requested = sessions.get(requested_index)?;
-    let active_slots = active_slots.into_iter().collect::<Vec<_>>();
-    let default_in_use = active_slots
+    active_slots: impl IntoIterator<Item = (ProfileId, String)>,
+    default_busy: bool,
+) -> Option<ProfileId> {
+    let requested = sessions
         .iter()
-        .any(|(active_index, slot)| *active_index != requested_index && slot == "default");
+        .find(|session| session.id == requested_index)?;
+    let active_slots = active_slots.into_iter().collect::<Vec<_>>();
+    let default_in_use = default_busy
+        || active_slots
+            .iter()
+            .any(|(active_index, slot)| *active_index != requested_index && slot == "default");
     let requested_slot = match choose_display_assignment(requested, default_in_use) {
         DisplayAssignment::Default => "default".to_string(),
         DisplayAssignment::Dedicated(slot) => slot,
@@ -375,9 +388,11 @@ fn report_startup_failure(error: &str, worker: bool) {
     log::error!("Cocoa-Way startup failed: {error}");
     if worker {
         if let Some(directory) = std::env::var_os(DISPLAY_WORKER_RUNTIME_ENV) {
-            let _ = std::fs::write(
-                std::path::PathBuf::from(directory).join(DISPLAY_WORKER_STARTUP_ERROR_LOG),
-                error,
+            let _ = startup::write_worker_report(
+                std::path::Path::new(&directory),
+                DISPLAY_WORKER_STARTUP_ERROR_LOG,
+                format_args!("{}", error),
+                None,
             );
         }
     } else if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
@@ -389,15 +404,18 @@ fn install_display_worker_panic_report() {
     let Some(runtime_dir) = std::env::var_os(DISPLAY_WORKER_RUNTIME_ENV) else {
         return;
     };
-    let panic_log = std::path::PathBuf::from(runtime_dir).join(DISPLAY_WORKER_PANIC_LOG);
+    let runtime_dir = std::path::PathBuf::from(runtime_dir);
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let report = format!(
-            "{}\n{}",
-            panic_info,
-            std::backtrace::Backtrace::force_capture()
+        let _ = startup::write_worker_report(
+            &runtime_dir,
+            DISPLAY_WORKER_PANIC_LOG,
+            format_args!("{}", panic_info),
+            Some(format_args!(
+                "{}",
+                std::backtrace::Backtrace::force_capture()
+            )),
         );
-        let _ = std::fs::write(&panic_log, report);
         previous_hook(panic_info);
     }));
 }
@@ -437,12 +455,6 @@ fn spawn_display_worker(
     let ready_file = runtime_dir.join("display.ready");
     let executable = std::env::current_exe()
         .map_err(|error| format!("failed to locate Cocoa-Way executable: {}", error))?;
-    let log_path = runtime_dir.join("display.log");
-    let stdout = std::fs::File::create(&log_path)
-        .map_err(|error| format!("failed to create display log: {}", error))?;
-    let stderr = stdout
-        .try_clone()
-        .map_err(|error| format!("failed to open display log for stderr: {}", error))?;
     let mut child = std::process::Command::new(executable)
         .env(DISPLAY_WORKER_SLOT_ENV, slot)
         .env(presentation::PresentationMode::ENV, presentation.as_str())
@@ -450,8 +462,8 @@ fn spawn_display_worker(
         .env(DISPLAY_WORKER_READY_ENV, &ready_file)
         .env(DISPLAY_WORKER_PARENT_ENV, std::process::id().to_string())
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(stdout))
-        .stderr(std::process::Stdio::from(stderr))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|error| format!("failed to start dedicated display '{}': {}", slot, error))?;
     if let Err(error) = std::fs::write(
@@ -526,16 +538,22 @@ fn spawn_display_worker(
 }
 
 fn spawn_display_worker_async(
-    index: usize,
+    index: ProfileId,
     generation: u64,
     display_slot: String,
     presentation: presentation::PresentationMode,
     sender: Sender<CompositorMessage>,
 ) {
+    let Some(producer) = lifecycle_producers::GLOBAL.begin() else {
+        return;
+    };
     std::thread::spawn(move || {
+        if lifecycle_producers::GLOBAL.closing() {
+            return;
+        }
         let message = match spawn_display_worker(&display_slot, presentation) {
             Ok((worker, runtime_dir, display)) => CompositorMessage::DedicatedDisplayStarted {
-                index,
+                profile_id: index,
                 generation,
                 display_slot,
                 runtime_dir,
@@ -544,33 +562,44 @@ fn spawn_display_worker_async(
                 worker_runtime_dir: worker.runtime_dir,
             },
             Err(error) => CompositorMessage::DedicatedDisplayFailed {
-                index,
+                profile_id: index,
                 generation,
                 display_slot,
                 error,
             },
         };
-        if let Err(send_error) = sender.send(message)
+        if let Err(send_error) = send_resource_message(&sender, message)
             && let CompositorMessage::DedicatedDisplayStarted {
                 worker_child,
                 worker_runtime_dir,
                 ..
             } = send_error.0
         {
-            let mut worker = DisplayWorker {
+            let worker = DisplayWorker {
                 child: worker_child,
                 runtime_dir: worker_runtime_dir,
             };
-            let _ = terminate_display_worker(&mut worker);
+            session_lifecycle::rollback_disconnected_display(worker, producer);
         }
     });
 }
 
-fn spawn_managed_display_worker_async(display_slot: String, sender: Sender<CompositorMessage>) {
+fn spawn_managed_display_worker_async(
+    display_slot: String,
+    generation: u64,
+    sender: Sender<CompositorMessage>,
+) {
+    let Some(producer) = lifecycle_producers::GLOBAL.begin() else {
+        return;
+    };
     std::thread::spawn(move || {
+        if lifecycle_producers::GLOBAL.closing() {
+            return;
+        }
         let message =
             match spawn_display_worker(&display_slot, presentation::PresentationMode::Desktop) {
                 Ok((worker, runtime_dir, display)) => CompositorMessage::ManagedDisplayStarted {
+                    generation,
                     display_slot,
                     runtime_dir,
                     display,
@@ -578,340 +607,40 @@ fn spawn_managed_display_worker_async(display_slot: String, sender: Sender<Compo
                     worker_runtime_dir: worker.runtime_dir,
                 },
                 Err(error) => CompositorMessage::ManagedDisplayFailed {
+                    generation,
                     display_slot,
                     error,
                 },
             };
-        if let Err(send_error) = sender.send(message)
+        if let Err(send_error) = send_resource_message(&sender, message)
             && let CompositorMessage::ManagedDisplayStarted {
                 worker_child,
                 worker_runtime_dir,
                 ..
             } = send_error.0
         {
-            let mut worker = DisplayWorker {
+            let worker = DisplayWorker {
                 child: worker_child,
                 runtime_dir: worker_runtime_dir,
             };
-            let _ = terminate_display_worker(&mut worker);
+            session_lifecycle::rollback_disconnected_display(worker, producer);
         }
     });
 }
 
-fn terminate_display_worker(worker: &mut DisplayWorker) -> Result<(), String> {
-    let result = terminate_child(&mut worker.child);
-    let cleanup = std::fs::remove_dir_all(&worker.runtime_dir).or_else(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    });
-    result.and(cleanup.map_err(|error| error.to_string()))
-}
-
-fn terminate_child(child: &mut std::process::Child) -> Result<(), String> {
-    match child.try_wait() {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
-            child.kill().map_err(|e| e.to_string())?;
-            child.wait().map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-fn request_child_exit(child: &mut std::process::Child) -> Result<(), String> {
-    match child.try_wait() {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
-            let result = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-            if result == 0 {
-                Ok(())
-            } else {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    Ok(())
-                } else {
-                    Err(error.to_string())
-                }
+fn send_resource_message(
+    sender: &Sender<CompositorMessage>,
+    mut message: CompositorMessage,
+) -> Result<(), std::sync::mpsc::SendError<CompositorMessage>> {
+    loop {
+        match lifecycle_producers::GLOBAL.admit(message, |message| sender.try_send(message)) {
+            Err(message) | Ok(Err(std::sync::mpsc::TrySendError::Disconnected(message))) => {
+                return Err(std::sync::mpsc::SendError(message));
             }
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(std::sync::mpsc::TrySendError::Full(pending))) => message = pending,
         }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn request_graceful_container_stop(
-    active: &mut [ActiveContainerSession],
-    index: usize,
-) -> Result<(), String> {
-    let Some(session) = active.iter_mut().find(|session| session.index == index) else {
-        return Err("No active instance is tracked for this profile".into());
-    };
-    if session.stopping_since.is_some() {
-        return Ok(());
-    }
-    if let Some(audio_worker) = session.audio_worker.as_mut() {
-        audio_worker.stop();
-    }
-    request_child_exit(&mut session.waypipe_child)?;
-    if let Some(container_child) = session.container_child.as_mut() {
-        request_child_exit(container_child)?;
-    }
-    session.stopping_since = Some(std::time::Instant::now());
-    session.force_stop_offered = false;
-    Ok(())
-}
-
-fn stop_active_container_session(
-    active: &mut Vec<ActiveContainerSession>,
-    index: usize,
-) -> Result<(), String> {
-    let Some(position) = active.iter().position(|session| session.index == index) else {
-        return Err("No active process is tracked for this session".into());
-    };
-    let mut session = active.remove(position);
-    if let Some(audio_worker) = session.audio_worker.as_mut() {
-        audio_worker.stop();
-    }
-    let waypipe_result = terminate_child(&mut session.waypipe_child);
-    let container_result = if let Some(container_child) = session.container_child.as_mut() {
-        terminate_child(container_child)
-    } else {
-        Ok(())
-    };
-    let display_result = if let Some(display_worker) = session.display_worker.as_mut() {
-        terminate_display_worker(display_worker)
-    } else {
-        Ok(())
-    };
-    let cleanup_result = cleanup_owned_container_session(&session.owned_identity);
-    waypipe_result
-        .and(container_result)
-        .and(display_result)
-        .and(cleanup_result)
-}
-
-fn cleanup_owned_container_session(
-    identity: &container_sessions::OwnedContainerIdentity,
-) -> Result<(), String> {
-    let result = container_sessions::cleanup_owned_instance(identity);
-    if let Err(error) = &result {
-        log::warn!(
-            "Container session '{}' ({}) owned cleanup failed: {}",
-            identity.name(),
-            identity.runtime(),
-            error
-        );
-    }
-    result
-}
-
-fn finish_reaped_container_session(
-    index: usize,
-    process: &str,
-    status: &str,
-    requested_stop: bool,
-    had_display: bool,
-    cleanup: Result<(), String>,
-) {
-    if let Err(error) = cleanup {
-        container_mode::record_session_log(index, "cleanup", &error);
-        if requested_stop {
-            container_mode::record_stop_failure(
-                index,
-                &format!("Application exited, but owned resource cleanup failed: {error}"),
-            );
-            return;
-        }
-    }
-    if requested_stop {
-        container_mode::record_stop_progress(
-            index,
-            "Stop Waypipe worker",
-            "Waypipe worker exited and no longer owns the application transport",
-        );
-        if had_display {
-            container_mode::record_stop_progress(
-                index,
-                "Release display",
-                "Dedicated display resources were released",
-            );
-        }
-        container_mode::record_stop_progress(
-            index,
-            "Stop container",
-            "Container process exited and named runtime resources were cleaned up",
-        );
-        container_mode::record_stop_progress(
-            index,
-            "Mark instance exited",
-            "Application instance is no longer running",
-        );
-        container_mode::record_stop_success(index);
-    } else {
-        container_mode::record_process_exit(index, process, status);
-    }
-}
-
-fn reap_exited_container_sessions(active: &mut Vec<ActiveContainerSession>) {
-    let mut position = 0;
-    while position < active.len() {
-        let index = active[position].index;
-        let display_worker_state = active[position]
-            .display_worker
-            .as_mut()
-            .map(|display_worker| display_worker.child.try_wait());
-        if let Some(worker_state) = display_worker_state {
-            match worker_state {
-                Ok(Some(status)) => {
-                    let mut session = active.remove(position);
-                    let requested_stop = session.stopping_since.is_some();
-                    let had_display = session.display_worker.is_some();
-                    let _ = terminate_child(&mut session.waypipe_child);
-                    if let Some(container_child) = session.container_child.as_mut() {
-                        let _ = terminate_child(container_child);
-                    }
-                    if let Some(display_worker) = session.display_worker.as_ref() {
-                        let _ = std::fs::remove_dir_all(&display_worker.runtime_dir);
-                    }
-                    let cleanup = cleanup_owned_container_session(&session.owned_identity);
-                    finish_reaped_container_session(
-                        index,
-                        "dedicated display",
-                        &status.to_string(),
-                        requested_stop,
-                        had_display,
-                        cleanup,
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    let mut session = active.remove(position);
-                    let requested_stop = session.stopping_since.is_some();
-                    let had_display = session.display_worker.is_some();
-                    let _ = terminate_child(&mut session.waypipe_child);
-                    if let Some(container_child) = session.container_child.as_mut() {
-                        let _ = terminate_child(container_child);
-                    }
-                    if let Some(display_worker) = session.display_worker.as_mut() {
-                        let _ = terminate_display_worker(display_worker);
-                    }
-                    let cleanup = cleanup_owned_container_session(&session.owned_identity);
-                    finish_reaped_container_session(
-                        index,
-                        "dedicated display monitor",
-                        &format!("error: {}", error),
-                        requested_stop,
-                        had_display,
-                        cleanup,
-                    );
-                    continue;
-                }
-                Ok(None) => {}
-            }
-        }
-        if let Some(container_child) = active[position].container_child.as_mut() {
-            match container_child.try_wait() {
-                Ok(Some(status)) => {
-                    let mut session = active.remove(position);
-                    let requested_stop = session.stopping_since.is_some();
-                    let had_display = session.display_worker.is_some();
-                    let _ = terminate_child(&mut session.waypipe_child);
-                    if let Some(display_worker) = session.display_worker.as_mut() {
-                        let _ = terminate_display_worker(display_worker);
-                    }
-                    let cleanup = cleanup_owned_container_session(&session.owned_identity);
-                    finish_reaped_container_session(
-                        index,
-                        "container",
-                        &status.to_string(),
-                        requested_stop,
-                        had_display,
-                        cleanup,
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    let mut session = active.remove(position);
-                    let requested_stop = session.stopping_since.is_some();
-                    let had_display = session.display_worker.is_some();
-                    let _ = terminate_child(&mut session.waypipe_child);
-                    if let Some(display_worker) = session.display_worker.as_mut() {
-                        let _ = terminate_display_worker(display_worker);
-                    }
-                    let cleanup = cleanup_owned_container_session(&session.owned_identity);
-                    finish_reaped_container_session(
-                        index,
-                        "container monitor",
-                        &format!("error: {}", error),
-                        requested_stop,
-                        had_display,
-                        cleanup,
-                    );
-                    continue;
-                }
-                Ok(None) => {}
-            }
-        }
-
-        match active[position].waypipe_child.try_wait() {
-            Ok(Some(status)) => {
-                let mut session = active.remove(position);
-                let requested_stop = session.stopping_since.is_some();
-                let had_display = session.display_worker.is_some();
-                if let Some(container_child) = session.container_child.as_mut() {
-                    let _ = terminate_child(container_child);
-                }
-                if let Some(display_worker) = session.display_worker.as_mut() {
-                    let _ = terminate_display_worker(display_worker);
-                }
-                let cleanup = cleanup_owned_container_session(&session.owned_identity);
-                finish_reaped_container_session(
-                    index,
-                    "waypipe",
-                    &status.to_string(),
-                    requested_stop,
-                    had_display,
-                    cleanup,
-                );
-                continue;
-            }
-            Err(error) => {
-                let mut session = active.remove(position);
-                let requested_stop = session.stopping_since.is_some();
-                let had_display = session.display_worker.is_some();
-                if let Some(container_child) = session.container_child.as_mut() {
-                    let _ = terminate_child(container_child);
-                }
-                if let Some(display_worker) = session.display_worker.as_mut() {
-                    let _ = terminate_display_worker(display_worker);
-                }
-                let cleanup = cleanup_owned_container_session(&session.owned_identity);
-                finish_reaped_container_session(
-                    index,
-                    "waypipe monitor",
-                    &format!("error: {}", error),
-                    requested_stop,
-                    had_display,
-                    cleanup,
-                );
-                continue;
-            }
-            Ok(None) => {}
-        }
-
-        if active[position]
-            .stopping_since
-            .is_some_and(|started| started.elapsed() >= std::time::Duration::from_secs(4))
-            && !active[position].force_stop_offered
-        {
-            active[position].force_stop_offered = true;
-            container_mode::record_force_stop_available(index);
-        }
-
-        position += 1;
+        sender.wait_for_capacity(std::time::Duration::from_millis(100));
     }
 }
 
@@ -922,7 +651,7 @@ fn sync_active_container_sessions(active: &[ActiveContainerSession]) {
             .map(|session| {
                 (
                     session.instance_id,
-                    session.index,
+                    session.profile_id,
                     session.started_at_unix_ms,
                     session.container_child.as_ref().map(|child| child.id()),
                     session.waypipe_child.id(),
@@ -959,13 +688,18 @@ fn sync_managed_displays(displays: &[ManagedDisplay]) {
 
 fn next_managed_display_slot(
     displays: &[ManagedDisplay],
-    pending: &std::collections::HashSet<String>,
+    pending: &HashMap<String, u64>,
     active: &[ActiveContainerSession],
+    pending_displays: &HashMap<ProfileId, String>,
+    pending_launches: &HashMap<ProfileId, String>,
+    cleanup: &lifecycle::CleanupQueue,
 ) -> String {
     for number in 1usize.. {
         let candidate = format!("display-{}", number);
         if !displays.iter().any(|display| display.slot == candidate)
-            && !pending.contains(&candidate)
+            && !pending.contains_key(&candidate)
+            && !profile_display_pending(&candidate, pending_displays, pending_launches)
+            && !cleanup.display_busy(&candidate)
             && !active
                 .iter()
                 .any(|session| session.display_slot == candidate)
@@ -976,43 +710,32 @@ fn next_managed_display_slot(
     unreachable!("the display slot counter is unbounded")
 }
 
-fn reap_exited_managed_displays(
-    displays: &mut Vec<ManagedDisplay>,
-    active: &mut Vec<ActiveContainerSession>,
-) {
-    let mut position = 0;
-    while position < displays.len() {
-        let state = displays[position].worker.child.try_wait();
-        match state {
-            Ok(Some(status)) => {
-                let display = displays.remove(position);
-                let affected = active
-                    .iter()
-                    .filter(|session| session.display_slot == display.slot)
-                    .map(|session| session.index)
-                    .collect::<Vec<_>>();
-                for index in affected {
-                    let _ = stop_active_container_session(active, index);
-                }
-                let _ = std::fs::remove_dir_all(&display.worker.runtime_dir);
-                container_mode::record_managed_display_exit(&display.slot, &status.to_string());
-            }
-            Ok(None) => position += 1,
-            Err(error) => {
-                let mut display = displays.remove(position);
-                let _ = terminate_display_worker(&mut display.worker);
-                container_mode::record_managed_display_exit(
-                    &display.slot,
-                    &format!("monitor error: {}", error),
-                );
-            }
-        }
+fn profile_display_pending(
+    slot: &str,
+    displays: &HashMap<ProfileId, String>,
+    launches: &HashMap<ProfileId, String>,
+) -> bool {
+    displays
+        .values()
+        .chain(launches.values())
+        .any(|pending| pending == slot)
+}
+
+fn complete_managed_attempt(
+    pending: &mut HashMap<String, u64>,
+    slot: &str,
+    generation: u64,
+) -> bool {
+    if pending.get(slot) != Some(&generation) {
+        return false;
     }
+    pending.remove(slot);
+    true
 }
 
 fn spawn_output_reader<R>(
     sender: Sender<CompositorMessage>,
-    index: usize,
+    index: ProfileId,
     source: &'static str,
     reader: R,
 ) where
@@ -1026,7 +749,7 @@ fn spawn_output_reader<R>(
                         &sender,
                         line.len(),
                         CompositorMessage::ContainerSessionLog {
-                            index,
+                            profile_id: index,
                             source: source.into(),
                             line,
                         },
@@ -1037,7 +760,7 @@ fn spawn_output_reader<R>(
                         &sender,
                         256,
                         CompositorMessage::ContainerSessionLog {
-                            index,
+                            profile_id: index,
                             source: source.into(),
                             line: format!("failed to read process output: {}", error),
                         },
@@ -1051,7 +774,7 @@ fn spawn_output_reader<R>(
 
 fn attach_container_logs(
     sender: &Sender<CompositorMessage>,
-    index: usize,
+    index: ProfileId,
     report: &mut container_sessions::LaunchReport,
 ) {
     if let Some(container_child) = report.container_child.as_mut() {
@@ -1071,38 +794,54 @@ fn attach_container_logs(
 }
 
 fn spawn_container_session_check(
-    index: usize,
+    index: ProfileId,
     generation: u64,
     session: container_sessions::ContainerSession,
     launch_after: bool,
     sender: Sender<CompositorMessage>,
 ) {
+    let Some(producer) = lifecycle_producers::GLOBAL.begin() else {
+        return;
+    };
     std::thread::spawn(move || {
+        let _producer = producer;
+        if lifecycle_producers::GLOBAL.closing() {
+            return;
+        }
         if launch_after {
-            let _ = sender.send(CompositorMessage::ContainerSessionLaunchProgress {
-                index,
-                generation,
-                step: application_model::LaunchStep::ValidateProfile,
-                detail: "Validating the saved application profile".into(),
-            });
-            let _ = sender.send(CompositorMessage::ContainerSessionLaunchProgress {
-                index,
-                generation,
-                step: application_model::LaunchStep::CheckRuntime,
-                detail: "Checking the selected container runtime and transport".into(),
-            });
+            let _ = send_resource_message(
+                &sender,
+                CompositorMessage::ContainerSessionLaunchProgress {
+                    profile_id: index,
+                    generation,
+                    step: application_model::LaunchStep::ValidateProfile,
+                    detail: "Validating the saved application profile".into(),
+                },
+            );
+            let _ = send_resource_message(
+                &sender,
+                CompositorMessage::ContainerSessionLaunchProgress {
+                    profile_id: index,
+                    generation,
+                    step: application_model::LaunchStep::CheckRuntime,
+                    detail: "Checking the selected container runtime and transport".into(),
+                },
+            );
         }
         let result = container_sessions::check_session(&session);
-        let _ = sender.send(CompositorMessage::ContainerSessionChecked {
-            index,
-            generation,
-            result,
-        });
+        let _ = send_resource_message(
+            &sender,
+            CompositorMessage::ContainerSessionChecked {
+                profile_id: index,
+                generation,
+                result,
+            },
+        );
     });
 }
 
 fn spawn_container_session_on_display(
-    index: usize,
+    index: ProfileId,
     generation: u64,
     session: container_sessions::ContainerSession,
     check: container_sessions::CheckReport,
@@ -1111,7 +850,13 @@ fn spawn_container_session_on_display(
     display_slot: String,
     sender: Sender<CompositorMessage>,
 ) {
+    let Some(producer) = lifecycle_producers::GLOBAL.begin() else {
+        return;
+    };
     std::thread::spawn(move || {
+        if lifecycle_producers::GLOBAL.closing() {
+            return;
+        }
         let progress_sender = sender.clone();
         let result = container_sessions::launch_checked_session(
             &session,
@@ -1119,43 +864,47 @@ fn spawn_container_session_on_display(
             &display,
             check,
             move |step, detail| {
-                let _ = progress_sender.send(CompositorMessage::ContainerSessionLaunchProgress {
-                    index,
-                    generation,
-                    step,
-                    detail: detail.into(),
-                });
+                let _ = send_resource_message(
+                    &progress_sender,
+                    CompositorMessage::ContainerSessionLaunchProgress {
+                        profile_id: index,
+                        generation,
+                        step,
+                        detail: detail.into(),
+                    },
+                );
             },
         );
-        if let Err(error) = sender.send(CompositorMessage::ContainerSessionLaunchFinished {
-            index,
-            generation,
-            display_slot,
-            result,
-        }) && let CompositorMessage::ContainerSessionLaunchFinished {
-            result: Ok(mut report),
-            ..
+        if let Err(error) = send_resource_message(
+            &sender,
+            CompositorMessage::ContainerSessionLaunchFinished {
+                profile_id: index,
+                generation,
+                display_slot,
+                result,
+            },
+        ) && let CompositorMessage::ContainerSessionLaunchFinished {
+            result: Ok(report), ..
         } = error.0
         {
-            let _ = terminate_child(&mut report.waypipe_child);
-            if let Some(child) = report.container_child.as_mut() {
-                let _ = terminate_child(child);
-            }
-            let _ = cleanup_owned_container_session(&report.identity);
+            session_lifecycle::rollback_disconnected_launch(report, producer);
         }
     });
 }
 
 fn complete_container_session_launch(
-    index: usize,
+    index: ProfileId,
     session: &container_sessions::ContainerSession,
     identity_reservation: Option<profile_activity::RuntimeReservation>,
+    activity: profile_activity::ProfileActivity,
     display_slot: String,
     mut display_worker: Option<DisplayWorker>,
     result: Result<container_sessions::LaunchReport, container_sessions::LaunchError>,
     sender: &Sender<CompositorMessage>,
     active: &mut Vec<ActiveContainerSession>,
+    cleanup: &mut lifecycle::CleanupQueue,
 ) {
+    debug_assert_eq!(activity.profile_id(), index);
     match result {
         Ok(mut report) => {
             log::info!(
@@ -1173,10 +922,10 @@ fn complete_container_session_launch(
                 .map(|socket| audio::AudioWorker::start(index, session.name.clone(), socket));
             active.push(ActiveContainerSession {
                 instance_id: APPLICATION_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-                index,
+                profile_id: index,
                 launched_session: session.clone(),
                 owned_identity: report.identity,
-                _profile_activity: profile_activity::ProfileActivity::begin(),
+                _profile_activity: activity,
                 _identity_reservation: identity_reservation,
                 started_at_unix_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1193,8 +942,15 @@ fn complete_container_session_launch(
             sync_active_container_sessions(active);
         }
         Err(error) => {
-            if let Some(worker) = display_worker.as_mut() {
-                let _ = terminate_display_worker(worker);
+            if let Some(worker) = display_worker.take() {
+                session_lifecycle::queue_failed_launch_display_cleanup(
+                    index,
+                    display_slot,
+                    worker,
+                    identity_reservation,
+                    activity,
+                    cleanup,
+                );
             }
             // A failed launch is not proof of ownership of an existing named container.
             // Child/relay startup paths must tear down only resources they created.
@@ -1217,22 +973,8 @@ fn container_data_root() -> String {
 }
 
 fn available_disk_gib(path: &str) -> Option<f64> {
-    let output = std::process::Command::new("/bin/df")
-        .args(["-Pk", path])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let available_kib: u64 = stdout
-        .lines()
-        .nth(1)?
-        .split_whitespace()
-        .nth(3)?
-        .parse()
-        .ok()?;
-    Some(available_kib as f64 / 1024.0 / 1024.0)
+    diagnostics::filesystem_available_bytes(std::path::Path::new(path))
+        .map(diagnostics::bytes_to_gib)
 }
 
 fn warn_low_container_disk_for_image_task(
@@ -1243,14 +985,19 @@ fn warn_low_container_disk_for_image_task(
     let root = container_data_root();
     if let Some(free_gib) = available_disk_gib(&root) {
         if free_gib < 8.0 {
-            let _ = sender.send(CompositorMessage::ContainerImagePullLog {
-                runtime: runtime.into(),
-                image: image.into(),
-                line: format!(
-                    "Low disk space: {:.1}G free at {}. Image operations may fail.",
-                    free_gib, root
-                ),
-            });
+            let line = format!(
+                "Low disk space: {:.1}G free at {}. Image operations may fail.",
+                free_gib, root
+            );
+            process_output::send(
+                sender,
+                line.len(),
+                CompositorMessage::ContainerImagePullLog {
+                    runtime: runtime.into(),
+                    image: image.into(),
+                    line,
+                },
+            );
         }
     }
 }
@@ -1440,53 +1187,26 @@ fn spawn_registry_login(
         };
         let args = registry_login_args(&server, &username, scheme.as_deref());
 
-        let mut child = match std::process::Command::new(command_path)
-            .env("PATH", &child_path)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
-                    runtime: "apple".into(),
-                    action,
-                    success: false,
-                    status: format!("Failed to start registry login: {}", error),
-                });
-                return;
-            }
-        };
-
-        let write_result = child.stdin.take().map(|mut stdin| {
-            stdin.write_all(password.as_bytes())?;
-            stdin.write_all(b"\n")
-        });
-        if let Some(Err(error)) = write_result {
-            let _ = child.kill();
-            let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
-                runtime: "apple".into(),
-                action,
-                success: false,
-                status: format!("Failed to send registry credentials: {}", error),
-            });
-            return;
-        }
-
-        match child.wait_with_output() {
+        let mut command = std::process::Command::new(command_path);
+        command.env("PATH", &child_path).args(&args);
+        let input = format!("{}\n", password).into_bytes();
+        match runtime_commands::capture_with_input(
+            command,
+            input,
+            std::time::Duration::from_secs(30),
+        ) {
             Ok(output) => {
-                for line in String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .chain(String::from_utf8_lossy(&output.stderr).lines())
-                    .filter(|line| !line.trim().is_empty())
+                for line in process_output::captured_lines(&output, std::slice::from_ref(&password))
                 {
-                    let _ = sender.send(CompositorMessage::RuntimeSystemActionLog {
-                        runtime: "apple".into(),
-                        action: action.clone(),
-                        line: line.to_string(),
-                    });
+                    process_output::send(
+                        &sender,
+                        line.len(),
+                        CompositorMessage::RuntimeSystemActionLog {
+                            runtime: "apple".into(),
+                            action: action.clone(),
+                            line,
+                        },
+                    );
                 }
                 let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
                     runtime: "apple".into(),
@@ -2229,10 +1949,9 @@ fn spawn_apple_runtime_container_restart(
             return;
         };
         for phase in ["stop", "start"] {
-            let output = std::process::Command::new(&command_path)
-                .env("PATH", &child_path)
-                .args([phase, &name])
-                .output();
+            let mut command = std::process::Command::new(&command_path);
+            command.env("PATH", &child_path).args([phase, &name]);
+            let output = runtime_commands::capture(command, runtime_commands::ACTION_TIMEOUT);
             let output = match output {
                 Ok(output) => output,
                 Err(error) => {
@@ -2246,17 +1965,17 @@ fn spawn_apple_runtime_container_restart(
                     return;
                 }
             };
-            for line in String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .chain(String::from_utf8_lossy(&output.stderr).lines())
-                .filter(|line| !line.trim().is_empty())
-            {
-                let _ = sender.send(CompositorMessage::RuntimeContainerActionLog {
-                    runtime: runtime.clone(),
-                    name: name.clone(),
-                    action: "restart".into(),
-                    line: format!("{}: {}", phase, line),
-                });
+            for line in process_output::captured_lines(&output, &[]) {
+                process_output::send(
+                    &sender,
+                    line.len(),
+                    CompositorMessage::RuntimeContainerActionLog {
+                        runtime: runtime.clone(),
+                        name: name.clone(),
+                        action: "restart".into(),
+                        line: format!("{}: {}", phase, line),
+                    },
+                );
             }
             if !output.status.success() {
                 let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
@@ -2357,22 +2076,21 @@ fn spawn_runtime_system_action(sender: Sender<CompositorMessage>, runtime: Strin
             return;
         };
 
-        let output = std::process::Command::new(&command_path)
-            .env("PATH", &child_path)
-            .args(args)
-            .output();
+        let mut command = std::process::Command::new(&command_path);
+        command.env("PATH", &child_path).args(args);
+        let output = runtime_commands::capture(command, runtime_commands::ACTION_TIMEOUT);
         match output {
             Ok(output) => {
-                for line in String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .chain(String::from_utf8_lossy(&output.stderr).lines())
-                    .filter(|line| !line.trim().is_empty())
-                {
-                    let _ = sender.send(CompositorMessage::RuntimeSystemActionLog {
-                        runtime: runtime.clone(),
-                        action: action.clone(),
-                        line: line.to_string(),
-                    });
+                for line in process_output::captured_lines(&output, &[]) {
+                    process_output::send(
+                        &sender,
+                        line.len(),
+                        CompositorMessage::RuntimeSystemActionLog {
+                            runtime: runtime.clone(),
+                            action: action.clone(),
+                            line,
+                        },
+                    );
                 }
                 let mut success = output.status.success();
                 let mut status = output.status.to_string();
@@ -2441,22 +2159,20 @@ fn spawn_runtime_machine_action(
             args.push("--force".into());
         }
         args.push(name);
-        match std::process::Command::new(command_path)
-            .env("PATH", &child_path)
-            .args(&args)
-            .output()
-        {
+        let mut command = std::process::Command::new(command_path);
+        command.env("PATH", &child_path).args(&args);
+        match runtime_commands::capture(command, runtime_commands::ACTION_TIMEOUT) {
             Ok(output) => {
-                for line in String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .chain(String::from_utf8_lossy(&output.stderr).lines())
-                    .filter(|line| !line.trim().is_empty())
-                {
-                    let _ = sender.send(CompositorMessage::RuntimeSystemActionLog {
-                        runtime: runtime.clone(),
-                        action: activity_action.clone(),
-                        line: line.to_string(),
-                    });
+                for line in process_output::captured_lines(&output, &[]) {
+                    process_output::send(
+                        &sender,
+                        line.len(),
+                        CompositorMessage::RuntimeSystemActionLog {
+                            runtime: runtime.clone(),
+                            action: activity_action.clone(),
+                            line,
+                        },
+                    );
                 }
                 let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
                     runtime,
@@ -2485,20 +2201,19 @@ fn wait_for_orbstack_state(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
     let mut last_status = "status unavailable".to_string();
     while std::time::Instant::now() < deadline {
-        match std::process::Command::new(command_path)
-            .env("PATH", child_path)
-            .arg("status")
-            .output()
-        {
+        let mut command = std::process::Command::new(command_path);
+        command.env("PATH", child_path).arg("status");
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match runtime_commands::capture(command, remaining.min(std::time::Duration::from_secs(3))) {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                last_status = [stdout.trim(), stderr.trim()]
+                let raw_status = [stdout.trim(), stderr.trim()]
                     .into_iter()
                     .filter(|part| !part.is_empty())
                     .collect::<Vec<_>>()
                     .join("; ");
-                if parse_orbstack_running(&last_status) == Some(expected_running) {
+                if parse_orbstack_running(&raw_status) == Some(expected_running) {
                     return Ok(format!(
                         "OrbStack is {}",
                         if expected_running {
@@ -2508,10 +2223,15 @@ fn wait_for_orbstack_state(
                         }
                     ));
                 }
+                last_status = process_output::redaction::redact(&raw_status);
             }
             Err(error) => last_status = error.to_string(),
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(std::time::Duration::from_millis(250)),
+        );
     }
     Err(format!(
         "OrbStack did not reach the expected {} state: {}",
@@ -2548,22 +2268,23 @@ fn spawn_docker_context_switch(sender: Sender<CompositorMessage>, name: String) 
             });
             return;
         };
-        let output = std::process::Command::new(command_path)
+        let mut command = std::process::Command::new(command_path);
+        command
             .env("PATH", &child_path)
-            .args(["context", "use", &name])
-            .output();
+            .args(["context", "use", &name]);
+        let output = runtime_commands::capture(command, runtime_commands::ACTION_TIMEOUT);
         match output {
             Ok(output) => {
-                for line in String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .chain(String::from_utf8_lossy(&output.stderr).lines())
-                    .filter(|line| !line.trim().is_empty())
-                {
-                    let _ = sender.send(CompositorMessage::RuntimeSystemActionLog {
-                        runtime: "docker".into(),
-                        action: action.clone(),
-                        line: line.to_string(),
-                    });
+                for line in process_output::captured_lines(&output, &[]) {
+                    process_output::send(
+                        &sender,
+                        line.len(),
+                        CompositorMessage::RuntimeSystemActionLog {
+                            runtime: "docker".into(),
+                            action: action.clone(),
+                            line,
+                        },
+                    );
                 }
                 let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
                     runtime: "docker".into(),
@@ -2948,33 +2669,40 @@ mod display_slot_tests {
     use super::*;
 
     fn test_profile(name: &str) -> container_sessions::ContainerSession {
-        toml::from_str(&format!(
+        let mut session: container_sessions::ContainerSession = toml::from_str(&format!(
             "name = '{name}'\nimage = 'test:latest'\ncommand = 'foot'\nruntime = 'container'"
         ))
-        .unwrap()
+        .unwrap();
+        session.id = ProfileId::new().unwrap();
+        session
     }
 
     #[test]
     fn stale_launch_generation_cannot_take_new_pending_resources() {
         let mut pending = HashMap::new();
+        let index = ProfileId::new().unwrap();
         pending.insert(
-            0,
+            index,
             PendingProfileOperation {
                 generation: 2,
-                session: test_profile("New"),
+                session: {
+                    let mut session = test_profile("New");
+                    session.id = index;
+                    session
+                },
                 launch_requested: true,
                 cancelled: false,
-                _profile_activity: profile_activity::ProfileActivity::begin(),
+                _profile_activity: profile_activity::ProfileActivity::begin(index),
                 identity_reservation: None,
             },
         );
-        let mut workers = HashMap::from([(0, "new display worker")]);
-        if current_operation(&pending, 0, 1) {
-            workers.remove(&0);
+        let mut workers = HashMap::from([(index, "new display worker")]);
+        if current_operation(&pending, index, 1) {
+            workers.remove(&index);
         }
-        assert_eq!(workers.get(&0), Some(&"new display worker"));
-        assert!(current_operation(&pending, 0, 2));
-        assert!(!current_operation(&pending, 1, 2));
+        assert_eq!(workers.get(&index), Some(&"new display worker"));
+        assert!(current_operation(&pending, index, 2));
+        assert!(!current_operation(&pending, ProfileId::new().unwrap(), 2));
     }
 
     #[test]
@@ -3112,6 +2840,7 @@ mod display_slot_tests {
 
     fn session(name: &str, display: Option<&str>) -> container_sessions::ContainerSession {
         container_sessions::ContainerSession {
+            id: ProfileId::new().unwrap(),
             name: name.into(),
             image: "example:latest".into(),
             runtime: "container".into(),
@@ -3136,7 +2865,12 @@ mod display_slot_tests {
     fn default_display_rejects_a_second_active_session() {
         let sessions = vec![session("first", Some("auto")), session("second", None)];
         assert_eq!(
-            active_display_conflict_index(1, &sessions, [(0, "default".into())]),
+            active_display_conflict_index(
+                sessions[1].id,
+                &sessions,
+                [(sessions[0].id, "default".into())],
+                false
+            ),
             None
         );
 
@@ -3145,16 +2879,100 @@ mod display_slot_tests {
             session("second", Some("default")),
         ];
         assert_eq!(
-            active_display_conflict_index(1, &sessions, [(0, "default".into())]),
-            Some(0)
+            active_display_conflict_index(
+                sessions[1].id,
+                &sessions,
+                [(sessions[0].id, "default".into())],
+                false
+            ),
+            Some(sessions[0].id)
         );
+    }
+
+    #[test]
+    fn pending_launch_and_cleanup_slots_participate_in_display_assignment() {
+        let sessions = vec![
+            session("first", Some("auto")),
+            session("second", Some("auto")),
+        ];
+        let pending_display = HashMap::from([(sessions[0].id, "research".into())]);
+        let pending_launch = HashMap::from([(sessions[1].id, "default".into())]);
+        assert!(profile_display_pending(
+            "research",
+            &pending_display,
+            &pending_launch
+        ));
+        assert!(profile_display_pending(
+            "default",
+            &pending_display,
+            &pending_launch
+        ));
+        assert!(!profile_display_pending(
+            "free",
+            &pending_display,
+            &pending_launch
+        ));
+        assert_eq!(
+            choose_display_assignment(&sessions[0], true),
+            DisplayAssignment::Dedicated("session-first".into())
+        );
+        assert_eq!(
+            active_display_conflict_index(
+                sessions[1].id,
+                &sessions,
+                [(sessions[0].id, "session-second".into())],
+                true
+            ),
+            Some(sessions[0].id)
+        );
+    }
+
+    #[test]
+    fn managed_display_callbacks_cannot_complete_a_recreated_attempt() {
+        let mut pending = HashMap::from([("research".to_string(), 10)]);
+        pending.remove("research");
+        pending.insert("research".into(), 11);
+        assert!(!complete_managed_attempt(&mut pending, "research", 10));
+        assert_eq!(pending.get("research"), Some(&11));
+        assert!(complete_managed_attempt(&mut pending, "research", 11));
+        assert!(!complete_managed_attempt(&mut pending, "research", 11));
+    }
+
+    #[test]
+    fn automatic_managed_display_names_skip_pending_launches_and_cleanup() {
+        let pending_display = HashMap::from([(ProfileId::new().unwrap(), "display-1".into())]);
+        let pending_launch = HashMap::from([(ProfileId::new().unwrap(), "display-2".into())]);
+        let mut cleanup = lifecycle::CleanupQueue::new(|| {});
+        cleanup.enqueue(
+            lifecycle::Key::Display("display-3".into()),
+            (),
+            |_| Ok(()),
+            |_, _| {},
+        );
+        assert_eq!(
+            next_managed_display_slot(
+                &[],
+                &HashMap::new(),
+                &[],
+                &pending_display,
+                &pending_launch,
+                &cleanup
+            ),
+            "display-4"
+        );
+        assert!(cleanup.finish(std::time::Duration::from_secs(1)));
     }
 
     #[test]
     fn relaunching_the_tracked_session_is_not_a_display_conflict() {
         let sessions = vec![session("first", Some("default"))];
         assert_eq!(
-            active_display_conflict_index(0, &sessions, [(0, "default".into())]),
+            active_display_conflict_index(
+                sessions[0].id,
+                &sessions,
+                [(sessions[0].id, "default".into())],
+                false
+            ),
             None
         );
     }
@@ -3166,7 +2984,12 @@ mod display_slot_tests {
             session("default", None),
         ];
         assert_eq!(
-            active_display_conflict_index(0, &sessions, [(1, "default".into())]),
+            active_display_conflict_index(
+                sessions[0].id,
+                &sessions,
+                [(sessions[1].id, "default".into())],
+                false
+            ),
             None
         );
     }
@@ -3237,8 +3060,13 @@ mod display_slot_tests {
             session("Browser", Some("Research Window")),
         ];
         assert_eq!(
-            active_display_conflict_index(1, &sessions, [(0, "research-window".into())]),
-            Some(0)
+            active_display_conflict_index(
+                sessions[1].id,
+                &sessions,
+                [(sessions[0].id, "research-window".into())],
+                false
+            ),
+            Some(sessions[0].id)
         );
     }
 
@@ -3944,8 +3772,8 @@ fn create_event_handler(
     let mut display = Display::<AppState>::new()
         .map_err(|error| format!("failed to initialize the Wayland display: {error}"))?;
     let display_handle = display.handle();
-    let (raw_signal, loop_receiver) = std::sync::mpsc::channel::<CompositorMessage>();
-    let loop_signal = Sender::new(raw_signal, event_proxy.clone());
+    let (loop_signal, loop_receiver) =
+        event_loop_signal::channel::<CompositorMessage>(event_proxy.clone());
     let control_socket_path = if display_worker_slot.is_none() {
         let path = control_api::start(loop_signal.clone()).map_err(|error| format!(
             "Could not start Cocoa-Way's local control service: {error}. Close any other running copy of Cocoa-Way, or check the socket directory permissions."
@@ -4036,6 +3864,10 @@ fn create_event_handler(
     let connections_for_menu = connections::load_connections();
     let container_sessions_for_menu = container_sessions::load_sessions();
     let container_event_signal = menu_signal.clone();
+    let cleanup_signal = container_event_signal.clone();
+    let mut lifecycle_cleanup = lifecycle::CleanupQueue::new(move || {
+        let _ = cleanup_signal.try_send(CompositorMessage::LifecycleCleanupReady);
+    });
     let mut pending_menu: Option<Sender<CompositorMessage>> = if display_worker_slot.is_some() {
         None
     } else {
@@ -4043,14 +3875,14 @@ fn create_event_handler(
     };
     let mut active_container_sessions: Vec<ActiveContainerSession> = Vec::new();
     let mut active_classic_connections: Vec<ActiveClassicConnection> = Vec::new();
-    let mut pending_profile_checks = HashSet::<usize>::new();
-    let mut pending_profile_operations = HashMap::<usize, PendingProfileOperation>::new();
-    let mut validated_launch_checks = HashMap::<usize, container_sessions::CheckReport>::new();
-    let mut pending_display_sessions: HashMap<usize, String> = HashMap::new();
-    let mut pending_launch_sessions: HashMap<usize, String> = HashMap::new();
-    let mut pending_launch_workers: HashMap<usize, DisplayWorker> = HashMap::new();
+    let mut pending_profile_checks = HashSet::<ProfileId>::new();
+    let mut pending_profile_operations = HashMap::<ProfileId, PendingProfileOperation>::new();
+    let mut validated_launch_checks = HashMap::<ProfileId, container_sessions::CheckReport>::new();
+    let mut pending_display_sessions: HashMap<ProfileId, String> = HashMap::new();
+    let mut pending_launch_sessions: HashMap<ProfileId, String> = HashMap::new();
+    let mut pending_launch_workers: HashMap<ProfileId, DisplayWorker> = HashMap::new();
     let mut managed_displays: Vec<ManagedDisplay> = Vec::new();
-    let mut pending_managed_displays = std::collections::HashSet::<String>::new();
+    let mut pending_managed_displays = HashMap::<String, u64>::new();
     let mut rootless_windows =
         HashMap::<winit::window::WindowId, presentation::RootlessWindow>::new();
     let mut rootless_clocks = HashMap::<winit::window::WindowId, frame_clock::FrameClock>::new();
@@ -4084,6 +3916,7 @@ fn create_event_handler(
     let mut reveal_first_desktop_client =
         display_worker_slot.is_none() && !presentation_mode.is_rootless();
     Ok(move |event: Event<()>, target: &ActiveEventLoop| {
+        lifecycle_cleanup.poll();
         let input_trace = if state.latency_trace.enabled()
             && matches!(
                 &event,
@@ -4193,7 +4026,10 @@ fn create_event_handler(
                 message => message,
             };
             let msg = match msg {
-                CompositorMessage::ResumeContainerSession { index, generation } => {
+                CompositorMessage::ResumeContainerSession {
+                    profile_id: index,
+                    generation,
+                } => {
                     if !current_operation(&pending_profile_operations, index, generation)
                         || pending_profile_operations[&index].cancelled
                     {
@@ -4201,12 +4037,17 @@ fn create_event_handler(
                     }
                     CompositorMessage::StartContainerSession(index)
                 }
-                CompositorMessage::StartContainerSessionIfCurrent { index, signature } => {
-                    if !container_sessions::load_sessions()
-                        .get(index)
-                        .is_some_and(|session| {
-                            container_sessions::session_to_toml(session) == signature
-                        })
+                CompositorMessage::StartContainerSessionIfCurrent {
+                    profile_id: index,
+                    signature,
+                } => {
+                    let target = container_sessions::ProfileActionTarget {
+                        id: index,
+                        signature,
+                    };
+                    if target
+                        .resolve(&container_sessions::load_sessions())
+                        .is_none()
                     {
                         let _ = container_event_signal.send(CompositorMessage::ReloadMenu);
                         log::warn!(
@@ -4219,6 +4060,7 @@ fn create_event_handler(
                 message => message,
             };
             match msg {
+                CompositorMessage::LifecycleCleanupReady => lifecycle_cleanup.poll(),
                 CompositorMessage::ProcessOutput { .. } => {
                     unreachable!("output envelopes cannot be nested")
                 }
@@ -4625,17 +4467,20 @@ fn create_event_handler(
                         "Disconnecting {} classic waypipe connection(s)",
                         active_classic_connections.len()
                     );
-                    for mut connection in active_classic_connections.drain(..) {
-                        let _ = connection.child.kill();
-                        let _ = connection.child.wait();
+                    for connection in active_classic_connections.drain(..) {
+                        session_lifecycle::queue_classic_child(
+                            connection.child,
+                            &mut lifecycle_cleanup,
+                        );
                     }
                 }
                 CompositorMessage::CheckContainerSession(i) => {
                     log::info!("Checking container session #{}", i);
+                    let activity = profile_activity::ProfileActivity::begin(i);
                     if !pending_profile_operations.contains_key(&i)
                         && pending_profile_checks.insert(i)
                     {
-                        if let Some(session) = container_sessions::load_sessions().get(i).cloned() {
+                        if let Some(session) = container_sessions::resolve_session(i).ok() {
                             let generation =
                                 PROFILE_OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
                             pending_profile_operations.insert(
@@ -4645,7 +4490,7 @@ fn create_event_handler(
                                     session: session.clone(),
                                     launch_requested: false,
                                     cancelled: false,
-                                    _profile_activity: profile_activity::ProfileActivity::begin(),
+                                    _profile_activity: activity,
                                     identity_reservation: None,
                                 },
                             );
@@ -4662,7 +4507,7 @@ fn create_event_handler(
                     }
                 }
                 CompositorMessage::ContainerSessionChecked {
-                    index,
+                    profile_id: index,
                     generation,
                     result,
                 } => {
@@ -4673,10 +4518,18 @@ fn create_event_handler(
                     let operation = &pending_profile_operations[&index];
                     if operation.cancelled {
                         pending_profile_operations.remove(&index);
+                        container_mode::record_launch_cancelled(
+                            index,
+                            "Launch cancelled; profile check finished without owned resources.",
+                        );
                         continue;
                     }
                     let launch_after = operation.launch_requested;
-                    let configured = container_sessions::load_sessions().get(index).cloned();
+                    let configured = container_sessions::resolve_session(index).ok();
+                    if configured.is_none() {
+                        pending_profile_operations.remove(&index);
+                        continue;
+                    }
                     if let Some(configured) = configured
                         && container_sessions::session_to_toml(&configured)
                             != container_sessions::session_to_toml(&operation.session)
@@ -4686,7 +4539,7 @@ fn create_event_handler(
                         operation.identity_reservation = None;
                         operation.generation =
                             PROFILE_OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-                        if launch_after && let Err(error) = operation.reserve_runtime(index) {
+                        if launch_after && let Err(error) = operation.reserve_runtime() {
                             container_mode::record_launch_blocked(index, &error);
                             pending_profile_operations.remove(&index);
                             continue;
@@ -4712,7 +4565,10 @@ fn create_event_handler(
                                 );
                                 validated_launch_checks.insert(index, report);
                                 let _ = container_event_signal.send(
-                                    CompositorMessage::ResumeContainerSession { index, generation },
+                                    CompositorMessage::ResumeContainerSession {
+                                        profile_id: index,
+                                        generation,
+                                    },
                                 );
                             } else {
                                 pending_profile_operations.remove(&index);
@@ -4734,13 +4590,27 @@ fn create_event_handler(
                 }
                 CompositorMessage::StartContainerSession(i) => {
                     log::info!("Starting container session #{}", i);
+                    let activity = profile_activity::ProfileActivity::begin(i);
                     let sessions = container_sessions::load_sessions();
-                    if let Some(configured_session) = sessions.get(i) {
-                        reap_exited_container_sessions(&mut active_container_sessions);
+                    if let Some(configured_session) =
+                        sessions.iter().find(|session| session.id == i)
+                    {
+                        container_mode::ensure_launch_task(i, &configured_session.name);
+                        if lifecycle_cleanup.session_busy(i) {
+                            container_mode::record_launch_blocked(
+                                i,
+                                "Previous instance is still releasing its resources. Wait for cleanup before launching again.",
+                            );
+                            continue;
+                        }
+                        reap_exited_container_sessions(
+                            &mut active_container_sessions,
+                            &mut lifecycle_cleanup,
+                        );
                         sync_active_container_sessions(&active_container_sessions);
                         if active_container_sessions
                             .iter()
-                            .any(|active| active.index == i)
+                            .any(|active| active.profile_id == i)
                         {
                             if !pending_profile_checks.contains(&i) {
                                 validated_launch_checks.remove(&i);
@@ -4758,7 +4628,7 @@ fn create_event_handler(
                                 continue;
                             }
                             if pending_profile_checks.contains(&i) {
-                                if let Err(error) = operation.reserve_runtime(i) {
+                                if let Err(error) = operation.reserve_runtime() {
                                     container_mode::record_launch_blocked(i, &error);
                                     continue;
                                 }
@@ -4787,13 +4657,13 @@ fn create_event_handler(
                                 session: configured_session.clone(),
                                 launch_requested: true,
                                 cancelled: false,
-                                _profile_activity: profile_activity::ProfileActivity::begin(),
+                                _profile_activity: activity,
                                 identity_reservation: None,
                             }
                         });
                         let generation = operation.generation;
                         let session = operation.session.clone();
-                        if let Err(error) = operation.reserve_runtime(i) {
+                        if let Err(error) = operation.reserve_runtime() {
                             container_mode::record_launch_blocked(i, &error);
                             validated_launch_checks.remove(&i);
                             pending_profile_operations.remove(&i);
@@ -4811,21 +4681,32 @@ fn create_event_handler(
                             continue;
                         };
                         let mut launch_profiles = sessions.clone();
-                        launch_profiles[i] = session.clone();
+                        if let Some(configured) =
+                            launch_profiles.iter_mut().find(|profile| profile.id == i)
+                        {
+                            *configured = session.clone();
+                        }
                         if let Some(conflict_index) = active_display_conflict_index(
                             i,
                             &launch_profiles,
                             active_container_sessions
                                 .iter()
-                                .map(|active| (active.index, active.display_slot.clone()))
+                                .map(|active| (active.profile_id, active.display_slot.clone()))
                                 .chain(
                                     pending_display_sessions
                                         .iter()
                                         .map(|(index, slot)| (*index, slot.clone())),
+                                )
+                                .chain(
+                                    pending_launch_sessions
+                                        .iter()
+                                        .map(|(id, slot)| (*id, slot.clone())),
                                 ),
+                            lifecycle_cleanup.display_busy("default"),
                         ) {
                             let conflict_name = sessions
-                                .get(conflict_index)
+                                .iter()
+                                .find(|session| session.id == conflict_index)
                                 .map(|session| session.name.as_str())
                                 .unwrap_or("another session");
                             let message = format!(
@@ -4849,8 +4730,26 @@ fn create_event_handler(
                         );
                         let default_in_use = active_container_sessions
                             .iter()
-                            .any(|active| active.display_slot == "default");
+                            .any(|active| active.display_slot == "default")
+                            || profile_display_pending(
+                                "default",
+                                &pending_display_sessions,
+                                &pending_launch_sessions,
+                            )
+                            || lifecycle_cleanup.display_busy("default");
                         let assignment = choose_display_assignment(&session, default_in_use);
+                        let assigned_slot = match &assignment {
+                            DisplayAssignment::Default => "default",
+                            DisplayAssignment::Dedicated(slot) => slot.as_str(),
+                        };
+                        if lifecycle_cleanup.display_busy(assigned_slot) {
+                            container_mode::record_launch_blocked(
+                                i,
+                                "This display is still releasing its previous resources. Wait for cleanup and retry.",
+                            );
+                            pending_profile_operations.remove(&i);
+                            continue;
+                        }
                         match assignment {
                             DisplayAssignment::Default => {
                                 pending_launch_sessions.insert(i, "default".into());
@@ -4866,7 +4765,7 @@ fn create_event_handler(
                                 );
                             }
                             DisplayAssignment::Dedicated(slot) => {
-                                if pending_managed_displays.contains(&slot) {
+                                if pending_managed_displays.contains_key(&slot) {
                                     let message = format!(
                                         "Managed display '{}' is still starting. Wait for it to become ready, then launch this session again.",
                                         slot
@@ -4903,7 +4802,7 @@ fn create_event_handler(
                     }
                 }
                 CompositorMessage::DedicatedDisplayStarted {
-                    index,
+                    profile_id: index,
                     generation,
                     display_slot,
                     runtime_dir,
@@ -4911,7 +4810,7 @@ fn create_event_handler(
                     worker_child,
                     worker_runtime_dir,
                 } => {
-                    let mut display_worker = DisplayWorker {
+                    let display_worker = DisplayWorker {
                         child: worker_child,
                         runtime_dir: worker_runtime_dir,
                     };
@@ -4924,27 +4823,77 @@ fn create_event_handler(
                             display_slot,
                             index
                         );
-                        let _ = terminate_display_worker(&mut display_worker);
+                        queue_display_cleanup(
+                            display_worker,
+                            display_slot,
+                            false,
+                            &mut lifecycle_cleanup,
+                        );
                         continue;
                     }
                     pending_display_sessions.remove(&index);
                     if pending_profile_operations[&index].cancelled {
-                        let _ = terminate_display_worker(&mut display_worker);
                         validated_launch_checks.remove(&index);
-                        pending_profile_operations.remove(&index);
+                        let operation = pending_profile_operations.remove(&index);
+                        queue_launch_cleanup(
+                            index,
+                            display_slot,
+                            None,
+                            Some(display_worker),
+                            operation,
+                            &mut lifecycle_cleanup,
+                        );
                         continue;
                     }
 
-                    reap_exited_container_sessions(&mut active_container_sessions);
+                    if lifecycle_cleanup.display_busy(&display_slot)
+                        || profile_display_pending(
+                            &display_slot,
+                            &pending_display_sessions,
+                            &pending_launch_sessions,
+                        )
+                        || pending_managed_displays.contains_key(&display_slot)
+                        || managed_displays
+                            .iter()
+                            .any(|display| display.slot == display_slot)
+                    {
+                        container_mode::record_launch_blocked(
+                            index,
+                            "The dedicated display slot is reserved by another launch or cleanup. Retry after it finishes.",
+                        );
+                        validated_launch_checks.remove(&index);
+                        let operation = pending_profile_operations.remove(&index);
+                        queue_launch_cleanup(
+                            index,
+                            display_slot,
+                            None,
+                            Some(display_worker),
+                            operation,
+                            &mut lifecycle_cleanup,
+                        );
+                        continue;
+                    }
+
+                    reap_exited_container_sessions(
+                        &mut active_container_sessions,
+                        &mut lifecycle_cleanup,
+                    );
                     sync_active_container_sessions(&active_container_sessions);
                     if active_container_sessions
                         .iter()
-                        .any(|active| active.index == index)
+                        .any(|active| active.profile_id == index)
                     {
-                        let _ = terminate_display_worker(&mut display_worker);
                         container_mode::record_launch_already_running(index);
                         validated_launch_checks.remove(&index);
-                        pending_profile_operations.remove(&index);
+                        let operation = pending_profile_operations.remove(&index);
+                        queue_launch_cleanup(
+                            index,
+                            display_slot,
+                            None,
+                            Some(display_worker),
+                            operation,
+                            &mut lifecycle_cleanup,
+                        );
                         continue;
                     }
                     if let Some(conflict) = active_container_sessions
@@ -4956,21 +4905,35 @@ fn create_event_handler(
                             "The dedicated display '{}' became occupied by '{}'. Stop that session or launch again with another display.",
                             display_slot, conflict_name
                         );
-                        let _ = terminate_display_worker(&mut display_worker);
                         container_mode::record_launch_blocked(index, &message);
                         validated_launch_checks.remove(&index);
-                        pending_profile_operations.remove(&index);
+                        let operation = pending_profile_operations.remove(&index);
+                        queue_launch_cleanup(
+                            index,
+                            display_slot,
+                            None,
+                            Some(display_worker),
+                            operation,
+                            &mut lifecycle_cleanup,
+                        );
                         continue;
                     }
 
                     let session = pending_profile_operations[&index].session.clone();
                     let Some(check) = validated_launch_checks.remove(&index) else {
-                        let _ = terminate_display_worker(&mut display_worker);
                         container_mode::record_launch_blocked(
                             index,
                             "The validated launch context expired. Launch the application again.",
                         );
-                        pending_profile_operations.remove(&index);
+                        let operation = pending_profile_operations.remove(&index);
+                        queue_launch_cleanup(
+                            index,
+                            display_slot,
+                            None,
+                            Some(display_worker),
+                            operation,
+                            &mut lifecycle_cleanup,
+                        );
                         continue;
                     };
                     pending_launch_workers.insert(index, display_worker);
@@ -4987,7 +4950,7 @@ fn create_event_handler(
                     );
                 }
                 CompositorMessage::DedicatedDisplayFailed {
-                    index,
+                    profile_id: index,
                     generation,
                     display_slot,
                     error,
@@ -5004,6 +4967,10 @@ fn create_event_handler(
                         .remove(&index)
                         .is_some_and(|operation| operation.cancelled);
                     if cancelled {
+                        container_mode::record_launch_cancelled(
+                            index,
+                            "Launch cancelled; failed display startup left no owned resources.",
+                        );
                         continue;
                     }
                     log::error!(
@@ -5015,7 +4982,7 @@ fn create_event_handler(
                     container_mode::record_launch_blocked(index, &error);
                 }
                 CompositorMessage::ContainerSessionLaunchProgress {
-                    index,
+                    profile_id: index,
                     generation,
                     step,
                     detail,
@@ -5028,7 +4995,7 @@ fn create_event_handler(
                     container_mode::record_launch_progress(index, step, &detail);
                 }
                 CompositorMessage::ContainerSessionLaunchFinished {
-                    index,
+                    profile_id: index,
                     generation,
                     display_slot,
                     result,
@@ -5037,30 +5004,28 @@ fn create_event_handler(
                         || pending_launch_sessions.get(&index).map(String::as_str)
                             != Some(display_slot.as_str())
                     {
-                        if let Ok(mut report) = result {
-                            let _ = report.waypipe_child.kill();
-                            let _ = report.waypipe_child.wait();
-                            if let Some(mut child) = report.container_child {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
-                        }
+                        queue_launch_cleanup(
+                            index,
+                            display_slot,
+                            result.ok(),
+                            None,
+                            None,
+                            &mut lifecycle_cleanup,
+                        );
                         continue;
                     }
                     pending_launch_sessions.remove(&index);
-                    let mut display_worker = pending_launch_workers.remove(&index);
+                    let display_worker = pending_launch_workers.remove(&index);
                     let operation = pending_profile_operations.remove(&index).unwrap();
                     if operation.cancelled {
-                        if let Ok(mut report) = result {
-                            let _ = terminate_child(&mut report.waypipe_child);
-                            if let Some(child) = report.container_child.as_mut() {
-                                let _ = terminate_child(child);
-                            }
-                            let _ = cleanup_owned_container_session(&report.identity);
-                        }
-                        if let Some(worker) = display_worker.as_mut() {
-                            let _ = terminate_display_worker(worker);
-                        }
+                        queue_launch_cleanup(
+                            index,
+                            display_slot,
+                            result.ok(),
+                            display_worker,
+                            Some(operation),
+                            &mut lifecycle_cleanup,
+                        );
                         continue;
                     }
                     let show_default_display = display_slot == "default" && result.is_ok();
@@ -5068,11 +5033,13 @@ fn create_event_handler(
                         index,
                         &operation.session,
                         operation.identity_reservation,
+                        operation._profile_activity,
                         display_slot,
                         display_worker,
                         result,
                         &container_event_signal,
                         &mut active_container_sessions,
+                        &mut lifecycle_cleanup,
                     );
                     if show_default_display {
                         renderer.window.set_visible(true);
@@ -5085,6 +5052,7 @@ fn create_event_handler(
                     reap_exited_managed_displays(
                         &mut managed_displays,
                         &mut active_container_sessions,
+                        &mut lifecycle_cleanup,
                     );
                     let slot = if let Some(requested_slot) = requested_slot {
                         requested_slot
@@ -5093,9 +5061,18 @@ fn create_event_handler(
                             &managed_displays,
                             &pending_managed_displays,
                             &active_container_sessions,
+                            &pending_display_sessions,
+                            &pending_launch_sessions,
+                            &lifecycle_cleanup,
                         )
                     };
-                    if pending_managed_displays.contains(&slot)
+                    if pending_managed_displays.contains_key(&slot)
+                        || profile_display_pending(
+                            &slot,
+                            &pending_display_sessions,
+                            &pending_launch_sessions,
+                        )
+                        || lifecycle_cleanup.display_busy(&slot)
                         || managed_displays.iter().any(|display| display.slot == slot)
                         || active_container_sessions
                             .iter()
@@ -5107,28 +5084,44 @@ fn create_event_handler(
                         );
                         continue;
                     }
-                    pending_managed_displays.insert(slot.clone());
+                    let generation = DISPLAY_WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                    pending_managed_displays.insert(slot.clone(), generation);
                     container_mode::record_managed_display_starting(&slot);
-                    spawn_managed_display_worker_async(slot, container_event_signal.clone());
+                    spawn_managed_display_worker_async(
+                        slot,
+                        generation,
+                        container_event_signal.clone(),
+                    );
                 }
                 CompositorMessage::ManagedDisplayStarted {
+                    generation,
                     display_slot,
                     runtime_dir,
                     display,
                     worker_child,
                     worker_runtime_dir,
                 } => {
-                    let mut worker = DisplayWorker {
+                    let worker = DisplayWorker {
                         child: worker_child,
                         runtime_dir: worker_runtime_dir,
                     };
-                    if !pending_managed_displays.remove(&display_slot) {
-                        let _ = terminate_display_worker(&mut worker);
+                    if !complete_managed_attempt(
+                        &mut pending_managed_displays,
+                        &display_slot,
+                        generation,
+                    ) {
+                        queue_display_cleanup(worker, display_slot, false, &mut lifecycle_cleanup);
                         continue;
                     }
-                    if managed_displays
-                        .iter()
-                        .any(|managed| managed.slot == display_slot)
+                    if lifecycle_cleanup.display_busy(&display_slot)
+                        || profile_display_pending(
+                            &display_slot,
+                            &pending_display_sessions,
+                            &pending_launch_sessions,
+                        )
+                        || managed_displays
+                            .iter()
+                            .any(|managed| managed.slot == display_slot)
                         || active_container_sessions
                             .iter()
                             .any(|active| active.display_slot == display_slot)
@@ -5137,7 +5130,12 @@ fn create_event_handler(
                             "Display slot '{}' became occupied while the managed window was starting.",
                             display_slot
                         );
-                        let _ = terminate_display_worker(&mut worker);
+                        queue_display_cleanup(
+                            worker,
+                            display_slot.clone(),
+                            false,
+                            &mut lifecycle_cleanup,
+                        );
                         container_mode::record_managed_display_failure(&display_slot, &message);
                         continue;
                     }
@@ -5156,10 +5154,15 @@ fn create_event_handler(
                     sync_managed_displays(&managed_displays);
                 }
                 CompositorMessage::ManagedDisplayFailed {
+                    generation,
                     display_slot,
                     error,
                 } => {
-                    if pending_managed_displays.remove(&display_slot) {
+                    if complete_managed_attempt(
+                        &mut pending_managed_displays,
+                        &display_slot,
+                        generation,
+                    ) {
                         log::error!(
                             "Managed display '{}' failed to start: {}",
                             display_slot,
@@ -5169,6 +5172,19 @@ fn create_event_handler(
                     }
                 }
                 CompositorMessage::CloseManagedDisplay(display_slot) => {
+                    if lifecycle_cleanup.display_busy(&display_slot)
+                        || profile_display_pending(
+                            &display_slot,
+                            &pending_display_sessions,
+                            &pending_launch_sessions,
+                        )
+                    {
+                        container_mode::record_managed_display_failure(
+                            &display_slot,
+                            "This display has a pending application launch or cleanup. Wait for it to finish before closing the display.",
+                        );
+                        continue;
+                    }
                     if let Some(active) = active_container_sessions
                         .iter()
                         .find(|active| active.display_slot == display_slot)
@@ -5181,7 +5197,7 @@ fn create_event_handler(
                         container_mode::record_managed_display_failure(&display_slot, &message);
                         continue;
                     }
-                    if pending_managed_displays.remove(&display_slot) {
+                    if pending_managed_displays.remove(&display_slot).is_some() {
                         container_mode::record_managed_display_exit(
                             &display_slot,
                             "startup cancelled",
@@ -5198,40 +5214,54 @@ fn create_event_handler(
                         );
                         continue;
                     };
-                    let mut managed = managed_displays.remove(position);
-                    match terminate_display_worker(&mut managed.worker) {
-                        Ok(()) => container_mode::record_managed_display_exit(
-                            &display_slot,
-                            "closed by user",
-                        ),
-                        Err(error) => container_mode::record_managed_display_failure(
-                            &display_slot,
-                            &format!("Failed to close display: {}", error),
-                        ),
-                    }
+                    let managed = managed_displays.remove(position);
+                    queue_display_cleanup(
+                        managed.worker,
+                        display_slot,
+                        true,
+                        &mut lifecycle_cleanup,
+                    );
                     sync_managed_displays(&managed_displays);
                 }
                 CompositorMessage::StopContainerSession(i) => {
                     log::info!("Stopping container session #{}", i);
+                    let name = active_container_sessions
+                        .iter()
+                        .find(|session| session.profile_id == i)
+                        .map(|session| session.launched_session.name.as_str())
+                        .or_else(|| {
+                            pending_profile_operations
+                                .get(&i)
+                                .map(|operation| operation.session.name.as_str())
+                        })
+                        .unwrap_or("Application");
+                    container_mode::ensure_stop_task(i, name);
                     if pending_profile_operations.contains_key(&i) {
                         if let Some(operation) = pending_profile_operations.get_mut(&i) {
                             operation.cancelled = true;
                         }
-                        if !pending_profile_checks.contains(&i)
-                            && !pending_display_sessions.contains_key(&i)
-                            && !pending_launch_sessions.contains_key(&i)
-                        {
+                        let worker_pending = pending_profile_checks.contains(&i)
+                            || pending_display_sessions.contains_key(&i)
+                            || pending_launch_sessions.contains_key(&i);
+                        if !worker_pending {
                             validated_launch_checks.remove(&i);
                             pending_profile_operations.remove(&i);
                         }
                         if !active_container_sessions
                             .iter()
-                            .any(|active| active.index == i)
+                            .any(|active| active.profile_id == i)
                         {
-                            container_mode::record_launch_cancelled(
-                                i,
-                                "Launch cancelled; waiting for its worker before releasing owned runtime and display resources.",
-                            );
+                            if worker_pending || lifecycle_cleanup.session_busy(i) {
+                                container_mode::record_launch_cancelling(
+                                    i,
+                                    "Cancelling launch; waiting for its worker and rollback before releasing owned runtime and display resources.",
+                                );
+                            } else {
+                                container_mode::record_launch_cancelled(
+                                    i,
+                                    "Launch cancelled before workers or owned resources were started.",
+                                );
+                            }
                             continue;
                         }
                     }
@@ -5257,42 +5287,17 @@ fn create_event_handler(
                 }
                 CompositorMessage::ForceStopContainerSession(i) => {
                     log::warn!("Force stopping container session #{}", i);
-                    let had_display = active_container_sessions
-                        .iter()
-                        .find(|session| session.index == i)
-                        .is_some_and(|session| session.display_worker.is_some());
                     container_mode::record_stop_progress(
                         i,
                         "Stop application process",
-                        "Graceful exit timed out; terminating the application process",
+                        "Terminating owned resources in the background",
                     );
-                    match stop_active_container_session(&mut active_container_sessions, i) {
-                        Ok(()) => {
-                            sync_active_container_sessions(&active_container_sessions);
-                            container_mode::record_stop_progress(
-                                i,
-                                "Stop Waypipe worker",
-                                "Waypipe worker was terminated",
-                            );
-                            if had_display {
-                                container_mode::record_stop_progress(
-                                    i,
-                                    "Release display",
-                                    "Dedicated display resources were released",
-                                );
-                            }
-                            container_mode::record_stop_progress(
-                                i,
-                                "Stop container",
-                                "Named container resources were removed",
-                            );
-                            container_mode::record_stop_progress(
-                                i,
-                                "Mark instance exited",
-                                "Application instance is no longer running",
-                            );
-                            container_mode::record_stop_success(i);
-                        }
+                    match stop_active_container_session(
+                        &mut active_container_sessions,
+                        i,
+                        &mut lifecycle_cleanup,
+                    ) {
+                        Ok(()) => sync_active_container_sessions(&active_container_sessions),
                         Err(error) => container_mode::record_stop_failure(i, &error),
                     }
                 }
@@ -5300,7 +5305,7 @@ fn create_event_handler(
                     log::info!("Opening terminal for container session #{}", i);
                     let launched = active_container_sessions
                         .iter()
-                        .find(|active| active.index == i)
+                        .find(|active| active.profile_id == i)
                         .map(|active| &active.owned_identity);
                     let result = launched
                         .ok_or_else(|| "No active instance is tracked for this profile".to_string())
@@ -5318,7 +5323,7 @@ fn create_event_handler(
                     }
                 }
                 CompositorMessage::ContainerSessionLog {
-                    index,
+                    profile_id: index,
                     source,
                     line,
                 } => {
@@ -6575,9 +6580,13 @@ fn create_event_handler(
                     reap_exited_managed_displays(
                         &mut managed_displays,
                         &mut active_container_sessions,
+                        &mut lifecycle_cleanup,
                     );
                     sync_managed_displays(&managed_displays);
-                    reap_exited_container_sessions(&mut active_container_sessions);
+                    reap_exited_container_sessions(
+                        &mut active_container_sessions,
+                        &mut lifecycle_cleanup,
+                    );
                     sync_active_container_sessions(&active_container_sessions);
                     next_maintenance = now + maintenance_interval;
                 }
@@ -6639,6 +6648,9 @@ fn create_event_handler(
                     || perf_redraws != perf_last_redraws
                     || pending_input_sample.is_some();
                 let mut next_wakeup = needs_maintenance.then_some(next_maintenance);
+                if let Some(due) = lifecycle_cleanup.next_wakeup() {
+                    next_wakeup = Some(next_wakeup.map_or(due, |next| next.min(due)));
+                }
                 if let Some(due) =
                     cursor_clock.next_due(now, !state.cursor_frame_callbacks.is_empty())
                 {
@@ -6774,6 +6786,7 @@ fn create_event_handler(
                 }
             }
             Event::LoopExiting => {
+                lifecycle_producers::GLOBAL.close();
                 if display_worker_slot.is_none() {
                     if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
                         menu_bar::remove_status_item(mtm);
@@ -6791,26 +6804,70 @@ fn create_event_handler(
                 }
                 wayland_source.stop();
                 macos_gestures::uninstall_all_swipe_recognizers();
-                for mut connection in active_classic_connections.drain(..) {
-                    let _ = connection.child.kill();
-                    let _ = connection.child.wait();
+                for connection in active_classic_connections.drain(..) {
+                    session_lifecycle::queue_classic_child(
+                        connection.child,
+                        &mut lifecycle_cleanup,
+                    );
                 }
                 while let Some(index) = active_container_sessions
                     .first()
-                    .map(|session| session.index)
+                    .map(|session| session.profile_id)
                 {
-                    let _ = stop_active_container_session(&mut active_container_sessions, index);
+                    let _ = stop_active_container_session(
+                        &mut active_container_sessions,
+                        index,
+                        &mut lifecycle_cleanup,
+                    );
                 }
-                for mut managed in managed_displays.drain(..) {
-                    let _ = terminate_display_worker(&mut managed.worker);
+                for managed in managed_displays.drain(..) {
+                    queue_display_cleanup(
+                        managed.worker,
+                        managed.slot,
+                        false,
+                        &mut lifecycle_cleanup,
+                    );
                 }
-                for (_, mut worker) in pending_launch_workers.drain() {
-                    let _ = terminate_display_worker(&mut worker);
+                let producer_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(60);
+                loop {
+                    let producers_idle_before_drain = lifecycle_producers::GLOBAL.active() == 0;
+                    let drained = shutdown::drain_owned_results(
+                        &loop_receiver,
+                        &container_event_signal,
+                        &mut pending_profile_operations,
+                        &mut pending_launch_workers,
+                        &mut lifecycle_cleanup,
+                    );
+                    lifecycle_cleanup.poll();
+                    if producers_idle_before_drain && drained == 0 {
+                        break;
+                    }
+                    if std::time::Instant::now() >= producer_deadline {
+                        log::error!(
+                            "Shutdown producer deadline exceeded; retaining unresolved attempt ownership"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                shutdown::retain_remainders(
+                    std::mem::take(&mut pending_profile_operations),
+                    std::mem::take(&mut pending_launch_workers),
+                    &mut lifecycle_cleanup,
+                );
+                if display_worker_slot.is_some() {
+                    session_lifecycle::queue_runtime_directory_cleanup(
+                        runtime_dir.clone(),
+                        &mut lifecycle_cleanup,
+                    );
+                }
+                if !lifecycle_cleanup.finish(std::time::Duration::from_secs(15)) {
+                    log::warn!(
+                        "Shutdown cleanup exceeded its deadline; runtime ownership labels are retained for diagnosis"
+                    );
                 }
                 sync_managed_displays(&managed_displays);
-                if display_worker_slot.is_some() {
-                    let _ = std::fs::remove_dir_all(&runtime_dir);
-                }
                 if let Some(path) = control_socket_path.as_deref() {
                     control_api::remove_socket(path);
                 }
@@ -6827,18 +6884,19 @@ fn create_event_handler(
             flush_wayland_output(&mut display, &wayland_source);
             if let Some(id) = input_trace {
                 state.latency_trace.record(
-                    latency_trace::Stage::Forwarded,
+                    latency_trace::Stage::HostInputHandled,
                     latency_trace::Tags {
                         correlation_id: Some(latency_trace::Tag::U64(id)),
-                        source_event_serial: state
-                            .trace_forwarded
-                            .map(|(_, serial, _)| latency_trace::Tag::U64(u64::from(serial))),
-                        source_event_time: state
-                            .trace_forwarded
-                            .map(|(_, _, time)| latency_trace::Tag::U64(u64::from(time))),
                         ..Default::default()
                     },
                 );
+                if let Some(tags) =
+                    latency_trace::forwarded_keyboard_tags(id, state.trace_forwarded)
+                {
+                    state
+                        .latency_trace
+                        .record(latency_trace::Stage::Forwarded, tags);
+                }
             }
         }
     })

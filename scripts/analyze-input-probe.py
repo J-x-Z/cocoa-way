@@ -66,6 +66,7 @@ MAX_CLOCK_BYTES = 16 * 1024 * 1024
 PROBE = "cocoa-way.input-latency-probe"
 STAGES = ("HostNativeInput", "Forwarded", "SurfaceCommit", "ComposeStarted", "CPUSubmitted", "MetalPresented")
 METAL_STAGES = ("DrawableAcquireStarted", "DrawableAcquireFinished", "ComposeFinished",
+                "HostInputHandled",
                 "GPUStarted", "GPUCompleted", "GPUCompletionCallback", "GPUCommandFailed",
                 "MetalPresentedCallback", "FrameCallbackDone")
 HOST_FIELDS = set("schema kind session_id clock queue_capacity dropped rejected final stage timestamp_ns correlation_id source_event_serial source_event_time window_id probe_marker".split())

@@ -1,3 +1,5 @@
+use crate::container_sessions::ProfileId;
+
 pub enum CompositorMessage {
     ProcessOutput {
         message: Box<CompositorMessage>,
@@ -33,40 +35,41 @@ pub enum CompositorMessage {
     Connect(usize),
     ConnectMachine(crate::connections::Connection),
     ReloadMenu,
+    LifecycleCleanupReady,
     DisconnectClassicConnections,
-    CheckContainerSession(usize),
-    StartContainerSession(usize),
+    CheckContainerSession(ProfileId),
+    StartContainerSession(ProfileId),
     ResumeContainerSession {
-        index: usize,
+        profile_id: ProfileId,
         generation: u64,
     },
     StartContainerSessionIfCurrent {
-        index: usize,
+        profile_id: ProfileId,
         signature: String,
     },
-    StopContainerSession(usize),
-    ForceStopContainerSession(usize),
+    StopContainerSession(ProfileId),
+    ForceStopContainerSession(ProfileId),
     ContainerSessionChecked {
-        index: usize,
+        profile_id: ProfileId,
         generation: u64,
         result:
             Result<crate::container_sessions::CheckReport, crate::container_sessions::LaunchError>,
     },
     ContainerSessionLaunchProgress {
-        index: usize,
+        profile_id: ProfileId,
         generation: u64,
         step: crate::application_model::LaunchStep,
         detail: String,
     },
     ContainerSessionLaunchFinished {
-        index: usize,
+        profile_id: ProfileId,
         generation: u64,
         display_slot: String,
         result:
             Result<crate::container_sessions::LaunchReport, crate::container_sessions::LaunchError>,
     },
     DedicatedDisplayStarted {
-        index: usize,
+        profile_id: ProfileId,
         generation: u64,
         display_slot: String,
         runtime_dir: String,
@@ -75,7 +78,7 @@ pub enum CompositorMessage {
         worker_runtime_dir: std::path::PathBuf,
     },
     DedicatedDisplayFailed {
-        index: usize,
+        profile_id: ProfileId,
         generation: u64,
         display_slot: String,
         error: String,
@@ -83,6 +86,7 @@ pub enum CompositorMessage {
     CreateManagedDisplay(Option<String>),
     CloseManagedDisplay(String),
     ManagedDisplayStarted {
+        generation: u64,
         display_slot: String,
         runtime_dir: String,
         display: String,
@@ -90,12 +94,13 @@ pub enum CompositorMessage {
         worker_runtime_dir: std::path::PathBuf,
     },
     ManagedDisplayFailed {
+        generation: u64,
         display_slot: String,
         error: String,
     },
-    OpenContainerTerminal(usize),
+    OpenContainerTerminal(ProfileId),
     ContainerSessionLog {
-        index: usize,
+        profile_id: ProfileId,
         source: String,
         line: String,
     },

@@ -190,18 +190,23 @@ pub fn render_rootless_window(
     if let Some((buffer_width, buffer_height)) =
         rootless.renderer.cached_surface_size(&root_surface.id())
     {
-        let buffer_scale = smithay::wayland::compositor::with_states(root_surface, |states| {
-            states
+        let mapping = smithay::wayland::compositor::with_states(root_surface, |states| {
+            let mut attributes = states
                 .cached_state
-                .get::<smithay::wayland::compositor::SurfaceAttributes>()
-                .current()
-                .buffer_scale
-                .max(1)
+                .get::<smithay::wayland::compositor::SurfaceAttributes>();
+            let current = attributes.current();
+            crate::metal_renderer::geometry::SurfaceMapping {
+                buffer_scale: current.buffer_scale,
+                transform: current.buffer_transform,
+                viewport: *states
+                    .cached_state
+                    .get::<smithay::wayland::viewporter::ViewportCachedState>()
+                    .current(),
+            }
         });
-        let destination_width =
-            (f64::from(buffer_width) / f64::from(buffer_scale) * scale).round() as i32;
-        let destination_height =
-            (f64::from(buffer_height) / f64::from(buffer_scale) * scale).round() as i32;
+        let (destination_width, destination_height) = mapping
+            .geometry((buffer_width, buffer_height), scale)
+            .map_or((0, 0), |geometry| (geometry.width, geometry.height));
         let metrics = (
             size.width,
             size.height,
@@ -220,7 +225,7 @@ pub fn render_rootless_window(
                 scale,
                 buffer_width,
                 buffer_height,
-                buffer_scale,
+                mapping.buffer_scale,
                 destination_width,
                 destination_height
             );
@@ -528,11 +533,14 @@ fn render_surface_tree(
                 .location;
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             let current = attributes.current();
-            let viewport_destination = states
-                .cached_state
-                .get::<smithay::wayland::viewporter::ViewportCachedState>()
-                .current()
-                .dst;
+            let mapping = crate::metal_renderer::geometry::SurfaceMapping {
+                buffer_scale: current.buffer_scale,
+                transform: current.buffer_transform,
+                viewport: *states
+                    .cached_state
+                    .get::<smithay::wayland::viewporter::ViewportCachedState>()
+                    .current(),
+            };
             let x = (f64::from(location.0 + offset.x) * scale).round() as i32;
             let y = (f64::from(location.1 + offset.y) * scale).round() as i32;
             let surface_id = surface.id();
@@ -551,31 +559,20 @@ fn render_surface_tree(
                                 height,
                                 buffer_scale,
                                 current.buffer_transform,
-                                viewport_destination.is_some(),
+                                mapping.viewport.src.is_some() || mapping.viewport.dst.is_some(),
                             );
-                            let destination_width = viewport_destination
-                                .map(|destination| {
-                                    (f64::from(destination.w) * scale).round() as i32
-                                })
-                                .unwrap_or_else(|| {
-                                    (f64::from(width) / f64::from(buffer_scale) * scale).round()
-                                        as i32
-                                });
-                            let destination_height = viewport_destination
-                                .map(|destination| {
-                                    (f64::from(destination.h) * scale).round() as i32
-                                })
-                                .unwrap_or_else(|| {
-                                    (f64::from(height) / f64::from(buffer_scale) * scale).round()
-                                        as i32
-                                });
+                            let Some(geometry) = mapping.geometry((width, height), scale) else {
+                                log::warn!(
+                                    "Invalid committed surface/viewport geometry for {surface_id:?}"
+                                );
+                                return PixelDrawResult::Rejected;
+                            };
                             renderer.draw_pixels(
                                 surface_id.clone(),
                                 buffer_id,
                                 x,
                                 y,
-                                destination_width,
-                                destination_height,
+                                geometry,
                                 width,
                                 height,
                                 bytes_per_row,
@@ -592,13 +589,13 @@ fn render_surface_tree(
                         buffer,
                         damage,
                         result,
-                        || renderer.draw_from_cache(&surface_id, x, y, scale, viewport_destination),
+                        || renderer.draw_from_cache(&surface_id, x, y, scale, mapping),
                         |buffer| buffer.release(),
                     );
                 }
                 Some(BufferAssignment::Removed) => renderer.evict_texture(&surface_id),
                 None => {
-                    if renderer.draw_from_cache(&surface_id, x, y, scale, viewport_destination) {
+                    if renderer.draw_from_cache(&surface_id, x, y, scale, mapping) {
                         rendered += 1;
                     }
                 }
@@ -767,19 +764,13 @@ pub(crate) fn surface_logical_size(
     transform: smithay::reexports::wayland_server::protocol::wl_output::Transform,
     viewport: smithay::wayland::viewporter::ViewportCachedState,
 ) -> smithay::utils::Size<f64, smithay::utils::Logical> {
-    use smithay::reexports::wayland_server::protocol::wl_output::Transform;
-
-    if let Some(size) = viewport.size() {
-        return size.to_f64();
+    crate::metal_renderer::geometry::SurfaceMapping {
+        buffer_scale,
+        transform,
+        viewport,
     }
-    let (width, height) = match transform {
-        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
-            (buffer_size.1, buffer_size.0)
-        }
-        _ => buffer_size,
-    };
-    let scale = f64::from(buffer_scale.max(1));
-    (f64::from(width) / scale, f64::from(height) / scale).into()
+    .logical_size(buffer_size)
+    .unwrap_or_else(|| (0.0, 0.0).into())
 }
 
 #[cfg(test)]
@@ -788,7 +779,7 @@ mod tests {
     use crate::metal_renderer::PixelDrawResult;
 
     use smithay::{
-        delegate_compositor, delegate_xdg_shell,
+        delegate_compositor, delegate_viewporter, delegate_xdg_shell,
         reexports::wayland_server::{
             Client, Display, DisplayHandle, Resource,
             backend::{ClientData, ObjectId},
@@ -806,7 +797,7 @@ mod tests {
                 PopupCachedState, PopupConfigure, PopupState, PopupSurface, PositionerState,
                 SurfaceCachedState, ToplevelSurface, XdgShellHandler, XdgShellState,
             },
-            viewporter::ViewportCachedState,
+            viewporter::{ViewportCachedState, ViewporterState},
         },
     };
     use std::{
@@ -823,6 +814,7 @@ mod tests {
     struct TestState {
         compositor: CompositorState,
         shell: XdgShellState,
+        _viewporter: ViewporterState,
         toplevels: Vec<ToplevelSurface>,
         popups: Vec<PopupSurface>,
     }
@@ -859,6 +851,7 @@ mod tests {
 
     delegate_compositor!(TestState);
     delegate_xdg_shell!(TestState);
+    delegate_viewporter!(TestState);
 
     // Real Smithay trees over a socket pair, with modeled committed geometry
     // and texture sizes. No Metal device, native window, or pixel upload needed.
@@ -871,6 +864,7 @@ mod tests {
         compositor: u32,
         subcompositor: u32,
         shell: u32,
+        viewporter: u32,
         sizes: HashMap<ObjectId, (i32, i32)>,
         subsurfaces: HashMap<ObjectId, u32>,
     }
@@ -882,6 +876,7 @@ mod tests {
             let state = TestState {
                 compositor: CompositorState::new::<TestState>(&dh),
                 shell: XdgShellState::new::<TestState>(&dh),
+                _viewporter: ViewporterState::new::<TestState>(&dh),
                 toplevels: Vec::new(),
                 popups: Vec::new(),
             };
@@ -904,6 +899,7 @@ mod tests {
                 compositor: 0,
                 subcompositor: 0,
                 shell: 0,
+                viewporter: 0,
                 sizes: HashMap::new(),
                 subsurfaces: HashMap::new(),
             };
@@ -925,6 +921,7 @@ mod tests {
             scene.subcompositor =
                 scene.bind(registry, globals["wl_subcompositor"], "wl_subcompositor");
             scene.shell = scene.bind(registry, globals["xdg_wm_base"], "xdg_wm_base");
+            scene.viewporter = scene.bind(registry, globals["wp_viewporter"], "wp_viewporter");
             scene.sync();
             scene
         }
@@ -1416,6 +1413,98 @@ mod tests {
                 ViewportCachedState::default()
             ),
             (200.0, 100.0).into()
+        );
+    }
+
+    #[test]
+    fn viewport_protocol_commit_changes_both_render_geometry_and_desktop_rootless_hits() {
+        let mut scene = Scene::new();
+        let (root, _) = scene.toplevel((200, 100));
+        let surface = root.wl_surface();
+        let surface_id = surface.id().protocol_id();
+        let viewport = scene.id();
+        scene.request(scene.viewporter, 1, &[viewport, surface_id]);
+        scene.request(viewport, 1, &[2688, 1344, 30 * 256, 20 * 256]); // (10.5, 5.25)
+        scene.sync();
+        compositor::with_states(surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            attributes.pending().buffer_scale = 2;
+            attributes.pending().buffer_transform = Transform::_90;
+        });
+        let tiles = [tile(root.clone(), (100, 50))];
+        // Requests are pending: neither renderer geometry nor input may see them yet.
+        assert!(scene.hit(&tiles, (160.0, 80.0)).is_some());
+        let mapping = || {
+            compositor::with_states(surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let attributes = attributes.current();
+                crate::metal_renderer::geometry::SurfaceMapping {
+                    buffer_scale: attributes.buffer_scale,
+                    transform: attributes.buffer_transform,
+                    viewport: *states.cached_state.get::<ViewportCachedState>().current(),
+                }
+            })
+        };
+        assert_eq!(mapping().geometry((200, 100), 1.5).unwrap().width, 300);
+        scene.request(surface_id, 6, &[]); // wl_surface.commit, no new buffer
+        scene.sync();
+        let geometry = mapping().geometry((200, 100), 1.5).unwrap();
+        assert_eq!((geometry.width, geometry.height), (45, 30));
+        assert_eq!(geometry.uv[2], [0.9475, 0.21]);
+        assert!(scene.hit(&tiles, (129.99, 69.99)).is_some());
+        assert!(scene.hit(&tiles, (130.0, 60.0)).is_none());
+        let rootless_hit = |scene: &Scene, point| {
+            super::toplevel_surface_under_with_sizes(
+                &root,
+                &scene.state.popups,
+                (0, 0).into(),
+                point,
+                &|id| scene.sizes.get(id).copied(),
+            )
+        };
+        assert_eq!(
+            rootless_hit(&scene, (29.99, 19.99).into()),
+            Some((surface.clone(), (0.0, 0.0).into()))
+        );
+        assert!(rootless_hit(&scene, (30.0, 10.0).into()).is_none());
+
+        scene.request(viewport, 2, &[80, 40]);
+        scene.sync();
+        assert!(rootless_hit(&scene, (79.0, 39.0).into()).is_none());
+        scene.request(surface_id, 6, &[]);
+        scene.sync();
+        let resized = mapping().geometry((200, 100), 1.5).unwrap();
+        assert_eq!((resized.width, resized.height), (120, 60));
+        assert_eq!(resized.uv, geometry.uv);
+        assert!(scene.hit(&tiles, (179.99, 89.99)).is_some());
+        assert!(rootless_hit(&scene, (79.99, 39.99).into()).is_some());
+        assert!(rootless_hit(&scene, (80.0, 10.0).into()).is_none());
+
+        scene.request(viewport, 0, &[]); // destroy is itself double-buffered
+        scene.sync();
+        assert_eq!(mapping().geometry((200, 100), 1.0).unwrap().width, 80);
+        scene.request(surface_id, 6, &[]);
+        scene.sync();
+        let uncropped = mapping().geometry((200, 100), 1.0).unwrap();
+        assert_eq!((uncropped.width, uncropped.height), (50, 100));
+        assert!(rootless_hit(&scene, (49.99, 99.99).into()).is_some());
+        assert!(rootless_hit(&scene, (50.0, 10.0).into()).is_none());
+    }
+
+    #[test]
+    fn crop_surface_damage_requires_a_complete_buffer_snapshot() {
+        let damage = [Damage::Surface(Rectangle::new(
+            (1, 2).into(),
+            (3, 4).into(),
+        ))];
+        assert_eq!(
+            super::buffer_damage_rects(&damage, 200, 100, 2, Transform::Normal, true),
+            vec![crate::metal_renderer::BufferDamage {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 100
+            }]
         );
     }
 

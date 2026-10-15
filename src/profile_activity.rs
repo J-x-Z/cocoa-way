@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-static OPERATIONS: Mutex<usize> = Mutex::new(0);
-static IDENTITIES: LazyLock<Mutex<HashMap<(String, String), (usize, u64)>>> =
+use crate::container_sessions::ProfileId;
+
+static OPERATIONS: LazyLock<Mutex<HashMap<ProfileId, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static IDENTITIES: LazyLock<Mutex<HashMap<(String, String), (ProfileId, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn runtime_key(runtime: &str) -> &str {
@@ -16,15 +19,18 @@ fn runtime_key(runtime: &str) -> &str {
 #[derive(Debug)]
 pub struct RuntimeReservation {
     key: (String, String),
-    owner: (usize, u64),
+    owner: (ProfileId, u64),
 }
 
 pub fn reserve_identity(
-    index: usize,
+    id: ProfileId,
     generation: u64,
     runtime: &str,
     name: &str,
 ) -> Result<RuntimeReservation, String> {
+    if !id.is_saved() {
+        return Err("an unsaved profile cannot reserve a runtime identity".into());
+    }
     let key = (runtime_key(runtime).into(), name.into());
     let mut identities = IDENTITIES.lock().unwrap_or_else(|error| error.into_inner());
     if identities.contains_key(&key) {
@@ -32,19 +38,19 @@ pub fn reserve_identity(
             "Container identity '{name}' is reserved by another active or pending instance. Wait for cleanup or choose a distinct name."
         ));
     }
-    identities.insert(key.clone(), (index, generation));
+    identities.insert(key.clone(), (id, generation));
     Ok(RuntimeReservation {
         key,
-        owner: (index, generation),
+        owner: (id, generation),
     })
 }
 
-pub fn identity_reserved_by_other(runtime: &str, name: &str, replacing: Option<usize>) -> bool {
+pub fn identity_reserved_by_other(runtime: &str, name: &str, replacing: Option<ProfileId>) -> bool {
     IDENTITIES
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&(runtime_key(runtime).into(), name.into()))
-        .is_some_and(|(index, _)| replacing != Some(*index))
+        .is_some_and(|(id, _)| replacing != Some(*id))
 }
 
 impl Drop for RuntimeReservation {
@@ -56,41 +62,53 @@ impl Drop for RuntimeReservation {
     }
 }
 
-/// Keeps positional configuration entries fixed while a worker or instance owns them.
+/// A profile-specific lease retained by checks, launches, instances and asynchronous cleanup.
+/// Acquire before resolving the current profile; a deleted ID must never launch a snapshot.
 #[derive(Debug)]
 pub struct ProfileActivity {
-    _private: (),
+    id: ProfileId,
 }
 
 impl ProfileActivity {
-    pub fn begin() -> Self {
-        *OPERATIONS.lock().unwrap_or_else(|error| error.into_inner()) += 1;
-        Self { _private: () }
+    pub fn begin(id: ProfileId) -> Self {
+        assert!(id.is_saved(), "activity requires a persistent profile ID");
+        *OPERATIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(id)
+            .or_default() += 1;
+        Self { id }
+    }
+
+    pub fn profile_id(&self) -> ProfileId {
+        self.id
     }
 }
 
 impl Drop for ProfileActivity {
     fn drop(&mut self) {
-        let mut count = OPERATIONS.lock().unwrap_or_else(|error| error.into_inner());
-        *count -= 1;
+        let mut operations = OPERATIONS.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = operations.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                operations.remove(&self.id);
+            }
+        }
     }
 }
 
-pub fn while_idle<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    let count = OPERATIONS.lock().unwrap_or_else(|error| error.into_inner());
-    require_idle(*count)?;
-    // Hold the lock through the write: no worker can reserve an index mid-deletion.
+pub fn while_inactive<T>(
+    id: ProfileId,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let operations = OPERATIONS.lock().unwrap_or_else(|error| error.into_inner());
+    if operations.get(&id).copied().unwrap_or_default() != 0 {
+        return Err(std::io::Error::other(
+            "Stop this application and wait for its pending checks, launches and cleanup before deleting its profile.",
+        ));
+    }
+    // Held through the atomic configuration replacement, not just the in-memory edit.
     operation()
-}
-
-fn require_idle(count: usize) -> std::io::Result<()> {
-    if count == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            "Stop all application instances and wait for pending checks/launches before deleting a profile.",
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -98,21 +116,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn index_compaction_requires_no_workers_or_instances() {
-        assert!(require_idle(0).is_ok());
-        assert!(require_idle(1).is_err());
-        assert!(require_idle(2).is_err());
+    fn activity_only_blocks_its_own_profile_and_last_lease_releases_it() {
+        let first = ProfileId::new().unwrap();
+        let second = ProfileId::new().unwrap();
+        let launch = ProfileActivity::begin(first);
+        let cleanup = ProfileActivity::begin(first);
+        assert!(while_inactive(second, || Ok(())).is_ok());
+        assert!(while_inactive(first, || Ok(())).is_err());
+        drop(launch);
+        assert!(while_inactive(first, || Ok(())).is_err());
+        drop(cleanup);
+        assert!(while_inactive(first, || Ok(())).is_ok());
     }
 
     #[test]
     fn original_name_stays_reserved_through_profile_rename_and_cleanup() {
         let name = "audit-reservation-rename";
-        let original = reserve_identity(42, 1, "apple", name).unwrap();
+        let first = ProfileId::new().unwrap();
+        let second = ProfileId::new().unwrap();
+        let original = reserve_identity(first, 1, "apple", name).unwrap();
         assert!(identity_reserved_by_other("container", name, None));
-        assert!(!identity_reserved_by_other("container", name, Some(42)));
-        assert!(reserve_identity(43, 2, "container", name).is_err());
+        assert!(!identity_reserved_by_other("container", name, Some(first)));
+        assert!(reserve_identity(second, 2, "container", name).is_err());
         drop(original);
         assert!(!identity_reserved_by_other("container", name, None));
-        assert!(reserve_identity(43, 2, "container", name).is_ok());
+        assert!(reserve_identity(second, 2, "container", name).is_ok());
     }
 }

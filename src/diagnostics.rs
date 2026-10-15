@@ -141,7 +141,7 @@ fn record_clipboard_failure_for(direction: &str, error: impl Into<String>) {
     let error = error.into();
     update_clipboard("Error", direction, None, |snapshot| {
         snapshot.failures = snapshot.failures.saturating_add(1);
-        snapshot.last_error = Some(error);
+        snapshot.last_error = Some(crate::process_output::redaction::redact(&error));
     });
 }
 
@@ -356,7 +356,7 @@ fn resource_error(error: &str, disk_available_bytes: Option<u64>) -> ResourceSna
     ResourceSnapshot {
         available: false,
         sampled_at_unix_ms: unix_time_ms(),
-        error: Some(error.trim().to_string()),
+        error: Some(crate::process_output::redaction::redact(error.trim())),
         containers: Vec::new(),
         total_cpu_percent: None,
         total_memory_usage_bytes: 0,
@@ -395,7 +395,14 @@ fn unix_time_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{bytes_to_gib, parse_stats};
+    use super::{bytes_to_gib, parse_stats, resource_error};
+
+    #[test]
+    fn exported_resource_errors_are_sanitized_without_changing_measurements() {
+        let snapshot = resource_error("  password=hidden  ", Some(123));
+        assert_eq!(snapshot.error.as_deref(), Some("password=[REDACTED]"));
+        assert_eq!(snapshot.disk_available_bytes, Some(123));
+    }
 
     #[test]
     fn parses_apple_container_stats_json() {

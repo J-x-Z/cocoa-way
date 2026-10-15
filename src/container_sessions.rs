@@ -1,11 +1,12 @@
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,19 @@ use crate::runtime_paths::{build_child_path, resolve_command_path, shell_single_
 mod container_identity;
 pub use container_identity::{OwnedContainerIdentity, cleanup_owned_instance};
 
+#[path = "profile_identity.rs"]
+mod profile_identity;
+pub use profile_identity::ProfileId;
+#[path = "profile_config.rs"]
+mod profile_config;
+
+#[path = "apple_container_transport.rs"]
+mod apple_container_transport;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContainerSession {
+    #[serde(default)]
+    pub id: ProfileId,
     pub name: String,
     pub image: String,
     #[serde(default = "default_runtime")]
@@ -52,6 +64,28 @@ struct Config {
 pub struct SessionLoadReport {
     pub sessions: Vec<ContainerSession>,
     pub error: Option<String>,
+}
+
+/// Captured at menu/control ingress. A reordered or edited view cannot retarget it.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+pub struct ProfileActionTarget {
+    pub id: ProfileId,
+    pub signature: String,
+}
+
+impl ProfileActionTarget {
+    pub fn capture(session: &ContainerSession) -> Self {
+        Self {
+            id: session.id,
+            signature: session_to_toml(session),
+        }
+    }
+
+    pub fn resolve<'a>(&self, sessions: &'a [ContainerSession]) -> Option<&'a ContainerSession> {
+        sessions
+            .iter()
+            .find(|session| session.id == self.id && session_to_toml(session) == self.signature)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -425,7 +459,7 @@ fn run_stdio_relay(
         .args(&relay.remote_command);
 
     let mut child = cmd.spawn().map_err(|error| error.to_string())?;
-    let child_stdin = child
+    let mut child_stdin = child
         .stdin
         .take()
         .ok_or_else(|| "container relay stdin unavailable".to_string())?;
@@ -434,12 +468,8 @@ fn run_stdio_relay(
         .take()
         .ok_or_else(|| "container relay stdout unavailable".to_string())?;
 
-    let child_stdin = Arc::new(Mutex::new(child_stdin));
-    let relay_result = bridge_relay_frames(
-        &mut child_stdout,
-        Arc::clone(&child_stdin),
-        &relay.local_socket,
-    );
+    let relay_result =
+        apple_container_transport::bridge(&mut child_stdout, &mut child_stdin, &relay.local_socket);
     drop(child_stdin);
     let status = finish_relay_child(child, relay_result.is_err(), Duration::from_secs(2))?;
     relay_result?;
@@ -581,21 +611,37 @@ fn run_publish_socket_relay(
                 return Err(PublishRelayError::Startup(error));
             }
         };
-    transport
-        .write_all(RELAY_V2_PREAMBLE)
-        .and_then(|_| transport.flush())
-        .map_err(|error| {
-            PublishRelayError::Startup(format!("transport handshake failed: {}", error))
-        })?;
-    eprintln!("cocoa-way container relay: using publish-socket transport v2");
-    let writer = transport
-        .try_clone()
-        .map_err(|error| PublishRelayError::Active(error.to_string()))?;
-    let relay_result = bridge_relay_frames(
+    if let Err(error) = apple_container_transport::write_before(
         &mut transport,
-        Arc::new(Mutex::new(writer)),
-        &relay.local_socket,
-    );
+        RELAY_V2_PREAMBLE,
+        Duration::from_secs(10),
+    ) {
+        let _ = transport.shutdown(std::net::Shutdown::Both);
+        let _ = finish_relay_child(child, true, Duration::from_secs(2));
+        let _ = std::fs::remove_file(&host_transport);
+        if let Some(host_audio) = host_audio.as_deref() {
+            let _ = std::fs::remove_file(host_audio);
+        }
+        return Err(PublishRelayError::Startup(format!(
+            "transport handshake failed: {}",
+            error
+        )));
+    }
+    eprintln!("cocoa-way container relay: using publish-socket transport v2");
+    let mut writer = match transport.try_clone() {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = transport.shutdown(std::net::Shutdown::Both);
+            let _ = finish_relay_child(child, true, Duration::from_secs(2));
+            let _ = std::fs::remove_file(&host_transport);
+            if let Some(host_audio) = host_audio.as_deref() {
+                let _ = std::fs::remove_file(host_audio);
+            }
+            return Err(PublishRelayError::Active(error.to_string()));
+        }
+    };
+    let relay_result =
+        apple_container_transport::bridge(&mut transport, &mut writer, &relay.local_socket);
     let _ = transport.shutdown(std::net::Shutdown::Both);
     let status = finish_relay_child(child, relay_result.is_err(), Duration::from_secs(2))
         .map_err(PublishRelayError::Active)?;
@@ -612,157 +658,6 @@ fn run_publish_socket_relay(
             status
         )))
     }
-}
-
-#[derive(Default)]
-struct RelayStreams {
-    sockets: Arc<Mutex<HashMap<u32, Arc<UnixStream>>>>,
-}
-
-impl RelayStreams {
-    fn get(&self, id: u32) -> Option<Arc<UnixStream>> {
-        self.sockets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&id)
-            .cloned()
-    }
-
-    fn insert(&self, id: u32, socket: Arc<UnixStream>) -> Option<Arc<UnixStream>> {
-        self.sockets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(id, socket)
-    }
-
-    fn remove(&self, id: u32) -> Option<Arc<UnixStream>> {
-        self.sockets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&id)
-    }
-}
-
-fn retire_relay_stream(
-    sockets: &Mutex<HashMap<u32, Arc<UnixStream>>>,
-    id: u32,
-    socket: &Arc<UnixStream>,
-) -> bool {
-    let mut sockets = sockets.lock().unwrap_or_else(|error| error.into_inner());
-    // An old reader must not remove or send CLOSE for a replacement stream.
-    if sockets
-        .get(&id)
-        .is_some_and(|current| Arc::ptr_eq(current, socket))
-    {
-        sockets.remove(&id);
-        true
-    } else {
-        false
-    }
-}
-
-impl Drop for RelayStreams {
-    fn drop(&mut self) {
-        // Dropping only the map would leave detached reader clones blocked.
-        let sockets = std::mem::take(
-            &mut *self
-                .sockets
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
-        for socket in sockets.values() {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
-        }
-    }
-}
-
-fn bridge_relay_frames<R, W>(
-    reader: &mut R,
-    writer: Arc<Mutex<W>>,
-    local_socket: &str,
-) -> Result<(), String>
-where
-    R: Read,
-    W: Write + Send + 'static,
-{
-    let streams = RelayStreams::default();
-    while let Some(frame) = read_relay_frame(reader)? {
-        match frame.kind {
-            RELAY_FRAME_OPEN => {
-                let socket = match connect_unix_socket(local_socket, Duration::from_secs(8)) {
-                    Ok(socket) => Arc::new(socket),
-                    Err(error) => {
-                        eprintln!("cocoa-way container relay stream {}: {}", frame.id, error);
-                        let _ = write_relay_frame_locked(&writer, RELAY_FRAME_CLOSE, frame.id, &[]);
-                        continue;
-                    }
-                };
-                let mut reader = socket.try_clone().map_err(|error| error.to_string())?;
-                let relay_input = Arc::clone(&writer);
-                let relay_streams = Arc::clone(&streams.sockets);
-                let reader_socket = Arc::clone(&socket);
-                let stream_id = frame.id;
-                if let Some(previous) = streams.insert(frame.id, socket) {
-                    let _ = previous.shutdown(std::net::Shutdown::Both);
-                }
-                thread::spawn(move || {
-                    let mut buffer = [0u8; 64 * 1024];
-                    let mut relay_failed = false;
-                    loop {
-                        match reader.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(length) => {
-                                if write_relay_frame_locked(
-                                    &relay_input,
-                                    RELAY_FRAME_DATA,
-                                    stream_id,
-                                    &buffer[..length],
-                                )
-                                .is_err()
-                                {
-                                    relay_failed = true;
-                                    break;
-                                }
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                                continue;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let _ = reader.shutdown(std::net::Shutdown::Both);
-                    let retired = retire_relay_stream(&relay_streams, stream_id, &reader_socket);
-                    // Release both descriptors before CLOSE can block on the writer.
-                    drop(reader);
-                    drop(reader_socket);
-                    if retired && !relay_failed {
-                        let _ = write_relay_frame_locked(
-                            &relay_input,
-                            RELAY_FRAME_CLOSE,
-                            stream_id,
-                            &[],
-                        );
-                    }
-                });
-            }
-            RELAY_FRAME_DATA => {
-                if let Some(stream) = streams.get(frame.id) {
-                    if (&*stream).write_all(&frame.payload).is_err() {
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                        streams.remove(frame.id);
-                        let _ = write_relay_frame_locked(&writer, RELAY_FRAME_CLOSE, frame.id, &[]);
-                    }
-                }
-            }
-            RELAY_FRAME_CLOSE => {
-                if let Some(stream) = streams.remove(frame.id) {
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                }
-            }
-            _ => return Err(format!("unknown container relay frame type {}", frame.kind)),
-        }
-    }
-    Ok(())
 }
 
 pub fn apple_publish_socket_supported(container: &Path, child_path: &str) -> bool {
@@ -896,20 +791,25 @@ fn wait_for_publish_relay_ready(
     Err("timed out waiting for the container publish-socket listener".into())
 }
 
-const RELAY_FRAME_OPEN: u8 = 1;
+#[cfg(test)]
 const RELAY_FRAME_DATA: u8 = 2;
+#[cfg(test)]
 const RELAY_FRAME_CLOSE: u8 = 3;
+#[cfg(test)]
 const RELAY_FRAME_HEADER_LEN: usize = 9;
+#[cfg(test)]
 const RELAY_FRAME_MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 const RELAY_V2_PREAMBLE: &[u8] = b"CWV2\x01";
 const RELAY_V2_READY_LINE: &str = "COCOA_WAY_TRANSPORT_V2_READY";
 
+#[cfg(test)]
 struct RelayFrame {
     kind: u8,
     id: u32,
     payload: Vec<u8>,
 }
 
+#[cfg(test)]
 fn read_relay_frame(reader: &mut impl Read) -> Result<Option<RelayFrame>, String> {
     let mut header = [0u8; RELAY_FRAME_HEADER_LEN];
     loop {
@@ -942,18 +842,7 @@ fn read_relay_frame(reader: &mut impl Read) -> Result<Option<RelayFrame>, String
     }))
 }
 
-fn write_relay_frame_locked<W: Write>(
-    writer: &Arc<Mutex<W>>,
-    kind: u8,
-    id: u32,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    let mut writer = writer
-        .lock()
-        .map_err(|_| std::io::Error::other("container relay writer lock poisoned"))?;
-    write_relay_frame(&mut *writer, kind, id, payload)
-}
-
+#[cfg(test)]
 fn write_relay_frame(
     writer: &mut impl Write,
     kind: u8,
@@ -1025,27 +914,6 @@ fn relay_env_list(name: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn connect_unix_socket(path: &str, timeout: Duration) -> Result<UnixStream, String> {
-    let deadline = Instant::now() + timeout;
-    let mut last_error = None;
-    while Instant::now() < deadline {
-        match UnixStream::connect(path) {
-            Ok(socket) => return Ok(socket),
-            Err(error) => {
-                last_error = Some(error);
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-    Err(format!(
-        "failed to connect local waypipe socket `{}`: {}",
-        path,
-        last_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "timed out".into())
-    ))
 }
 
 fn guest_relay_perl() -> &'static str {
@@ -1537,10 +1405,21 @@ impl ContainerSession {
 }
 
 pub fn config_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home)
-        .join(".config/cocoa-way")
-        .join("container-sessions.toml")
+    #[cfg(test)]
+    {
+        thread_local! {
+            static CONFIG: tempfile::TempDir = tempfile::Builder::new()
+                .prefix("cocoa-way-unit-config-").tempdir().expect("private test configuration");
+        }
+        CONFIG.with(|directory| directory.path().join("container-sessions.toml"))
+    }
+    #[cfg(not(test))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::PathBuf::from(home)
+            .join(".config/cocoa-way")
+            .join("container-sessions.toml")
+    }
 }
 
 pub fn load_sessions() -> Vec<ContainerSession> {
@@ -1553,162 +1432,56 @@ pub fn load_sessions_report() -> SessionLoadReport {
 }
 
 fn load_sessions_report_from_path(path: &Path) -> SessionLoadReport {
-    let failure = |action: &str, error: &std::io::Error| SessionLoadReport {
-        sessions: vec![],
-        error: Some(format!(
-            "Failed to {action} {}: {error}. Check the path and file/directory permissions; existing configuration was not replaced.",
-            path.display()
-        )),
-    };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                if let Err(error) = std::fs::create_dir_all(parent) {
-                    return failure("create the configuration directory for", &error);
-                }
-            }
-            let example = r#"# cocoa-way container sessions
-# Container Mode owns local Linux GUI sessions. Classic SSH/OrbStack entries
-# remain in ~/.config/cocoa-way/connections.toml.
-
-# [[session]]
-# name = "Niri Desktop"
-# runtime = "container"
-# image = "localhost/cocoa-way-niri:latest"
-# display = "auto"
-# presentation = "desktop"
-# profile = "niri"
-# command = "niri"
-# waypipe_compress = "none"
-# audio = true
-
-# [[session]]
-# name = "Single App Diagnostic"
-# runtime = "container"
-# image = "localhost/cocoa-way-smoke:latest"
-# profile = "single-app"
-# app = "foot"
-"#;
-            let result = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .and_then(|mut file| file.write_all(example.as_bytes()));
-            if let Err(error) = result {
-                return failure("create example configuration at", &error);
-            }
-            log::info!("Created example container-sessions.toml at {:?}", path);
-            return SessionLoadReport {
-                sessions: vec![],
-                error: None,
-            };
-        }
-        Err(error) => return failure("read", &error),
-    };
-
-    match toml::from_str::<Config>(&content) {
-        Ok(cfg) => SessionLoadReport {
-            sessions: cfg.session,
+    match profile_config::load(path) {
+        Ok(sessions) => SessionLoadReport {
+            sessions,
             error: None,
         },
-        Err(e) => {
-            log::warn!("Failed to parse container-sessions.toml: {}", e);
-            SessionLoadReport {
-                sessions: vec![],
-                error: Some(format!(
-                    "Failed to parse {}: {}. Correct the TOML/session fields and retry; the file was not changed.",
-                    path.display(),
-                    e
-                )),
-            }
-        }
+        Err(error) => SessionLoadReport {
+            sessions: vec![],
+            error: Some(format!(
+                "Failed to load/migrate {}: {error}. Correct the TOML/IDs or permissions and retry; no partial configuration was written.",
+                path.display()
+            )),
+        },
     }
 }
 
-pub fn append_session(session: &ContainerSession) -> std::io::Result<()> {
-    validate_profile_name(session, &load_sessions(), None)?;
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            "# cocoa-way container sessions\n\
-         # Container Mode owns local Linux GUI sessions.\n"
-                .into()
-        }
-        Err(error) => return Err(error),
-    };
-    if !content.ends_with('\n') {
-        content.push('\n');
-    }
-    if !content.ends_with("\n\n") {
-        content.push('\n');
-    }
-    content.push_str(&session_to_toml(session));
-
-    std::fs::write(path, content)
+/// Creation/duplication always allocates a fresh identity, ignoring the draft/source ID.
+pub fn append_session(session: &ContainerSession) -> std::io::Result<ProfileId> {
+    profile_config::append(&config_path(), session)
 }
 
-pub fn replace_session(index: usize, session: &ContainerSession) -> std::io::Result<()> {
-    validate_profile_name(session, &load_sessions(), Some(index))?;
-    let path = config_path();
-    let content = std::fs::read_to_string(&path)?;
-    let ranges = session_ranges(&content);
-
-    let Some((start, end)) = ranges.get(index).copied() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "session index not found",
-        ));
-    };
-
-    let mut updated = String::new();
-    updated.push_str(&content[..start]);
-    if !updated.ends_with('\n') && !updated.is_empty() {
-        updated.push('\n');
-    }
-    updated.push_str(&session_to_toml(session));
-    if !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str(content[end..].trim_start_matches('\n'));
-    std::fs::write(path, updated)
+/// Resolve an identity against the current configuration, never against a saved vector position.
+pub fn resolve_session(id: ProfileId) -> std::io::Result<ContainerSession> {
+    let sessions = profile_config::load(&config_path())?;
+    sessions
+        .into_iter()
+        .find(|session| session.id == id)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("profile {id} no longer exists"),
+            )
+        })
 }
 
-pub fn remove_session(index: usize) -> std::io::Result<()> {
-    crate::profile_activity::while_idle(|| remove_idle_session(index))
+pub fn replace_session(id: ProfileId, session: &ContainerSession) -> std::io::Result<()> {
+    profile_config::replace(&config_path(), id, session)
 }
 
-fn remove_idle_session(index: usize) -> std::io::Result<()> {
-    let path = config_path();
-    let content = std::fs::read_to_string(&path)?;
-    let ranges = session_ranges(&content);
-
-    let Some((start, end)) = ranges.get(index).copied() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "session index not found",
-        ));
-    };
-
-    let mut updated = String::new();
-    updated.push_str(&content[..start]);
-    updated.push_str(content[end..].trim_start_matches('\n'));
-    std::fs::write(path, updated)
+pub fn remove_session(id: ProfileId) -> std::io::Result<()> {
+    profile_config::remove(&config_path(), id)
 }
 
 fn validate_profile_name(
     session: &ContainerSession,
     sessions: &[ContainerSession],
-    replaced_index: Option<usize>,
+    replaced_id: Option<ProfileId>,
 ) -> std::io::Result<()> {
     let name = container_name(session);
-    if let Some((_, existing)) = sessions.iter().enumerate().find(|(index, existing)| {
-        Some(*index) != replaced_index
+    if let Some(existing) = sessions.iter().find(|existing| {
+        Some(existing.id) != replaced_id
             && runtime_binary_name(&existing.runtime) == runtime_binary_name(&session.runtime)
             && container_name(existing) == name
     }) {
@@ -1720,8 +1493,7 @@ fn validate_profile_name(
             ),
         ));
     }
-    if crate::profile_activity::identity_reserved_by_other(&session.runtime, &name, replaced_index)
-    {
+    if crate::profile_activity::identity_reserved_by_other(&session.runtime, &name, replaced_id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -1732,35 +1504,12 @@ fn validate_profile_name(
     Ok(())
 }
 
-fn session_ranges(content: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut current_start: Option<usize> = None;
-
-    for (offset, line) in line_offsets(&content) {
-        if line.trim() == "[[session]]" {
-            if let Some(start) = current_start.replace(offset) {
-                ranges.push((start, offset));
-            }
-        }
-    }
-    if let Some(start) = current_start {
-        ranges.push((start, content.len()));
-    }
-    ranges
-}
-
-fn line_offsets(content: &str) -> impl Iterator<Item = (usize, &str)> {
-    let mut offset = 0;
-    content.lines().map(move |line| {
-        let current = offset;
-        offset += line.len() + 1;
-        (current, line)
-    })
-}
-
 pub(crate) fn session_to_toml(session: &ContainerSession) -> String {
     let mut content = String::new();
     content.push_str("[[session]]\n");
+    if session.id.is_saved() {
+        content.push_str(&format!("id = \"{}\"\n", session.id));
+    }
     content.push_str(&format!("name = \"{}\"\n", toml_escape(&session.name)));
     content.push_str(&format!(
         "runtime = \"{}\"\n",
@@ -3111,10 +2860,12 @@ mod tests {
     }
 
     fn diagnostic_session(runtime: &str) -> ContainerSession {
-        toml::from_str(&format!(
+        let mut session: ContainerSession = toml::from_str(&format!(
             "name = 'Diagnostics'\nimage = 'test:latest'\ncommand = 'foot'\nruntime = '{runtime}'"
         ))
-        .unwrap()
+        .unwrap();
+        session.id = ProfileId::new().unwrap();
+        session
     }
 
     #[test]
@@ -3129,7 +2880,7 @@ mod tests {
             let mut b = a.clone();
             b.name = second.into();
             assert!(validate_profile_name(&b, &[a.clone()], None).is_err());
-            assert!(validate_profile_name(&b, &[a], Some(0)).is_ok());
+            assert!(validate_profile_name(&b, &[a.clone()], Some(a.id)).is_ok());
         }
     }
 
@@ -3139,14 +2890,21 @@ mod tests {
         original.name = "Audit reserved profile identity".into();
         let name = container_name(&original);
         let reservation =
-            crate::profile_activity::reserve_identity(71, 1, "container", &name).unwrap();
+            crate::profile_activity::reserve_identity(original.id, 1, "container", &name).unwrap();
         let mut renamed = original.clone();
         renamed.name = "Audit renamed profile identity".into();
         let mut replacement = original.clone();
         replacement.runtime = "apple-container".into();
         assert!(validate_profile_name(&replacement, &[renamed.clone()], None).is_err());
-        assert!(validate_profile_name(&replacement, &[renamed.clone()], Some(0)).is_err());
-        assert!(validate_profile_name(&replacement, &[], Some(71)).is_ok());
+        assert!(
+            validate_profile_name(
+                &replacement,
+                &[renamed.clone()],
+                Some(ProfileId::new().unwrap())
+            )
+            .is_err()
+        );
+        assert!(validate_profile_name(&replacement, &[], Some(original.id)).is_ok());
         replacement.runtime = "docker".into();
         assert!(validate_profile_name(&replacement, &[renamed.clone()], None).is_ok());
         drop(reservation);
@@ -4088,97 +3846,6 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     }
 
     #[test]
-    fn relay_stream_teardown_shuts_down_surviving_reader_clone() {
-        let (socket, mut peer) = UnixStream::pair().unwrap();
-        let mut reader = socket.try_clone().unwrap();
-        reader
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        peer.set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let streams = RelayStreams::default();
-        streams.insert(7, Arc::new(socket));
-        drop(streams);
-        let mut byte = [0u8; 1];
-        assert_eq!(reader.read(&mut byte).unwrap(), 0);
-        assert_eq!(peer.read(&mut byte).unwrap(), 0);
-    }
-
-    #[test]
-    fn relay_stream_host_eof_churn_reclaims_owned_sockets_without_guest_close() {
-        let streams = RelayStreams::default();
-        for id in 1..=256 {
-            let (socket, peer) = UnixStream::pair().unwrap();
-            let socket = Arc::new(socket);
-            let weak = Arc::downgrade(&socket);
-            let mut reader = socket.try_clone().unwrap();
-            reader
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .unwrap();
-            streams.insert(id, Arc::clone(&socket));
-            let reader_streams = Arc::clone(&streams.sockets);
-            drop(peer);
-            let retired = thread::spawn(move || {
-                assert_eq!(reader.read(&mut [0u8; 1]).unwrap(), 0);
-                let _ = reader.shutdown(std::net::Shutdown::Both);
-                let retired = retire_relay_stream(&reader_streams, id, &socket);
-                drop(reader);
-                drop(socket);
-                retired
-            })
-            .join()
-            .unwrap();
-            assert!(retired);
-            assert!(streams.get(id).is_none());
-            assert!(weak.upgrade().is_none());
-            assert!(streams.sockets.lock().unwrap().is_empty());
-        }
-    }
-
-    #[test]
-    fn relay_stream_retirement_preserves_replacement_with_same_id() {
-        let streams = RelayStreams::default();
-        let (previous, _previous_peer) = UnixStream::pair().unwrap();
-        let previous = Arc::new(previous);
-        streams.insert(7, Arc::clone(&previous));
-        let (replacement, _replacement_peer) = UnixStream::pair().unwrap();
-        let replacement = Arc::new(replacement);
-        assert!(streams.insert(7, Arc::clone(&replacement)).is_some());
-        assert!(!retire_relay_stream(&streams.sockets, 7, &previous));
-        assert!(Arc::ptr_eq(&streams.get(7).unwrap(), &replacement));
-        assert!(retire_relay_stream(&streams.sockets, 7, &replacement));
-        assert!(streams.get(7).is_none());
-    }
-
-    #[test]
-    fn relay_stream_retirement_does_not_wait_for_transport_writer() {
-        let streams = RelayStreams::default();
-        let (socket, _peer) = UnixStream::pair().unwrap();
-        let socket = Arc::new(socket);
-        let weak = Arc::downgrade(&socket);
-        streams.insert(7, Arc::clone(&socket));
-        let reader_streams = Arc::clone(&streams.sockets);
-        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer_guard = writer.lock().unwrap();
-        let reader_writer = Arc::clone(&writer);
-        let (retired_tx, retired_rx) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            assert!(retire_relay_stream(&reader_streams, 7, &socket));
-            drop(socket);
-            retired_tx.send(()).unwrap();
-            write_relay_frame_locked(&reader_writer, RELAY_FRAME_CLOSE, 7, &[]).unwrap();
-        });
-        let retired = retired_rx.recv_timeout(Duration::from_secs(2));
-        let reclaimed_before_unlock =
-            retired.is_ok() && weak.upgrade().is_none() && streams.get(7).is_none();
-        // Always release the writer and join, including a failed assertion path.
-        drop(writer_guard);
-        reader.join().unwrap();
-        retired.unwrap();
-        assert!(reclaimed_before_unlock);
-    }
-
-    #[test]
     fn guest_relay_accepts_more_than_one_forwarded_connection() {
         let relay = guest_relay_perl();
         assert!(relay.contains("Listen => 128"));
@@ -4293,6 +3960,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     #[test]
     fn apple_container_defaults_to_uncompressed_local_waypipe() {
         let session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Niri Desktop".into(),
             image: "localhost/cocoa-way-niri:latest".into(),
             runtime: "container".into(),
@@ -4322,6 +3990,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     #[test]
     fn named_display_is_accepted_for_dedicated_worker() {
         let auto_session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Niri Desktop".into(),
             image: "localhost/cocoa-way-niri:latest".into(),
             runtime: "container".into(),
@@ -4343,6 +4012,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
         assert!(validate_display_slot(&auto_session).is_ok());
 
         let external_session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Niri Desktop".into(),
             image: "localhost/cocoa-way-niri:latest".into(),
             runtime: "container".into(),
@@ -4367,6 +4037,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     #[test]
     fn terminal_command_targets_named_container() {
         let session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Niri Desktop".into(),
             image: "localhost/cocoa-way-niri:latest".into(),
             runtime: "container".into(),
@@ -4392,6 +4063,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     #[test]
     fn docker_terminal_command_uses_docker_exec() {
         let session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Smoke App".into(),
             image: "localhost/cocoa-way-smoke:latest".into(),
             runtime: "docker".into(),
@@ -4416,6 +4088,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     #[test]
     fn missing_presentation_keeps_the_desktop_behavior() {
         let session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Legacy Desktop".into(),
             image: "example:latest".into(),
             runtime: "container".into(),
@@ -4444,6 +4117,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     #[test]
     fn session_toml_preserves_rootless_presentation() {
         let session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Rootless App".into(),
             image: "example:latest".into(),
             runtime: "container".into(),
@@ -4492,6 +4166,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     #[test]
     fn rootless_rejects_xterm_without_xwayland() {
         let session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Rootless Xterm".into(),
             image: "example:latest".into(),
             runtime: "container".into(),
@@ -4520,6 +4195,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     #[test]
     fn rootless_rejects_nested_desktop_compositors() {
         let session = ContainerSession {
+            id: ProfileId::UNSAVED,
             name: "Rootless Niri".into(),
             image: "example:latest".into(),
             runtime: "container".into(),

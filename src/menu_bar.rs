@@ -180,13 +180,12 @@ declare_class!(
 
         #[method(startContainerSession:)]
         fn start_container_session(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            let signature: Option<Retained<NSString>> = unsafe { msg_send_id![sender, representedObject] };
-            let Some(signature) = signature else { return; };
-            let Ok(index) = usize::try_from(tag) else { return; };
+            let payload: Option<Retained<NSString>> = unsafe { msg_send_id![sender, representedObject] };
+            let Some(payload) = payload else { return; };
+            let Ok(target) = serde_json::from_str::<crate::container_sessions::ProfileActionTarget>(&payload.to_string()) else { return; };
             send(CompositorMessage::StartContainerSessionIfCurrent {
-                index,
-                signature: signature.to_string(),
+                profile_id: target.id,
+                signature: target.signature,
             });
         }
 
@@ -624,7 +623,7 @@ pub fn setup_menu(
                 );
                 let _: () = msg_send![&*item, setTag: i as isize];
                 let _: () = msg_send![&*item, setRepresentedObject:
-                    &*NSString::from_str(&crate::container_sessions::session_to_toml(session))];
+                    &*NSString::from_str(&serde_json::to_string(&crate::container_sessions::ProfileActionTarget::capture(session)).unwrap())];
                 let _: () = msg_send![&*item, setTarget: &*handler];
                 container_menu.addItem(&item);
             }
@@ -760,7 +759,7 @@ unsafe fn install_status_menu(
             unsafe {
                 item.setTag(index as isize);
                 let _: () = msg_send![&*item, setRepresentedObject:
-                    &*NSString::from_str(&crate::container_sessions::session_to_toml(session))];
+                    &*NSString::from_str(&serde_json::to_string(&crate::container_sessions::ProfileActionTarget::capture(session)).unwrap())];
             }
             submenu.addItem(&item);
         }

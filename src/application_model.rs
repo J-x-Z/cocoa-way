@@ -187,7 +187,7 @@ pub struct OperationTask {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplicationInstanceSnapshot {
     pub id: u64,
-    pub profile_index: usize,
+    pub profile_id: crate::container_sessions::ProfileId,
     pub status: InstanceStatus,
     pub started_at_unix_ms: u128,
     pub container_pid: Option<u32>,

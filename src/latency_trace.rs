@@ -93,6 +93,7 @@ pub fn media_time_ns(seconds: f64) -> Option<u64> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Stage {
     HostNativeInput,
+    HostInputHandled,
     Forwarded,
     SurfaceCommit,
     ComposeStarted,
@@ -107,6 +108,21 @@ pub enum Stage {
     GPUCommandFailed,
     MetalPresentedCallback,
     FrameCallbackDone,
+}
+
+/// An observed event is not evidence of protocol forwarding. Only a matching
+/// keyboard dispatch currently provides an exact Wayland serial/time join.
+pub fn forwarded_keyboard_tags(
+    input: u64,
+    dispatched: Option<(u64, u32, u32)>,
+) -> Option<Tags<'static>> {
+    let (id, serial, time) = dispatched.filter(|(id, _, _)| *id == input)?;
+    Some(Tags {
+        correlation_id: Some(Tag::U64(id)),
+        source_event_serial: Some(Tag::U64(u64::from(serial))),
+        source_event_time: Some(Tag::U64(u64::from(time))),
+        ..Default::default()
+    })
 }
 
 impl Stage {
@@ -441,6 +457,16 @@ fn write_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unforwarded_or_stale_input_is_not_reported_as_protocol_delivery() {
+        assert!(forwarded_keyboard_tags(7, None).is_none());
+        assert!(forwarded_keyboard_tags(7, Some((6, 12, 100))).is_none());
+        let tags = forwarded_keyboard_tags(7, Some((7, 12, 100))).unwrap();
+        assert!(matches!(tags.correlation_id, Some(Tag::U64(7))));
+        assert!(matches!(tags.source_event_serial, Some(Tag::U64(12))));
+        assert!(matches!(tags.source_event_time, Some(Tag::U64(100))));
+    }
 
     #[test]
     fn numeric_ids_are_nonzero_and_unique() {

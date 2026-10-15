@@ -28,6 +28,7 @@ const MAX_ACTIVE_HANDLERS: usize = 8;
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const QUEUE_TIMEOUT: Duration = Duration::from_millis(100);
 
 thread_local! {
     // Inventory probes share the connection budget rather than each starting a new one.
@@ -227,9 +228,10 @@ fn dispatch(
             Ok((index, session)) => ControlResponse::success(
                 &command,
                 json!({
+                    "id": session.id,
                     "index": index,
                     "name": session.name,
-                    "lines": container_mode::control_session_logs(index, request.limit.clamp(1, 1000)),
+                    "lines": container_mode::control_session_logs(session.id, request.limit.clamp(1, 1000)),
                 }),
             ),
             Err(error) => ControlResponse::failure(&command, error),
@@ -247,6 +249,32 @@ fn dispatch(
     }
 }
 
+/// Admission is not acceptance until the message is actually queued. A stalled
+/// UI must not retain every control handler beyond its request's I/O deadline.
+fn queue_message(
+    sender: &Sender<CompositorMessage>,
+    message: CompositorMessage,
+) -> Result<(), &'static str> {
+    let timeout = REQUEST_DEADLINE.with(|budget| match budget.get() {
+        Some(deadline) => deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .map(|remaining| remaining.min(QUEUE_TIMEOUT))
+            .ok_or("control request deadline exceeded"),
+        None => Ok(QUEUE_TIMEOUT),
+    })?;
+    sender
+        .send_timeout(message, timeout)
+        .map_err(|error| match error {
+            crate::event_loop_signal::SendTimeoutError::Timeout(_) => {
+                "event loop queue admission timed out; command was not accepted"
+            }
+            crate::event_loop_signal::SendTimeoutError::Disconnected(_) => {
+                "event loop is unavailable; command was not accepted"
+            }
+        })
+}
+
 fn queue_session_command(
     command: &str,
     selector: Option<&str>,
@@ -256,28 +284,31 @@ fn queue_session_command(
         Ok(resolved) => resolved,
         Err(error) => return ControlResponse::failure(command, error),
     };
-    let message = match command {
-        "launch" | "start" => CompositorMessage::StartContainerSessionIfCurrent {
-            index,
-            signature: container_sessions::session_to_toml(&session),
-        },
-        "stop" => CompositorMessage::StopContainerSession(index),
-        "check" => CompositorMessage::CheckContainerSession(index),
-        _ => unreachable!(),
-    };
-    match sender.send(message) {
+    let message = session_command_message(command, &session);
+    match queue_message(sender, message) {
         Ok(()) => ControlResponse::success(
             command,
             json!({
                 "accepted": true,
+                "id": session.id,
                 "index": index,
                 "name": session.name,
                 "note": "The command was queued on Cocoa-Way's compositor event loop.",
             }),
         ),
-        Err(error) => {
-            ControlResponse::failure(command, format!("event loop is unavailable: {error}"))
-        }
+        Err(error) => ControlResponse::failure(command, error),
+    }
+}
+
+fn session_command_message(command: &str, session: &ContainerSession) -> CompositorMessage {
+    match command {
+        "launch" | "start" => CompositorMessage::StartContainerSessionIfCurrent {
+            profile_id: session.id,
+            signature: container_sessions::session_to_toml(&session),
+        },
+        "stop" => CompositorMessage::StopContainerSession(session.id),
+        "check" => CompositorMessage::CheckContainerSession(session.id),
+        _ => unreachable!(),
     }
 }
 
@@ -314,7 +345,7 @@ fn queue_display_command(
         _ => unreachable!(),
     };
     let automatic = slot.is_none();
-    match sender.send(message) {
+    match queue_message(sender, message) {
         Ok(()) => ControlResponse::success(
             command,
             json!({
@@ -324,18 +355,42 @@ fn queue_display_command(
                 "note": note,
             }),
         ),
-        Err(error) => {
-            ControlResponse::failure(command, format!("event loop is unavailable: {error}"))
-        }
+        Err(error) => ControlResponse::failure(command, error),
     }
 }
 
 fn resolve_session(selector: Option<&str>) -> Result<(usize, ContainerSession), String> {
+    let report = container_sessions::load_sessions_report();
+    if let Some(error) = report.error {
+        return Err(error);
+    }
+    resolve_session_in(selector, &report.sessions)
+}
+
+fn resolve_session_in(
+    selector: Option<&str>,
+    sessions: &[ContainerSession],
+) -> Result<(usize, ContainerSession), String> {
     let selector = selector
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "a session index or exact name is required".to_string())?;
-    let sessions = container_sessions::load_sessions();
+        .ok_or_else(|| "a profile ID, session index or exact name is required".to_string())?;
+    if let Ok(id) = selector.parse::<container_sessions::ProfileId>() {
+        return sessions
+            .iter()
+            .enumerate()
+            .find(|(_, session)| session.id == id)
+            .map(|(index, session)| (index, session.clone()))
+            .ok_or_else(|| format!("profile '{id}' was not found"));
+    }
+    if sessions
+        .iter()
+        .filter(|session| session.name.eq_ignore_ascii_case(selector))
+        .count()
+        > 1
+    {
+        return Err("session name is ambiguous; use its persistent profile ID".into());
+    }
     if let Some((index, session)) = sessions
         .iter()
         .enumerate()
@@ -400,9 +455,10 @@ fn sessions_snapshot() -> Value {
             .into_iter()
             .enumerate()
             .map(|(index, session)| {
-                let tracked = active.iter().find(|active| active.1 == index);
-                let state = container_mode::control_session_state(index);
+                let tracked = active.iter().find(|active| active.1 == session.id);
+                let state = container_mode::control_session_state(session.id);
                 json!({
+                    "id": session.id,
                     "index": index,
                     "name": session.name,
                     "runtime": session.runtime,
@@ -464,13 +520,14 @@ fn displays_snapshot() -> Value {
 }
 
 fn active_sessions_json() -> Value {
+    let sessions = container_sessions::load_sessions();
     Value::Array(
         container_mode::control_active_sessions()
             .into_iter()
             .map(
                 |(
                     instance_id,
-                    profile_index,
+                    profile_id,
                     started_at_unix_ms,
                     container_pid,
                     waypipe_pid,
@@ -479,7 +536,8 @@ fn active_sessions_json() -> Value {
                 )| {
                     json!({
                         "instance_id": instance_id,
-                        "profile_index": profile_index,
+                        "profile_id": profile_id,
+                        "profile_index": sessions.iter().position(|session| session.id == profile_id),
                         "started_at_unix_ms": started_at_unix_ms,
                         "container_pid": container_pid,
                         "waypipe_pid": waypipe_pid,
@@ -642,9 +700,10 @@ fn feature_matrix_snapshot() -> Value {
 fn diagnostics_snapshot(path: &Path, selector: Option<&str>, limit: usize) -> Value {
     let selected_logs = selector.map(|selector| match resolve_session(Some(selector)) {
         Ok((index, session)) => json!({
-            "index": index,
+            "id": session.id,
+                    "index": index,
             "name": session.name,
-            "lines": container_mode::control_session_logs(index, limit.clamp(1, 1000)),
+            "lines": container_mode::control_session_logs(session.id, limit.clamp(1, 1000)),
         }),
         Err(error) => json!({ "selector": selector, "error": error }),
     });
@@ -677,6 +736,7 @@ fn command_probe(command: &str, args: &[&str], child_path: &str) -> Value {
 }
 
 fn redact_value(mut value: Value) -> Value {
+    crate::process_output::redaction::json(&mut value);
     let home = std::env::var("HOME").ok().filter(|value| !value.is_empty());
     let user = std::env::var("USER").ok().filter(|value| !value.is_empty());
     redact_value_in_place(&mut value, home.as_deref(), user.as_deref());
@@ -718,12 +778,18 @@ fn command_snapshot(command: &str, args: &[&str], child_path: &str) -> Value {
 }
 
 fn command_output_snapshot(output: &Output) -> Value {
+    let mut data = serde_json::from_slice::<Value>(&output.stdout).ok();
+    if let Some(data) = &mut data {
+        crate::process_output::redaction::json(data);
+    }
+    let stdout = crate::process_output::redaction::output(&output.stdout);
+    let stderr = crate::process_output::redaction::output(&output.stderr);
     json!({
         "available": true,
         "success": output.status.success(),
-        "data": serde_json::from_slice::<Value>(&output.stdout).ok(),
-        "stdout": String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
-        "stderr": String::from_utf8_lossy(&output.stderr).lines().collect::<Vec<_>>(),
+        "data": data,
+        "stdout": stdout.lines().collect::<Vec<_>>(),
+        "stderr": stderr.lines().collect::<Vec<_>>(),
     })
 }
 
@@ -748,6 +814,68 @@ fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity_profile(name: &str) -> ContainerSession {
+        let mut session: ContainerSession =
+            toml::from_str(&format!("name='{name}'\nimage='test'\n")).unwrap();
+        session.id = container_sessions::ProfileId::new().unwrap();
+        session
+    }
+
+    #[test]
+    fn legacy_selectors_are_resolved_once_to_ids_before_queuing() {
+        let alpha = identity_profile("Alpha");
+        let beta = identity_profile("Beta");
+        let mut sessions = vec![alpha.clone(), beta.clone()];
+        for selector in ["1".to_string(), "beta".to_string(), beta.id.to_string()] {
+            let (_, captured) = resolve_session_in(Some(&selector), &sessions).unwrap();
+            for command in ["start", "stop", "check"] {
+                let message = session_command_message(command, &captured);
+                let id = match message {
+                    CompositorMessage::StartContainerSessionIfCurrent {
+                        profile_id,
+                        signature,
+                    } => {
+                        let target = container_sessions::ProfileActionTarget {
+                            id: profile_id,
+                            signature,
+                        };
+                        assert_eq!(target.resolve(&sessions).unwrap().id, beta.id);
+                        profile_id
+                    }
+                    CompositorMessage::StopContainerSession(id)
+                    | CompositorMessage::CheckContainerSession(id) => id,
+                    _ => panic!("unexpected queued profile action"),
+                };
+                assert_eq!(id, beta.id);
+            }
+        }
+        let (_, captured) = resolve_session_in(Some("0"), &sessions).unwrap();
+        let target = container_sessions::ProfileActionTarget::capture(&captured);
+        sessions.remove(0);
+        assert_eq!(sessions[0].id, beta.id);
+        assert!(target.resolve(&sessions).is_none());
+        assert!(resolve_session_in(Some(&alpha.id.to_string()), &sessions).is_err());
+        assert_eq!(
+            resolve_session_in(Some("0"), &sessions).unwrap().1.id,
+            beta.id
+        );
+    }
+
+    #[test]
+    fn ambiguous_names_require_a_persistent_id() {
+        let first = identity_profile("Same");
+        let second = identity_profile("same");
+        let sessions = [first.clone(), second];
+        assert!(resolve_session_in(Some("SAME"), &sessions).is_err());
+        assert_eq!(
+            resolve_session_in(Some(&first.id.to_string()), &sessions)
+                .unwrap()
+                .1
+                .id,
+            first.id
+        );
+    }
     use std::io::{BufRead, BufReader, Write};
 
     fn test_sender() -> Sender<CompositorMessage> {
@@ -852,17 +980,112 @@ mod tests {
     }
 
     #[test]
+    fn expired_queue_deadline_rejects_session_and_display_commands_without_enqueueing() {
+        let (sender, receiver) = crate::event_loop_signal::channel_with_waker(|| {});
+        let session = identity_profile("queue-deadline");
+        REQUEST_DEADLINE.with(|budget| budget.set(Some(Instant::now())));
+        let display = queue_display_command("display-create", Some("extra"), &sender);
+        let session = queue_message(&sender, session_command_message("stop", &session));
+        REQUEST_DEADLINE.with(|budget| budget.set(None));
+        assert!(!display.ok);
+        assert!(display.error.unwrap().contains("deadline exceeded"));
+        assert_eq!(session, Err("control request deadline exceeded"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(!sender.finish_turn());
+    }
+
+    #[test]
+    fn saturated_queue_honors_remaining_request_budget_for_both_display_commands_and_session() {
+        let (sender, receiver) = crate::event_loop_signal::channel_with_waker(|| {});
+        for _ in 0..crate::event_loop_signal::MAX_PENDING_WORKER_MESSAGES {
+            assert!(sender.send(CompositorMessage::ReloadMenu).is_ok());
+        }
+        for command in ["display-create", "display-close"] {
+            let started = Instant::now();
+            REQUEST_DEADLINE.with(|budget| budget.set(Some(started + Duration::from_millis(20))));
+            let response = queue_display_command(command, Some("extra"), &sender);
+            REQUEST_DEADLINE.with(|budget| budget.set(None));
+            assert!(!response.ok);
+            assert!(response.error.unwrap().contains("not accepted"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        let session = identity_profile("queue-saturation");
+        let started = Instant::now();
+        REQUEST_DEADLINE.with(|budget| budget.set(Some(started + Duration::from_millis(20))));
+        let result = queue_message(&sender, session_command_message("stop", &session));
+        REQUEST_DEADLINE.with(|budget| budget.set(None));
+        assert!(result.unwrap_err().contains("not accepted"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        for _ in 0..crate::event_loop_signal::MAX_PENDING_WORKER_MESSAGES {
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(CompositorMessage::ReloadMenu)
+            ));
+            sender.message_received();
+        }
+        assert!(!sender.finish_turn());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn saturated_control_admission_releases_all_handler_permits_with_a_short_default_budget() {
+        let (sender, _receiver) = crate::event_loop_signal::channel_with_waker(|| {});
+        for _ in 0..crate::event_loop_signal::MAX_PENDING_WORKER_MESSAGES {
+            assert!(sender.send(CompositorMessage::ReloadMenu).is_ok());
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        let started = Instant::now();
+        for _ in 0..MAX_ACTIVE_HANDLERS {
+            let permit = HandlerPermit::acquire(&active).unwrap();
+            let sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                let _permit = permit;
+                let result = queue_message(&sender, CompositorMessage::CreateManagedDisplay(None));
+                assert!(result.unwrap_err().contains("not accepted"));
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(HandlerPermit::acquire(&active).is_some());
+    }
+
+    #[test]
     fn structured_command_data_is_preserved_even_when_the_service_is_stopped() {
         use std::os::unix::process::ExitStatusExt;
         let output = Output {
             status: std::process::ExitStatus::from_raw(1 << 8),
-            stdout: br#"{"status":"not running","paths":{"appRoot":"/tmp/container"}}"#.to_vec(),
+            stdout: br#"{"status":"not running","paths":{"appRoot":"/tmp/container"},"Env":["ORDINARY=hidden-env"]}"#.to_vec(),
             stderr: Vec::new(),
         };
         let snapshot = command_output_snapshot(&output);
         assert_eq!(snapshot["success"], false);
         assert_eq!(snapshot["data"]["status"], "not running");
-        assert_eq!(snapshot["stdout"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["data"]["paths"]["appRoot"], "/tmp/container");
+        assert_eq!(snapshot["data"]["Env"], "[REDACTED]");
+        let rendered = snapshot["stdout"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            serde_json::from_str::<Value>(&rendered).unwrap(),
+            snapshot["data"]
+        );
+        assert!(!rendered.contains("hidden-env"));
+        // Sanitizing a diagnostic view must not rewrite operational capture.
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hidden-env"));
     }
 
     #[test]

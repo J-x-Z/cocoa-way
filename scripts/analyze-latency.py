@@ -38,11 +38,13 @@ STAGES = (
     "CPUSubmitted", "MetalPresented",
 )
 METAL_STAGES = (
+    "HostInputHandled",
     "DrawableAcquireStarted", "DrawableAcquireFinished", "ComposeFinished",
     "GPUStarted", "GPUCompleted", "GPUCompletionCallback", "GPUCommandFailed",
     "MetalPresentedCallback", "FrameCallbackDone",
 )
 METAL_PAIRS = (
+    ("HostNativeInput", "HostInputHandled"),
     ("DrawableAcquireStarted", "DrawableAcquireFinished"),
     ("DrawableAcquireFinished", "ComposeFinished"),
     ("CPUSubmitted", "GPUStarted"),

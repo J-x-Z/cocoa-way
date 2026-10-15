@@ -510,7 +510,8 @@ fn populate(
     }
     for active in active {
         let name = sessions
-            .get(active.instance.profile_index)
+            .iter()
+            .find(|session| session.id == active.profile_id)
             .map(|session| session.name.as_str())
             .unwrap_or("Unknown application");
         let body = card_body(
@@ -533,10 +534,11 @@ fn populate(
             "Stop and Release",
             handler,
             sel!(releaseDisplayAttachment:),
-            active.instance.profile_index,
+            0,
             mtm,
         );
         unsafe {
+            let _: () = msg_send![&*release, setIdentifier: &*NSString::from_str(&active.profile_id.to_string())];
             let _: () = msg_send![&*release, setToolTip: &*NSString::from_str("Stop this managed application and release its display")];
         }
         actions(content, &body, &[release], mtm);

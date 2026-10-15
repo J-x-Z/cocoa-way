@@ -4,16 +4,24 @@ use objc2_foundation::{NSError, NSString};
 use objc2_metal::*;
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use smithay::reexports::wayland_server::backend::ObjectId;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use winit::window::Window;
 
 #[path = "texture_lifetime.rs"]
 mod texture_lifetime;
-use texture_lifetime::{FrameGate, FrameLifetime, TextureVersions, UpdateError};
+use texture_lifetime::{
+    BudgetError, BudgetWake, FrameGate, FrameLifetime, TextureBudget, TextureReservation,
+    TextureVersions, UpdateError,
+};
+
+#[path = "render_geometry.rs"]
+pub(crate) mod geometry;
+use geometry::{DrawGeometry, SurfaceMapping};
 
 // All three shaders share one vertex function; each has its own fragment function.
 const SHADER_SOURCE: &str = r#"
@@ -26,24 +34,26 @@ struct VertexOut {
 };
 
 struct Rect { float x, y, w, h; };
+struct DrawUV { float2 corners[4]; float4 bounds; };
 
 vertex VertexOut vert_main(uint vid [[vertex_id]],
-                           constant Rect& rect [[buffer(0)]]) {
+                           constant Rect& rect [[buffer(0)]],
+                           constant DrawUV& mapping [[buffer(1)]]) {
     // Z-pattern (BL, BR, TL, TR) — the N-pattern (BL,BR,TR,TL) leaves
     // a left-diamond region uncovered between the two triangles.
     float2 pos[4] = {float2(0,0), float2(1,0), float2(0,1), float2(1,1)};
-    float2 uv[4]  = {float2(0,1), float2(1,1), float2(0,0), float2(1,0)};
     VertexOut out;
     out.position = float4(rect.x + pos[vid].x * rect.w,
                           rect.y + pos[vid].y * rect.h, 0.0, 1.0);
-    out.texcoord = uv[vid];
+    out.texcoord = mapping.corners[vid];
     return out;
 }
 
 fragment float4 frag_blit(VertexOut in [[stage_in]],
+                          constant DrawUV& mapping [[buffer(0)]],
                           texture2d<float> tex [[texture(0)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    return tex.sample(s, in.texcoord);
+    return tex.sample(s, clamp(in.texcoord, mapping.bounds.xy, mapping.bounds.zw));
 }
 
 fragment float4 frag_border(VertexOut in [[stage_in]],
@@ -67,6 +77,21 @@ struct RectUniform {
     h: f32,
 }
 
+#[repr(C, align(16))]
+struct UvUniform {
+    corners: [[f32; 2]; 4],
+    bounds: [f32; 4],
+}
+
+impl From<DrawGeometry> for UvUniform {
+    fn from(geometry: DrawGeometry) -> Self {
+        Self {
+            corners: geometry.uv,
+            bounds: geometry.sample_bounds,
+        }
+    }
+}
+
 // Safety: caller ensures the reference outlives the GPU call.
 #[inline(always)]
 unsafe fn as_bytes<T>(v: &T) -> NonNull<c_void> {
@@ -88,6 +113,7 @@ struct TextureResource {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
     width: i32,
     height: i32,
+    reservation: Arc<TextureReservation>,
 }
 
 // Slots cover size changes too; a busy old-sized resource cannot be replaced.
@@ -95,16 +121,47 @@ struct CachedTexture {
     textures: TextureVersions<TextureResource>,
     buffer_id: ObjectId,
     alpha: TextureAlpha,
-    dest_w: i32,
-    dest_h: i32,
+}
+
+type TextureCache = RefCell<HashMap<ObjectId, CachedTexture>>;
+
+thread_local! {
+    // Caches are main-thread owned; only byte reservations cross completion threads.
+    static TEXTURE_CACHES: RefCell<Vec<Weak<TextureCache>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn new_texture_cache() -> Rc<TextureCache> {
+    let cache = Rc::new(RefCell::new(HashMap::new()));
+    TEXTURE_CACHES.with(|caches| {
+        let mut caches = caches.borrow_mut();
+        caches.retain(|cache| cache.strong_count() != 0);
+        caches.push(Rc::downgrade(&cache));
+    });
+    cache
+}
+
+fn prune_idle_texture_versions() {
+    TEXTURE_CACHES.with(|caches| {
+        caches.borrow_mut().retain(|cache| {
+            let Some(cache) = cache.upgrade() else {
+                return false;
+            };
+            if let Ok(mut entries) = cache.try_borrow_mut() {
+                for entry in entries.values_mut() {
+                    entry.textures.prune_idle();
+                }
+            }
+            true
+        });
+    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PixelDrawResult {
     Drawn,
-    /// No frame/idle texture slot. Caller must retain the latest commit for retry.
+    /// No frame/idle slot/budget/allocation. Retain the latest commit for retry.
     Deferred,
-    /// Invalid dimensions/range or failed Metal allocation; no texture was changed.
+    /// Invalid dimensions/range; no texture was changed.
     Rejected,
 }
 
@@ -142,7 +199,10 @@ pub struct MetalRenderer {
     frame: RefCell<Option<FrameState>>,
     frame_gate: Arc<FrameGate>,
     // surface ObjectId → cached GPU texture
-    texture_cache: RefCell<HashMap<ObjectId, CachedTexture>>,
+    texture_cache: Rc<TextureCache>,
+    texture_budget: Arc<TextureBudget>,
+    budget_wake: Arc<BudgetWake>,
+    allocation_warning: Cell<bool>,
     trace: crate::latency_trace::LatencyTrace,
     trace_frames: RefCell<Vec<u64>>,
     native_frame_source: Option<crate::display_link::NativeFrameSource>,
@@ -212,6 +272,8 @@ impl MetalRenderer {
             let opaque_blit_pipeline = make_pipeline(&device, &vert, &frag_blit, false)?;
             let alpha_blit_pipeline = make_pipeline(&device, &vert, &frag_blit, true)?;
             let border_pipeline = make_pipeline(&device, &vert, &frag_border, true)?;
+            let wake_window = window.clone();
+            let budget_wake = BudgetWake::new(move || wake_window.request_redraw());
 
             Ok(Self {
                 width: size.width,
@@ -225,7 +287,10 @@ impl MetalRenderer {
                 border_pipeline,
                 frame: RefCell::new(None),
                 frame_gate: Arc::new(FrameGate::default()),
-                texture_cache: RefCell::new(HashMap::new()),
+                texture_cache: new_texture_cache(),
+                texture_budget: TextureBudget::shared(),
+                budget_wake,
+                allocation_warning: Cell::new(false),
                 trace: crate::latency_trace::LatencyTrace::default(),
                 trace_frames: RefCell::new(Vec::new()),
                 native_frame_source: None,
@@ -304,6 +369,7 @@ impl MetalRenderer {
 
     /// Begin a frame: set clear colour, acquire drawable, start the render pass.
     pub fn clear(&self, r: f32, g: f32, b: f32, a: f32) -> bool {
+        prune_idle_texture_versions();
         let mut frame_slot = self.frame.borrow_mut();
         // Drop any leftover frame state from a previous incomplete frame.
         *frame_slot = None;
@@ -521,31 +587,28 @@ impl MetalRenderer {
         phys_x: i32,
         phys_y: i32,
         scale: f64,
-        viewport_dst: Option<smithay::utils::Size<i32, smithay::utils::Logical>>,
+        mapping: SurfaceMapping,
     ) -> bool {
         let mut cache = self.texture_cache.borrow_mut();
         let Some(entry) = cache.get_mut(surface_id) else {
             return false;
         };
-        let dest_w = viewport_dst
-            .map(|d| (d.w as f64 * scale).round() as i32)
-            .unwrap_or(entry.dest_w);
-        let dest_h = viewport_dst
-            .map(|d| (d.h as f64 * scale).round() as i32)
-            .unwrap_or(entry.dest_h);
-        if dest_w <= 0 || dest_h <= 0 {
+        let Some(resource) = entry.textures.current() else {
             return false;
-        }
+        };
+        let Some(geometry) = mapping.geometry((resource.width, resource.height), scale) else {
+            return false;
+        };
         let frame_ref = self.frame.borrow();
         let Some(frame) = frame_ref.as_ref() else {
             return false;
         };
-        if entry.textures.current().is_none() {
-            return false;
-        }
         entry.textures.mark_read(&frame.lifetime);
-        let texture = &entry.textures.current().unwrap().texture;
-        let rect = self.to_ndc(phys_x, phys_y, dest_w, dest_h);
+        let resource = entry.textures.current().unwrap();
+        frame.lifetime.retain_reservation(&resource.reservation);
+        let texture = &resource.texture;
+        let rect = self.to_ndc(phys_x, phys_y, geometry.width, geometry.height);
+        let uv = UvUniform::from(geometry);
         unsafe {
             let enc = &frame.encoder;
             let pipeline = if entry.alpha.uses_blending() {
@@ -560,6 +623,8 @@ impl MetalRenderer {
                 0,
             );
             enc.setFragmentTexture_atIndex(Some(texture), 0);
+            enc.setVertexBytes_length_atIndex(as_bytes(&uv), std::mem::size_of::<UvUniform>(), 1);
+            enc.setFragmentBytes_length_atIndex(as_bytes(&uv), std::mem::size_of::<UvUniform>(), 0);
             enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         }
         true
@@ -575,8 +640,7 @@ impl MetalRenderer {
         buffer_id: ObjectId,
         x: i32,
         y: i32,
-        dest_w: i32,
-        dest_h: i32,
+        geometry: DrawGeometry,
         tex_w: i32,
         tex_h: i32,
         bytes_per_row: usize,
@@ -584,7 +648,7 @@ impl MetalRenderer {
         alpha: TextureAlpha,
         damage: &[BufferDamage],
     ) -> PixelDrawResult {
-        if dest_w <= 0 || dest_h <= 0 {
+        if geometry.width <= 0 || geometry.height <= 0 {
             return PixelDrawResult::Rejected;
         }
         let frame_ref = self.frame.borrow();
@@ -595,8 +659,6 @@ impl MetalRenderer {
         let texture = self.get_or_create_texture(
             surface_id,
             buffer_id,
-            dest_w,
-            dest_h,
             tex_w,
             tex_h,
             bytes_per_row,
@@ -610,7 +672,8 @@ impl MetalRenderer {
             Err(result) => return result,
         };
 
-        let rect = self.to_ndc(x, y, dest_w, dest_h);
+        let rect = self.to_ndc(x, y, geometry.width, geometry.height);
+        let uv = UvUniform::from(geometry);
         unsafe {
             let enc = &frame.encoder;
             let pipeline = if alpha.uses_blending() {
@@ -625,6 +688,8 @@ impl MetalRenderer {
                 0,
             );
             enc.setFragmentTexture_atIndex(Some(&texture), 0);
+            enc.setVertexBytes_length_atIndex(as_bytes(&uv), std::mem::size_of::<UvUniform>(), 1);
+            enc.setFragmentBytes_length_atIndex(as_bytes(&uv), std::mem::size_of::<UvUniform>(), 0);
             enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         }
         PixelDrawResult::Drawn
@@ -641,6 +706,10 @@ impl MetalRenderer {
         let rect = self.to_ndc(x, y, width, height);
         let color: [f32; 4] = [0.0, 0.6, 1.0, 1.0];
         let bw = border_width / width as f32;
+        let uv = UvUniform {
+            corners: [[0.0, 1.0], [1.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+            bounds: [0.0, 0.0, 1.0, 1.0],
+        };
         unsafe {
             let enc = &frame.encoder;
             enc.setRenderPipelineState(&self.border_pipeline);
@@ -655,6 +724,7 @@ impl MetalRenderer {
                 1,
             );
             enc.setFragmentBytes_length_atIndex(as_bytes(&bw), std::mem::size_of::<f32>(), 2);
+            enc.setVertexBytes_length_atIndex(as_bytes(&uv), std::mem::size_of::<UvUniform>(), 1);
             enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         }
     }
@@ -664,7 +734,7 @@ impl MetalRenderer {
         let fh = self.height as f32;
         RectUniform {
             x: (2.0 * x as f32 / fw) - 1.0,
-            y: 1.0 - (2.0 * (y + h) as f32 / fh),
+            y: 1.0 - (2.0 * (y as f32 + h as f32) / fh),
             w: 2.0 * w as f32 / fw,
             h: 2.0 * h as f32 / fh,
         }
@@ -674,8 +744,6 @@ impl MetalRenderer {
         &self,
         surface_id: ObjectId,
         buffer_id: ObjectId,
-        dest_w: i32,
-        dest_h: i32,
         tex_w: i32,
         tex_h: i32,
         bytes_per_row: usize,
@@ -696,7 +764,6 @@ impl MetalRenderer {
             || row_bytes.is_none_or(|row_bytes| bytes_per_row < row_bytes)
             || required.is_none_or(|required| pixels.len() < required)
         {
-            cache.remove(&surface_id);
             return Err(PixelDrawResult::Rejected);
         }
 
@@ -706,8 +773,6 @@ impl MetalRenderer {
                 textures: TextureVersions::new(),
                 buffer_id: buffer_id.clone(),
                 alpha,
-                dest_w,
-                dest_h,
             });
         let same_size = entry
             .textures
@@ -715,6 +780,19 @@ impl MetalRenderer {
             .is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
         let damage = coalesce_damage(damage, tex_w, tex_h);
         if !same_size || damage.is_some() {
+            // Discard only idle alternates before applying the one-frame share.
+            entry.textures.prune_idle();
+            let retry_in_place = entry.textures.current_busy()
+                || entry
+                    .textures
+                    .current()
+                    .is_some_and(|texture| texture.reservation.has_readers());
+            let previous = entry
+                .textures
+                .current()
+                .map(|texture| texture.reservation.clone());
+            let mut allocation_deferred = false;
+            let mut allocation_denial = None;
             let result = entry.textures.update(|idle, is_current| {
                 let same_size =
                     idle.is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
@@ -735,8 +813,9 @@ impl MetalRenderer {
                         depth: 1,
                     },
                 };
-                let texture = if same_size {
-                    idle.unwrap().texture.clone()
+                let (texture, reservation) = if same_size {
+                    let idle = idle.unwrap();
+                    (idle.texture.clone(), idle.reservation.clone())
                 } else {
                     let desc = unsafe { MTLTextureDescriptor::new() };
                     desc.setTextureType(MTLTextureType::MTLTextureType2D);
@@ -746,7 +825,28 @@ impl MetalRenderer {
                         desc.setHeight(tex_h as usize);
                     }
                     desc.setUsage(MTLTextureUsage::ShaderRead);
-                    self.device.newTextureWithDescriptor(&desc)?
+                    // Reserve Metal's aligned storage estimate BEFORE allocation, not
+                    // just width*height*4. Count old/in-flight versions across windows.
+                    let layout = self.device.heapTextureSizeAndAlignWithDescriptor(&desc);
+                    let bytes = texture_reservation_bytes(layout, tex_w, tex_h)?;
+                    allocation_deferred = true;
+                    let reservation = match self.texture_budget.try_reserve_replacing(
+                        bytes,
+                        &self.budget_wake,
+                        idle.map(|texture| &texture.reservation),
+                    ) {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            allocation_denial = Some(error);
+                            return None;
+                        }
+                    };
+                    let texture = self.device.newTextureWithDescriptor(&desc)?;
+                    if texture.allocatedSize() > reservation.bytes {
+                        return None;
+                    }
+                    allocation_deferred = false;
+                    (texture, reservation)
                 };
                 // The ownership model excludes ALL encoded/submitted GPU readers here.
                 unsafe {
@@ -761,6 +861,7 @@ impl MetalRenderer {
                     texture,
                     width: tex_w,
                     height: tex_h,
+                    reservation,
                 })
             });
             if let Err(error) = result {
@@ -772,19 +873,86 @@ impl MetalRenderer {
                         self.frame_gate.defer_redraw();
                         PixelDrawResult::Deferred
                     }
+                    UpdateError::Rejected if allocation_deferred => {
+                        let result = texture_admission_result(
+                            allocation_denial,
+                            retry_in_place,
+                            allocation_denial == Some(BudgetError::Pressure)
+                                && self.texture_budget.has_reclaimable_readers(),
+                        );
+                        if result == PixelDrawResult::Rejected
+                            || !self.allocation_warning.replace(true)
+                        {
+                            log::warn!(
+                                "Metal texture admission {result:?} ({tex_w}x{tex_h}, {allocation_denial:?}); process limit=256MiB/4096 allocations, renderer base=64MiB plus one oversized frame/1024 allocations"
+                            );
+                        }
+                        if result == PixelDrawResult::Deferred {
+                            if retry_in_place {
+                                self.frame_gate.defer_until_idle();
+                            } else {
+                                self.texture_budget.defer(&self.budget_wake);
+                            }
+                        }
+                        result
+                    }
                     UpdateError::Rejected => PixelDrawResult::Rejected,
                 });
             }
+            let current = &entry.textures.current().unwrap().reservation;
+            current.set_retired(false);
+            if let Some(previous) = previous
+                && !Arc::ptr_eq(&previous, current)
+            {
+                previous.set_retired(true);
+            }
+            // Pair retirement with pruning: if completion raced retirement, either
+            // this pass reclaims the slot or that completion requests one redraw.
+            entry.textures.prune_idle();
         }
         entry.buffer_id = buffer_id;
         entry.alpha = alpha;
-        entry.dest_w = dest_w;
-        entry.dest_h = dest_h;
+        self.allocation_warning.set(false);
         // Default command buffers retain encoded Metal textures through completion;
         // this CPU-only fence additionally prevents replaceRegion while they are read.
         entry.textures.mark_read(frame);
+        frame.retain_reservation(&entry.textures.current().unwrap().reservation);
         Ok(entry.textures.current().unwrap().texture.clone())
     }
+}
+
+fn texture_admission_result(
+    error: Option<BudgetError>,
+    retry_in_place: bool,
+    reclaimable_readers: bool,
+) -> PixelDrawResult {
+    // Idle current images cannot be silently evicted: their wl_buffers were
+    // released. The fair share prevents monopoly; exhausted idle capacity and
+    // impossible requests must fail explicitly, not wait for nonexistent work.
+    if error == Some(BudgetError::Pressure) && (retry_in_place || reclaimable_readers) {
+        PixelDrawResult::Deferred
+    } else {
+        PixelDrawResult::Rejected
+    }
+}
+
+fn texture_reservation_bytes(layout: MTLSizeAndAlign, width: i32, height: i32) -> Option<usize> {
+    let packed = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(4)?;
+    if packed == 0 {
+        return None;
+    }
+    // Heap payload sizes need not include standalone allocation page padding.
+    // Reserve whole 64KiB granules (or Metal's larger alignment), and still verify
+    // allocatedSize before publishing any texture. This covers 4/16/64KiB pages.
+    let align = layout.align.max(64 * 1024);
+    layout
+        .size
+        .max(packed)
+        .checked_add(align - 1)
+        .map(|bytes| bytes / align * align)
 }
 
 fn texture_upload_damage(
@@ -830,6 +998,10 @@ fn coalesce_damage(damage: &[BufferDamage], width: i32, height: i32) -> Option<B
         height: y2 - y1,
     })
 }
+
+#[cfg(test)]
+#[path = "render_metal_tests.rs"]
+mod headless_tests;
 
 #[cfg(test)]
 mod tests {
@@ -902,6 +1074,70 @@ mod tests {
     fn only_premultiplied_textures_use_the_alpha_pipeline() {
         assert!(!TextureAlpha::Opaque.uses_blending());
         assert!(TextureAlpha::Premultiplied.uses_blending());
+    }
+
+    #[test]
+    fn idle_pressure_and_impossible_allocations_are_not_unwakeable_deferrals() {
+        use super::{BudgetError, PixelDrawResult, texture_admission_result};
+        assert_eq!(
+            texture_admission_result(Some(BudgetError::Pressure), false, false),
+            PixelDrawResult::Rejected
+        );
+        assert_eq!(
+            texture_admission_result(Some(BudgetError::Pressure), true, false),
+            PixelDrawResult::Deferred
+        );
+        assert_eq!(
+            texture_admission_result(Some(BudgetError::Pressure), false, true),
+            PixelDrawResult::Deferred
+        );
+        for retry in [false, true] {
+            for reclaim in [false, true] {
+                assert_eq!(
+                    texture_admission_result(Some(BudgetError::TooLarge), retry, reclaim),
+                    PixelDrawResult::Rejected
+                );
+                assert_eq!(
+                    texture_admission_result(None, retry, reclaim),
+                    PixelDrawResult::Rejected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn texture_budget_includes_standalone_page_padding_and_checks_overflow() {
+        use super::{MTLSizeAndAlign, texture_reservation_bytes};
+        assert_eq!(
+            texture_reservation_bytes(
+                MTLSizeAndAlign {
+                    size: 33024,
+                    align: 256
+                },
+                65,
+                44
+            ),
+            Some(65536)
+        );
+        assert_eq!(
+            texture_reservation_bytes(MTLSizeAndAlign { size: 0, align: 0 }, 3840, 2160),
+            Some(33_226_752)
+        );
+        assert_eq!(
+            texture_reservation_bytes(
+                MTLSizeAndAlign {
+                    size: usize::MAX,
+                    align: 16384
+                },
+                1,
+                1
+            ),
+            None
+        );
+        assert_eq!(
+            texture_reservation_bytes(MTLSizeAndAlign { size: 1, align: 1 }, -1, 1),
+            None
+        );
     }
 }
 
