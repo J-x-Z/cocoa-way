@@ -27,6 +27,11 @@ use crate::event_loop_signal::Sender;
 use crate::messages::CompositorMessage;
 use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quote};
 
+mod displays;
+mod native_layout;
+mod panel_shell;
+use native_layout::{TextStyle, label_font, scroll_distance_from_top, scroll_origin_for_distance};
+
 static SENDER: Mutex<Option<Sender<CompositorMessage>>> = Mutex::new(None);
 static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
 static HANDLER: Mutex<Option<usize>> = Mutex::new(None);
@@ -96,7 +101,7 @@ const NAV_ACTIVITY: usize = 7;
 const NAV_COMMANDS: usize = 8;
 const NAV_RUNNING: usize = 9;
 
-const PANEL_MIN_WIDTH: f64 = 996.0;
+const PANEL_MIN_WIDTH: f64 = panel_shell::SIDEBAR_WIDTH + LIST_MIN_WIDTH + DETAIL_MIN_WIDTH;
 const PANEL_MIN_HEIGHT: f64 = 568.0;
 const LIST_MIN_WIDTH: f64 = 344.0;
 const DETAIL_MIN_WIDTH: f64 = 444.0;
@@ -1221,6 +1226,14 @@ unsafe fn rebuild_window_throttled(interval: Duration) -> bool {
 }
 
 unsafe fn refresh_window_without_focus_throttled(interval: Duration) {
+    let selected_nav = *SELECTED_NAV.lock().unwrap();
+    if selected_nav == NAV_DISPLAYS {
+        // Display lifecycle changes are sparse and must not lose the final snapshot.
+        unsafe {
+            refresh_window_without_focus();
+        }
+        return;
+    }
     let now = Instant::now();
     let mut last = LAST_PERFORMANCE_REBUILD.lock().unwrap();
     let should_rebuild = last
@@ -4165,6 +4178,7 @@ declare_class!(
 
         #[method(windowDidResize:)]
         fn window_did_resize(&self, _notification: &AnyObject) {
+            if displays::relayout() { return; }
             unsafe {
                 refresh_window_for_resize(Duration::from_millis(16));
             }
@@ -4173,6 +4187,7 @@ declare_class!(
         #[method(windowDidEndLiveResize:)]
         fn window_did_end_live_resize(&self, _notification: &AnyObject) {
             *LAST_RESIZE_REBUILD.lock().unwrap() = None;
+            if displays::relayout() { return; }
             unsafe {
                 refresh_window_without_focus();
             }
@@ -4185,7 +4200,13 @@ declare_class!(
                 let window = unsafe { &*(window_ptr as *mut NSWindow) };
                 fit_panel_to_visible_screen(window);
             }
-            unsafe { refresh_window_without_focus(); }
+            if !displays::relayout() { unsafe { refresh_window_without_focus(); } }
+        }
+
+        #[method(toggleDisplayConnectionDetails:)]
+        fn toggle_display_connection_details(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            if tag >= 0 { displays::toggle_details(tag as usize); }
         }
 
         #[method(launchContainerSession:)]
@@ -5072,6 +5093,15 @@ declare_class!(
             unsafe { rebuild_window(); }
         }
 
+        #[method(selectContainerNativeTab:)]
+        fn select_container_native_tab(&self, sender: &AnyObject) {
+            let index: isize = unsafe { msg_send![sender, selectedSegment] };
+            if (0..4).contains(&index) {
+                *SELECTED_TAB.lock().unwrap() = index as usize;
+                unsafe { rebuild_window(); }
+            }
+        }
+
         #[method(selectContainerSession:)]
         fn select_container_session(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
@@ -5220,6 +5250,7 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     }
     *SUMMARY_FPS_LABEL.lock().unwrap() = None;
     LIVE_DISPLAY_FPS_LABELS.lock().unwrap().clear();
+    displays::clear();
     let (width, height) = content_size(window);
     let root: Retained<NSView> = unsafe {
         msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, width, height)]
@@ -5239,24 +5270,21 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     let selected_tab = *SELECTED_TAB.lock().unwrap();
     let selected_session = selected_session_index(sessions.len(), selected_nav);
 
+    if selected_nav == NAV_DISPLAYS {
+        displays::install(window, &sessions, config_error.as_deref(), handler, mtm);
+        return;
+    }
+
     let (sidebar_w, list_w, detail_w) = panel_pane_widths(width, selected_nav);
     let runtime_overview_page = matches!(
         selected_nav,
         NAV_APPLE_CONTAINER | NAV_DOCKER | NAV_ORBSTACK
     );
-    let toolbar_h = 64.0;
+    let toolbar_h = panel_shell::HEADER_HEIGHT;
     let detail_x = sidebar_w + list_w;
 
     let sidebar = add_sidebar_background(&root, sidebar_w, height, mtm);
-    add_resource_sidebar(
-        &sidebar,
-        sessions.len(),
-        height,
-        sidebar_w,
-        selected_nav,
-        handler,
-        mtm,
-    );
+    let sidebar_menu = panel_shell::sidebar(&sidebar, sessions.len(), selected_nav, handler, mtm);
     add_separator(&root, rect(sidebar_w, 0.0, 1.0, height), mtm);
 
     add_list_toolbar(
@@ -5271,10 +5299,19 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     );
     add_separator(&root, rect(sidebar_w, height - toolbar_h, list_w, 1.0), mtm);
     if !runtime_overview_page {
-        add_separator(&root, rect(detail_x, 0.0, 1.0, height), mtm);
+        add_separator(
+            &root,
+            rect(
+                detail_x,
+                panel_shell::FOOTER_HEIGHT,
+                1.0,
+                height - panel_shell::FOOTER_HEIGHT,
+            ),
+            mtm,
+        );
     }
 
-    let overview_summary_height = if runtime_overview_page { 72.0 } else { 0.0 };
+    let overview_summary_height = panel_shell::FOOTER_HEIGHT;
     let scroll_frame = rect(
         sidebar_w + 1.0,
         overview_summary_height,
@@ -5297,15 +5334,6 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         NAV_DOCKER => 1760.0,
         NAV_IMAGES => 1800.0,
         NAV_VOLUMES => 1400.0,
-        NAV_DISPLAYS => {
-            let managed_rows =
-                managed_displays_snapshot().len() + pending_managed_displays_snapshot().len();
-            let active_rows = active_sessions_snapshot().len();
-            780.0
-                + managed_rows as f64 * 150.0
-                + active_rows.max(1) as f64 * 116.0
-                + sessions.len().max(1).min(16) as f64 * 78.0
-        }
         NAV_ACTIVITY => 1560.0,
         NAV_COMMANDS => 1080.0,
         _ => height - toolbar_h,
@@ -5319,8 +5347,6 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         add_images_list(&content, content_w, content_height, handler, mtm);
     } else if selected_nav == NAV_VOLUMES {
         add_volumes_list(&content, content_w, content_height, handler, mtm);
-    } else if selected_nav == NAV_DISPLAYS {
-        add_displays_list(&content, content_w, content_height, &sessions, handler, mtm);
     } else if matches!(
         selected_nav,
         NAV_APPLE_CONTAINER | NAV_DOCKER | NAV_ORBSTACK
@@ -5399,7 +5425,6 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
             rect(sidebar_w, overview_summary_height, list_w, 1.0),
             mtm,
         );
-        add_runtime_summary(&root, sidebar_w + 28.0, 4.0, list_w - 56.0, mtm);
     } else {
         add_detail_panel(
             &root,
@@ -5407,6 +5432,7 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
             0.0,
             detail_w,
             height,
+            toolbar_h,
             selected_tab,
             selected_nav,
             selected_session.and_then(|index| sessions.get(index).map(|session| (index, session))),
@@ -5415,6 +5441,26 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
             mtm,
         );
     }
+    panel_shell::footer(
+        &root,
+        rect(
+            sidebar_w,
+            0.0,
+            width - sidebar_w,
+            panel_shell::FOOTER_HEIGHT,
+        ),
+        mtm,
+    );
+    add_separator(
+        &root,
+        rect(
+            sidebar_w,
+            panel_shell::FOOTER_HEIGHT,
+            width - sidebar_w,
+            1.0,
+        ),
+        mtm,
+    );
     unsafe {
         for view in root.subviews().iter() {
             let frame = view.frame();
@@ -5426,6 +5472,10 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         }
     }
     window.setContentView(Some(&root));
+    unsafe {
+        root.layoutSubtreeIfNeeded();
+    }
+    sidebar_menu.reflow();
 }
 
 fn add_sidebar_background(
@@ -5544,9 +5594,12 @@ fn fit_panel_to_visible_screen(window: &NSWindow) {
 }
 
 fn panel_pane_widths(width: f64, nav: usize) -> (f64, f64, f64) {
-    let sidebar = (width - LIST_MIN_WIDTH - DETAIL_MIN_WIDTH).clamp(208.0, 230.0);
+    let sidebar = panel_shell::SIDEBAR_WIDTH;
     let available = (width - sidebar).max(0.0);
-    if matches!(nav, NAV_APPLE_CONTAINER | NAV_DOCKER | NAV_ORBSTACK) {
+    if matches!(
+        nav,
+        NAV_DISPLAYS | NAV_APPLE_CONTAINER | NAV_DOCKER | NAV_ORBSTACK
+    ) {
         return (sidebar, available, 0.0);
     }
     let preferred_list = if matches!(nav, NAV_IMAGES | NAV_VOLUMES | NAV_DISPLAYS) {
@@ -5595,14 +5648,6 @@ fn fit_scroll_document(document: &NSView, viewport_height: f64) -> f64 {
     }
 }
 
-fn scroll_distance_from_top(document_height: f64, viewport_height: f64, origin_y: f64) -> f64 {
-    ((document_height - viewport_height).max(0.0) - origin_y).max(0.0)
-}
-
-fn scroll_origin_for_distance(max_y: f64, distance: f64) -> f64 {
-    (max_y - distance).clamp(0.0, max_y.max(0.0))
-}
-
 fn action_frames(x: f64, top_y: f64, width: f64, widths: &[f64], height: f64) -> Vec<NSRect> {
     let mut offset = 0.0;
     let mut y = top_y;
@@ -5621,284 +5666,6 @@ fn action_frames(x: f64, top_y: f64, width: f64, widths: &[f64], height: f64) ->
         .collect()
 }
 
-fn add_resource_sidebar(
-    parent: &NSView,
-    session_count: usize,
-    height: f64,
-    width: f64,
-    selected_nav: usize,
-    handler: *mut AnyObject,
-    mtm: MainThreadMarker,
-) {
-    let compact = height < 700.0;
-    let nav_height = if compact { 32.0 } else { 44.0 };
-    let session_y = if compact {
-        height - 132.0
-    } else {
-        height - 144.0
-    };
-    let nav_step = if compact { 34.0 } else { 46.0 };
-    let resources_heading_y = if compact {
-        height - 194.0
-    } else {
-        height - 230.0
-    };
-    let resources_first_y = if compact {
-        height - 228.0
-    } else {
-        height - 272.0
-    };
-    let runtime_heading_y = if compact {
-        height - 324.0
-    } else {
-        height - 410.0
-    };
-    let runtime_first_y = if compact {
-        height - 358.0
-    } else {
-        height - 454.0
-    };
-    let general_heading_y = if compact {
-        height - 426.0
-    } else {
-        height - 548.0
-    };
-    let general_first_y = if compact {
-        height - 460.0
-    } else {
-        height - 592.0
-    };
-    add_label(
-        parent,
-        "Cocoa-Way",
-        rect(18.0, height - 52.0, width - 36.0, 24.0),
-        mtm,
-        TextStyle::Heading,
-    );
-    add_label(
-        parent,
-        "Applications",
-        rect(18.0, height - 96.0, width - 36.0, 18.0),
-        mtm,
-        TextStyle::Section,
-    );
-    add_nav_item(
-        parent,
-        NAV_SESSIONS,
-        "Applications",
-        &format!("{} profiles", session_count),
-        selected_nav == NAV_SESSIONS,
-        rect(10.0, session_y, width - 20.0, nav_height),
-        handler,
-        mtm,
-    );
-    add_label(
-        parent,
-        "Resources",
-        rect(18.0, resources_heading_y, width - 36.0, 18.0),
-        mtm,
-        TextStyle::Section,
-    );
-    add_nav_item(
-        parent,
-        NAV_RUNNING,
-        "Running",
-        &format!("{} active", active_sessions_snapshot().len()),
-        selected_nav == NAV_RUNNING,
-        rect(10.0, session_y - nav_step, width - 20.0, nav_height),
-        handler,
-        mtm,
-    );
-    add_nav_item(
-        parent,
-        NAV_IMAGES,
-        "Images",
-        "GUI-ready images",
-        selected_nav == NAV_IMAGES,
-        rect(10.0, resources_first_y, width - 20.0, nav_height),
-        handler,
-        mtm,
-    );
-    add_nav_item(
-        parent,
-        NAV_VOLUMES,
-        "Volumes",
-        "shared data",
-        selected_nav == NAV_VOLUMES,
-        rect(10.0, resources_first_y - nav_step, width - 20.0, nav_height),
-        handler,
-        mtm,
-    );
-    add_nav_item(
-        parent,
-        NAV_DISPLAYS,
-        "Displays",
-        "window slots",
-        selected_nav == NAV_DISPLAYS,
-        rect(
-            10.0,
-            resources_first_y - nav_step * 2.0,
-            width - 20.0,
-            nav_height,
-        ),
-        handler,
-        mtm,
-    );
-
-    add_label(
-        parent,
-        "Runtimes",
-        rect(18.0, runtime_heading_y, width - 36.0, 18.0),
-        mtm,
-        TextStyle::Section,
-    );
-    add_nav_item(
-        parent,
-        NAV_APPLE_CONTAINER,
-        "Apple Container",
-        "first-class target",
-        selected_nav == NAV_APPLE_CONTAINER,
-        rect(10.0, runtime_first_y, width - 20.0, nav_height),
-        handler,
-        mtm,
-    );
-    add_nav_item(
-        parent,
-        NAV_DOCKER,
-        "Docker-compatible",
-        "contexts and providers",
-        selected_nav == NAV_DOCKER,
-        rect(10.0, runtime_first_y - nav_step, width - 20.0, nav_height),
-        handler,
-        mtm,
-    );
-    add_label(
-        parent,
-        "Diagnostics",
-        rect(18.0, general_heading_y, width - 36.0, 18.0),
-        mtm,
-        TextStyle::Section,
-    );
-    let activity_count = activity_snapshot().len();
-    let running_tasks = active_task_count();
-    let activity_subtitle = if running_tasks > 0 {
-        format!("{} running · {} events", running_tasks, activity_count)
-    } else {
-        format!("{} events", activity_count)
-    };
-    add_nav_item(
-        parent,
-        NAV_ACTIVITY,
-        "Activity",
-        &activity_subtitle,
-        selected_nav == NAV_ACTIVITY,
-        rect(10.0, general_first_y, width - 20.0, nav_height),
-        handler,
-        mtm,
-    );
-    add_nav_item(
-        parent,
-        NAV_COMMANDS,
-        "Commands",
-        "launch helpers",
-        selected_nav == NAV_COMMANDS,
-        rect(10.0, general_first_y - nav_step, width - 20.0, nav_height),
-        handler,
-        mtm,
-    );
-    add_separator(parent, rect(0.0, 70.0, width, 1.0), mtm);
-    let settings = add_button(
-        parent,
-        "Settings...",
-        rect(18.0, 24.0, 104.0, 28.0),
-        handler,
-        sel!(openContainerSettings:),
-        mtm,
-    );
-    unsafe {
-        let _: () = msg_send![&*settings, setToolTip:
-            &*NSString::from_str("Open Cocoa-Way Container Mode settings")];
-        for view in parent.subviews().iter() {
-            if view.frame().origin.y > 70.0 {
-                view.setAutoresizingMask(NSAutoresizingMaskOptions::NSViewMinYMargin);
-            }
-        }
-    }
-}
-
-fn add_nav_item(
-    parent: &NSView,
-    index: usize,
-    title: &str,
-    subtitle: &str,
-    active: bool,
-    frame: NSRect,
-    handler: *mut AnyObject,
-    mtm: MainThreadMarker,
-) {
-    if active {
-        add_card(parent, frame, mtm);
-        add_runtime_accent(
-            parent,
-            index,
-            rect(
-                frame.origin.x,
-                frame.origin.y + 8.0,
-                3.0,
-                frame.size.height - 16.0,
-            ),
-            mtm,
-        );
-    }
-    if frame.size.height < 40.0 {
-        add_label(
-            parent,
-            title,
-            rect(
-                frame.origin.x + 16.0,
-                frame.origin.y + 7.0,
-                frame.size.width - 32.0,
-                20.0,
-            ),
-            mtm,
-            TextStyle::Heading,
-        );
-    } else {
-        add_label(
-            parent,
-            title,
-            rect(
-                frame.origin.x + 16.0,
-                frame.origin.y + 22.0,
-                frame.size.width - 32.0,
-                20.0,
-            ),
-            mtm,
-            TextStyle::Heading,
-        );
-        add_label(
-            parent,
-            subtitle,
-            rect(
-                frame.origin.x + 16.0,
-                frame.origin.y + 7.0,
-                frame.size.width - 32.0,
-                16.0,
-            ),
-            mtm,
-            TextStyle::Caption,
-        );
-    }
-    add_hit_button(
-        parent,
-        frame,
-        index,
-        handler,
-        sel!(selectContainerNav:),
-        mtm,
-    );
-}
-
 fn add_list_toolbar(
     parent: &NSView,
     x: f64,
@@ -5909,62 +5676,13 @@ fn add_list_toolbar(
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
-    let title_width = if selected_nav == NAV_SESSIONS {
-        width - 238.0
-    } else if selected_nav == NAV_ACTIVITY {
-        width - 194.0
-    } else {
-        width - 112.0
-    }
-    .max(0.0);
-    add_label(
+    panel_shell::header(
         parent,
-        nav_title(selected_nav),
-        rect(x + 18.0, y + 18.0, title_width, 30.0),
-        mtm,
-        TextStyle::Title,
-    );
-    let reload = add_button(
-        parent,
-        "Reload",
-        rect(x + width - 86.0, y + 17.0, 68.0, 30.0),
+        rect(x, y, width, height),
+        selected_nav,
         handler,
-        sel!(reloadContainerMode:),
         mtm,
     );
-    unsafe {
-        let _: () = msg_send![&*reload, setToolTip:
-            &*NSString::from_str("Reload container-sessions.toml")];
-    }
-    if selected_nav == NAV_ACTIVITY {
-        let clear = add_button(
-            parent,
-            "Clear",
-            rect(x + width - 168.0, y + 17.0, 74.0, 30.0),
-            handler,
-            sel!(clearContainerActivity:),
-            mtm,
-        );
-        unsafe {
-            let _: () = msg_send![&*clear, setToolTip:
-                &*NSString::from_str("Clear Container Mode activity messages")];
-        }
-    }
-    if selected_nav == NAV_SESSIONS {
-        let open = add_button(
-            parent,
-            "New Application",
-            rect(x + width - 212.0, y + 17.0, 116.0, 30.0),
-            handler,
-            sel!(addContainerSession:),
-            mtm,
-        );
-        unsafe {
-            let _: () = msg_send![&*open, setToolTip:
-                &*NSString::from_str("Create a saved application profile")];
-        }
-    }
-    let _ = height;
 }
 
 fn add_session_empty_list(
@@ -6754,343 +6472,6 @@ fn add_volumes_list(
     }
 }
 
-fn add_displays_list(
-    parent: &NSView,
-    width: f64,
-    content_height: f64,
-    sessions: &[ContainerSession],
-    handler: *mut AnyObject,
-    mtm: MainThreadMarker,
-) {
-    MANAGED_DISPLAY_ACTIONS.lock().unwrap().clear();
-    let managed_displays = managed_displays_snapshot();
-    let pending_displays = pending_managed_displays_snapshot();
-    let closing_displays = closing_managed_displays_snapshot();
-    let active_sessions = active_sessions_snapshot();
-    let mut y = add_display_section(
-        parent,
-        "Managed Displays",
-        "Persistent Cocoa-Way windows for explicit local, remote, and application connections.",
-        content_height - 30.0,
-        width,
-        mtm,
-    );
-    add_button(
-        parent,
-        "Create Display",
-        rect(34.0, y - 30.0, 120.0, 30.0),
-        handler,
-        sel!(createManagedDisplay:),
-        mtm,
-    );
-    y -= 46.0;
-
-    for slot in &pending_displays {
-        let detail = format!(
-            "{} · Starting an independent Wayland display window...",
-            DisplayStatus::Allocating.label()
-        );
-        y = add_display_card(
-            parent,
-            y,
-            width,
-            &[(slot, TextStyle::Heading), (&detail, TextStyle::Caption)],
-            &[],
-            mtm,
-        )
-        .bottom
-            - 12.0;
-    }
-
-    if managed_displays.is_empty() && pending_displays.is_empty() {
-        y = add_display_card(
-            parent,
-            y,
-            width,
-            &[
-                ("No managed displays", TextStyle::Heading),
-                ("The default display still works. Create one when external and GUI-managed connections need explicit allocation.", TextStyle::Caption),
-            ],
-            &[],
-            mtm,
-        ).bottom - 12.0;
-    }
-
-    for display in &managed_displays {
-        let attachment_count = active_sessions
-            .iter()
-            .filter(|active| active.instance.display_slot == display.slot)
-            .count();
-        let closing = closing_displays.iter().any(|slot| slot == &display.slot);
-        let status = if closing {
-            DisplayStatus::Closing
-        } else if attachment_count > 0 {
-            DisplayStatus::Attached
-        } else {
-            DisplayStatus::Free
-        };
-        let action_index = {
-            let mut actions = MANAGED_DISPLAY_ACTIONS.lock().unwrap();
-            let index = actions.len();
-            actions.push(display.clone());
-            index
-        };
-        let display_performance = worker_performance_snapshot(&display.runtime_dir);
-        let performance_base = format!(
-            "{} · {} attachment{} · process {}",
-            status.label(),
-            attachment_count,
-            if attachment_count == 1 { "" } else { "s" },
-            display.pid,
-        );
-        let performance_text = display_fps_text(&performance_base, display_performance.as_ref());
-        let socket = format!("{}/{}", display.runtime_dir, display.display);
-        let performance_reservation = format!("{performance_base} · 9999.9 fps · idle");
-        let card = add_display_card(
-            parent,
-            y,
-            width,
-            &[
-                (&display.slot, TextStyle::Heading),
-                (&performance_reservation, TextStyle::Caption),
-                (&socket, TextStyle::Mono),
-            ],
-            &[100.0, 116.0, 112.0],
-            mtm,
-        );
-        unsafe {
-            let _: () = msg_send![&*card.labels[1], setStringValue: &*NSString::from_str(&performance_text)];
-        }
-        register_live_display_fps_label(&card.labels[1], &display.slot, performance_base);
-        let focus = add_button(
-            parent,
-            "Focus Window",
-            card.actions[0],
-            handler,
-            sel!(focusManagedDisplay:),
-            mtm,
-        );
-        let copy_command = add_button(
-            parent,
-            "Copy Connection",
-            card.actions[1],
-            handler,
-            sel!(copyManagedDisplayCommand:),
-            mtm,
-        );
-        let close = add_button(
-            parent,
-            "Close Display",
-            card.actions[2],
-            handler,
-            sel!(closeManagedDisplay:),
-            mtm,
-        );
-        unsafe {
-            let _: () = msg_send![&*focus, setTag: action_index as isize];
-            let _: () = msg_send![&*copy_command, setTag: action_index as isize];
-            let _: () = msg_send![&*close, setTag: action_index as isize];
-            let _: () = msg_send![&*focus, setEnabled: !closing];
-            let _: () = msg_send![&*copy_command, setEnabled: !closing];
-            let _: () = msg_send![&*close, setEnabled: !closing && attachment_count == 0];
-            let _: () = msg_send![&*focus, setToolTip:
-                &*NSString::from_str("Bring this independent display window to the front")];
-            let _: () = msg_send![&*copy_command, setToolTip:
-                &*NSString::from_str("Copy a run_waypipe.sh command prefix for this display")];
-            let close_tooltip = if attachment_count > 0 {
-                "Release the active attachment before closing this display"
-            } else {
-                "Close this Cocoa-Way display window"
-            };
-            let _: () = msg_send![&*close, setToolTip: &*NSString::from_str(close_tooltip)];
-        }
-        y = card.bottom - 12.0;
-    }
-
-    if let Some(error) = MANAGED_DISPLAY_LAST_ERROR.lock().unwrap().as_deref() {
-        let title = format!("Last display operation · {}", DisplayStatus::Failed.label());
-        y = add_display_card(
-            parent,
-            y,
-            width,
-            &[(&title, TextStyle::Heading), (error, TextStyle::Caption)],
-            &[],
-            mtm,
-        )
-        .bottom
-            - 12.0;
-    }
-
-    y = add_display_section(
-        parent,
-        "Active Attachments",
-        "Runtime bindings between an application instance and a Cocoa-Way display.",
-        y - 18.0,
-        width,
-        mtm,
-    );
-    if active_sessions.is_empty() {
-        y = add_display_card(
-            parent,
-            y,
-            width,
-            &[
-                ("No active display attachments", TextStyle::Heading),
-                (
-                    "Launch an application to allocate a display at runtime.",
-                    TextStyle::Caption,
-                ),
-            ],
-            &[],
-            mtm,
-        )
-        .bottom
-            - 12.0;
-    } else {
-        for active in &active_sessions {
-            let session = sessions.get(active.instance.profile_index);
-            let session_name = session
-                .map(|session| session.name.as_str())
-                .unwrap_or("Unknown application");
-            let presentation = session
-                .map(session_presentation_summary)
-                .unwrap_or("unknown");
-            let attachment = format!(
-                "{} · instance #{} · {} · {}",
-                DisplayStatus::Attached.label(),
-                active.instance.id,
-                active.instance.display_slot,
-                presentation
-            );
-            let display_performance = performance_for_active_session(active);
-            let performance_base = format!(
-                "waypipe {} · display process {}",
-                active.instance.waypipe_pid,
-                active
-                    .instance
-                    .display_pid
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "built-in".into()),
-            );
-            let performance_text =
-                display_fps_text(&performance_base, display_performance.as_ref());
-            let performance_reservation = format!("{performance_base} · 9999.9 fps · idle");
-            let card = add_display_card(
-                parent,
-                y,
-                width,
-                &[
-                    (session_name, TextStyle::Heading),
-                    (&attachment, TextStyle::Caption),
-                    (&performance_reservation, TextStyle::Mono),
-                ],
-                &[116.0],
-                mtm,
-            );
-            unsafe {
-                let _: () = msg_send![&*card.labels[2], setStringValue: &*NSString::from_str(&performance_text)];
-            }
-            register_live_display_fps_label(
-                &card.labels[2],
-                &active.instance.display_slot,
-                performance_base,
-            );
-            let release = add_button(
-                parent,
-                "Release Display",
-                card.actions[0],
-                handler,
-                sel!(releaseDisplayAttachment:),
-                mtm,
-            );
-            unsafe {
-                let _: () = msg_send![&*release, setTag: active.instance.profile_index as isize];
-                let _: () = msg_send![&*release, setToolTip:
-                    &*NSString::from_str("Stop this application instance and release its display")];
-            }
-            y = card.bottom - 12.0;
-        }
-    }
-
-    y = add_display_section(
-        parent,
-        "Built-in Display",
-        "The default window is shared only when available.",
-        y - 18.0,
-        width,
-        mtm,
-    );
-    let default_attachments = active_sessions
-        .iter()
-        .filter(|active| active.instance.display_slot == "default")
-        .count();
-    let built_in_status = if default_attachments > 0 {
-        DisplayStatus::Attached
-    } else {
-        DisplayStatus::Free
-    };
-    let detail = format!(
-        "{} · {} active attachment{}",
-        built_in_status.label(),
-        default_attachments,
-        if default_attachments == 1 { "" } else { "s" }
-    );
-    y = add_display_card(
-        parent,
-        y,
-        width,
-        &[
-            ("Default Display", TextStyle::Heading),
-            (&detail, TextStyle::Caption),
-            ("The current Cocoa-Way Metal window. Auto uses it while free, then allocates an isolated display.", TextStyle::Caption),
-        ],
-        &[],
-        mtm,
-    ).bottom - 12.0;
-
-    y = add_display_section(
-        parent,
-        "Display Policies",
-        "Saved profile preferences. Policies do not reserve a display until an instance launches.",
-        y - 18.0,
-        width,
-        mtm,
-    );
-    if sessions.is_empty() {
-        add_display_card(
-            parent,
-            y,
-            width,
-            &[
-                ("No display policies", TextStyle::Heading),
-                (
-                    "Create an application profile to configure its display policy.",
-                    TextStyle::Caption,
-                ),
-            ],
-            &[],
-            mtm,
-        );
-        return;
-    }
-    for session in sessions {
-        let policy = display_policy_description(session);
-        y = add_display_card(
-            parent,
-            y,
-            width,
-            &[
-                (&session.name, TextStyle::Heading),
-                (&policy, TextStyle::Caption),
-            ],
-            &[],
-            mtm,
-        )
-        .bottom
-            - 12.0;
-    }
-}
-
 fn display_policy_description(session: &ContainerSession) -> String {
     if session.presentation_mode().is_rootless() {
         return "Independent native windows · Rootless presentation".into();
@@ -7103,102 +6484,6 @@ fn display_policy_description(session: &ContainerSession) -> String {
         _ => format!("Named display: {target}"),
     };
     format!("{policy} · Desktop presentation")
-}
-
-struct DisplayCard {
-    bottom: f64,
-    labels: Vec<Retained<NSTextField>>,
-    actions: Vec<NSRect>,
-}
-
-fn display_card_geometry(
-    top: f64,
-    width: f64,
-    row_heights: &[f64],
-    button_widths: &[f64],
-) -> (NSRect, Vec<NSRect>, Vec<NSRect>) {
-    let text_width = (width - 76.0).max(1.0);
-    let mut cursor = top - 16.0;
-    let rows = row_heights
-        .iter()
-        .map(|height| {
-            cursor -= height;
-            let frame = rect(38.0, cursor, text_width, *height);
-            cursor -= 8.0;
-            frame
-        })
-        .collect::<Vec<_>>();
-    if !rows.is_empty() {
-        cursor += 8.0;
-    }
-    let actions = if button_widths.is_empty() {
-        Vec::new()
-    } else {
-        cursor -= 14.0 + 28.0;
-        let frames = action_frames(38.0, cursor, text_width, button_widths, 28.0);
-        cursor = frames.last().unwrap().origin.y;
-        frames
-    };
-    let bottom = cursor - 16.0;
-    (
-        rect(24.0, bottom, width - 48.0, top - bottom),
-        rows,
-        actions,
-    )
-}
-
-fn add_display_card(
-    parent: &NSView,
-    top: f64,
-    width: f64,
-    rows: &[(&str, TextStyle)],
-    button_widths: &[f64],
-    mtm: MainThreadMarker,
-) -> DisplayCard {
-    let labels = rows
-        .iter()
-        .map(|(text, style)| measured_wrapping_label(text, width - 76.0, *style, mtm))
-        .collect::<Vec<_>>();
-    let heights = labels.iter().map(|(_, height)| *height).collect::<Vec<_>>();
-    let (frame, rows, actions) = display_card_geometry(top, width, &heights, button_widths);
-    add_card(parent, frame, mtm);
-    let labels = labels
-        .into_iter()
-        .zip(rows)
-        .map(|((label, _), frame)| {
-            unsafe {
-                label.setFrame(frame);
-                parent.addSubview(&label);
-            }
-            label
-        })
-        .collect();
-    DisplayCard {
-        bottom: frame.origin.y,
-        labels,
-        actions,
-    }
-}
-
-fn add_display_section(
-    parent: &NSView,
-    title: &str,
-    description: &str,
-    top: f64,
-    width: f64,
-    mtm: MainThreadMarker,
-) -> f64 {
-    let mut cursor = top;
-    for (text, style) in [(title, TextStyle::Title), (description, TextStyle::Caption)] {
-        let (label, height) = measured_wrapping_label(text, width - 68.0, style, mtm);
-        cursor -= height;
-        unsafe {
-            label.setFrame(rect(34.0, cursor, width - 68.0, height));
-            parent.addSubview(&label);
-        }
-        cursor -= 8.0;
-    }
-    cursor - 8.0
 }
 
 fn add_runtime_list(
@@ -7304,7 +6589,7 @@ fn add_runtime_list(
         add_label(
             parent,
             &missing_detail,
-            rect(38.0, y - 18.0, width - 76.0, 36.0),
+            rect(38.0, y - 30.0, width - 76.0, 36.0),
             mtm,
             TextStyle::Body,
         );
@@ -9735,6 +9020,7 @@ fn add_detail_panel(
     _y: f64,
     width: f64,
     height: f64,
+    toolbar_height: f64,
     selected_tab: usize,
     selected_nav: usize,
     selected_session: Option<(usize, &ContainerSession)>,
@@ -9742,63 +9028,19 @@ fn add_detail_panel(
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
-    let compact_toolbar = width < 560.0;
-    if matches!(selected_nav, NAV_SESSIONS | NAV_RUNNING) {
-        let tab_x = if compact_toolbar {
-            x + 122.0
-        } else {
-            x + 144.0
-        };
-        let max_tab_w = (x + width - tab_x - 24.0).max(0.0);
-        let tab_w = max_tab_w.min(440.0);
-        let terminal = add_button(
-            parent,
-            "New Terminal",
-            rect(
-                if compact_toolbar { x + 12.0 } else { x + 22.0 },
-                height - 47.0,
-                if compact_toolbar { 104.0 } else { 112.0 },
-                30.0,
-            ),
-            handler,
-            sel!(openContainerTerminal:),
-            mtm,
-        );
-        unsafe {
-            if let Some((index, _)) =
-                selected_session.filter(|(index, _)| active_session(*index).is_some())
-            {
-                let _: () = msg_send![&*terminal, setTag: index as isize];
-                let _: () = msg_send![&*terminal, setToolTip:
-                    &*NSString::from_str("Open a terminal in the running application instance")];
-            } else {
-                let _: () = msg_send![&*terminal, setEnabled: false];
-                let _: () = msg_send![&*terminal, setToolTip:
-                    &*NSString::from_str("Launch an application instance before opening its terminal")];
-            }
-        }
-        add_tab_bar(
-            parent,
-            tab_x,
-            height - 50.0,
-            tab_w,
-            selected_tab,
-            handler,
-            mtm,
-        );
-    } else {
-        add_label(
-            parent,
-            nav_title(selected_nav),
-            rect(x + 28.0, height - 44.0, width - 56.0, 26.0),
-            mtm,
-            TextStyle::Title,
-        );
-    }
-    add_separator(parent, rect(x, height - 64.0, width, 1.0), mtm);
+    panel_shell::detail_header(
+        parent,
+        rect(x, height - toolbar_height, width, toolbar_height),
+        selected_tab,
+        matches!(selected_nav, NAV_SESSIONS | NAV_RUNNING),
+        selected_session.and_then(|(index, _)| active_session(index).map(|_| index)),
+        handler,
+        mtm,
+    );
+    add_separator(parent, rect(x, height - toolbar_height, width, 1.0), mtm);
 
-    let summary_height = 72.0;
-    let scroll_height = (height - 64.0 - summary_height).max(0.0);
+    let summary_height = panel_shell::FOOTER_HEIGHT;
+    let scroll_height = (height - toolbar_height - summary_height).max(0.0);
     let scroll = unsafe {
         NSScrollView::initWithFrame(
             mtm.alloc::<NSScrollView>(),
@@ -9960,7 +9202,6 @@ fn add_detail_panel(
         });
     }
     add_separator(parent, rect(x, summary_height, width, 1.0), mtm);
-    add_runtime_summary(parent, x + 28.0, 4.0, width - 56.0, mtm);
 }
 
 fn detail_scroll_key(
@@ -11297,7 +10538,7 @@ fn add_session_logs(
         return;
     }
 
-    let max_chars = ((width - 44.0) / 10.0).floor().clamp(48.0, 120.0) as usize;
+    let max_chars = chars_for_width(width - 44.0, TextStyle::Mono).min(120);
     let visible_lines = wrapped_log_lines(&logs, max_chars, 8);
     let mut row_y = y + 176.0;
     for line in visible_lines {
@@ -12007,80 +11248,6 @@ fn add_detail_card(
     add_card(parent, rect(x, y, width, height), mtm);
 }
 
-fn add_tab_bar(
-    parent: &NSView,
-    x: f64,
-    y: f64,
-    width: f64,
-    selected_tab: usize,
-    handler: *mut AnyObject,
-    mtm: MainThreadMarker,
-) {
-    add_card(parent, rect(x, y, width, 36.0), mtm);
-    let tab_w = width / 4.0;
-    add_card(
-        parent,
-        rect(
-            x + selected_tab as f64 * tab_w + 4.0,
-            y + 4.0,
-            tab_w - 8.0,
-            28.0,
-        ),
-        mtm,
-    );
-    for (index, title) in ["Overview", "Logs", "Terminal", "Files"].iter().enumerate() {
-        let label_width = tab_w - 16.0;
-        add_label(
-            parent,
-            title,
-            rect(x + index as f64 * tab_w + 8.0, y + 9.0, label_width, 18.0),
-            mtm,
-            if index == selected_tab {
-                TextStyle::Heading
-            } else {
-                TextStyle::Body
-            },
-        );
-        add_hit_button(
-            parent,
-            rect(x + index as f64 * tab_w, y, tab_w, 36.0),
-            index,
-            handler,
-            sel!(selectContainerTab:),
-            mtm,
-        );
-    }
-}
-
-fn add_runtime_summary(parent: &NSView, x: f64, y: f64, width: f64, mtm: MainThreadMarker) {
-    let diagnostics = runtime_diagnostics(&[]);
-    let columns = diagnostics.len().max(1);
-    let item_w = width / columns as f64;
-    for (i, diagnostic) in diagnostics.iter().enumerate() {
-        let item_x = x + i as f64 * item_w;
-        add_label(
-            parent,
-            diagnostic.name,
-            rect(item_x, y + 30.0, item_w - 14.0, 16.0),
-            mtm,
-            TextStyle::Caption,
-        );
-        let state_label = add_label(
-            parent,
-            &short_text(
-                &diagnostic.state,
-                chars_for_width(item_w - 14.0, TextStyle::Heading),
-            ),
-            rect(item_x, y + 10.0, item_w - 14.0, 20.0),
-            mtm,
-            TextStyle::Heading,
-        );
-        if diagnostic.name == "Display FPS" {
-            *SUMMARY_FPS_LABEL.lock().unwrap() = Some(Retained::as_ptr(&state_label) as usize);
-        }
-    }
-}
-
 fn nav_title(index: usize) -> &'static str {
     match index {
         NAV_RUNNING => "Running",
@@ -12234,7 +11401,7 @@ unsafe fn add_session_row(
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
-    let card_w = (width - 24.0).max(320.0);
+    let card_w = (width - 24.0).max(0.0);
     let process_active = active_session(index).is_some();
     let state_label = state
         .as_ref()
@@ -12650,61 +11817,6 @@ fn request_selected_runtime_container_details() {
     });
 }
 
-#[derive(Clone, Copy)]
-enum TextStyle {
-    Hero,
-    Title,
-    Heading,
-    Section,
-    Body,
-    Caption,
-    Mono,
-}
-
-fn label_font(style: TextStyle) -> Retained<NSFont> {
-    unsafe {
-        match style {
-            TextStyle::Hero => NSFont::boldSystemFontOfSize(28.0),
-            TextStyle::Title => NSFont::boldSystemFontOfSize(22.0),
-            TextStyle::Heading => NSFont::boldSystemFontOfSize(15.0),
-            TextStyle::Section => NSFont::boldSystemFontOfSize(12.0),
-            TextStyle::Body => NSFont::systemFontOfSize(13.0),
-            TextStyle::Caption => NSFont::systemFontOfSize(11.0),
-            TextStyle::Mono => NSFont::userFixedPitchFontOfSize(13.0)
-                .unwrap_or_else(|| NSFont::systemFontOfSize(13.0)),
-        }
-    }
-}
-
-fn measured_wrapping_label(
-    text: &str,
-    width: f64,
-    style: TextStyle,
-    mtm: MainThreadMarker,
-) -> (Retained<NSTextField>, f64) {
-    unsafe {
-        let label = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
-        let font = label_font(style);
-        let _: () = msg_send![&*label, setFont: &*font];
-        let _: () = msg_send![&*label, setUsesSingleLineMode: false];
-        let _: () = msg_send![&*label, setMaximumNumberOfLines: 0isize];
-        let _: () = msg_send![&*label, setPreferredMaxLayoutWidth: width];
-        let line_break: isize = if matches!(style, TextStyle::Mono) {
-            1
-        } else {
-            0
-        };
-        let _: () = msg_send![&*label, setLineBreakMode: line_break];
-        let cell: Retained<AnyObject> = msg_send_id![&*label, cell];
-        let _: () = msg_send![&*cell, setWraps: true];
-        let _: () = msg_send![&*cell, setScrollable: false];
-        // Measure at the actual logical width; Retina backing pixels are not layout units.
-        let size: NSSize = msg_send![&*cell, cellSizeForBounds: rect(0.0, 0.0, width, f64::MAX)];
-        let height = (size.height.ceil() + 4.0).max(line_height_for_style(style));
-        (label, height)
-    }
-}
-
 fn add_label(
     parent: &NSView,
     text: &str,
@@ -12876,15 +11988,7 @@ fn add_hit_button(
 fn add_card(parent: &NSView, frame: NSRect, mtm: MainThreadMarker) {
     unsafe {
         let card = NSBox::initWithFrame(mtm.alloc::<NSBox>(), frame);
-        card.setBoxType(NSBoxType::NSBoxCustom);
-        card.setTitle(&NSString::from_str(""));
-        card.setTransparent(false);
-        card.setCornerRadius(10.0);
-        card.setBorderWidth(0.5);
-        let fill = NSColor::controlBackgroundColor().colorWithAlphaComponent(0.62);
-        let border = NSColor::separatorColor().colorWithAlphaComponent(0.55);
-        card.setFillColor(&fill);
-        card.setBorderColor(&border);
+        native_layout::style_card(&card);
         parent.addSubview(&card);
     }
 }
@@ -12905,7 +12009,7 @@ fn add_profile_card(
         card.setBoxType(NSBoxType::NSBoxCustom);
         card.setTitle(&NSString::from_str(""));
         card.setTransparent(false);
-        card.setCornerRadius(10.0);
+        card.setCornerRadius(12.0);
         card.setBorderWidth(1.5);
         let accent = NSColor::controlAccentColor();
         card.setFillColor(&accent.colorWithAlphaComponent(0.09));
@@ -12962,50 +12066,6 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn layout_display_cards_keep_wrapped_rows_and_actions_inside_the_card() {
-        for width in [329.0, 344.0, 440.0, 560.0] {
-            let (card, rows, actions) =
-                display_card_geometry(200.0, width, &[44.0, 49.0, 76.0], &[100.0, 116.0, 112.0]);
-            for frame in rows.iter().chain(actions.iter()) {
-                assert!(frame.origin.x >= card.origin.x + 14.0);
-                assert!(
-                    frame.origin.x + frame.size.width <= card.origin.x + card.size.width - 14.0
-                );
-                assert!(frame.origin.y >= card.origin.y + 16.0);
-                assert!(frame.origin.y + frame.size.height <= 184.0);
-            }
-            for pair in rows.windows(2) {
-                assert_eq!(
-                    pair[0].origin.y - (pair[1].origin.y + pair[1].size.height),
-                    8.0
-                );
-            }
-            assert!(
-                actions[0].origin.y + actions[0].size.height
-                    <= rows.last().unwrap().origin.y - 14.0
-            );
-            for (index, frame) in actions.iter().enumerate() {
-                for other in &actions[..index] {
-                    assert!(
-                        frame.origin.x >= other.origin.x + other.size.width
-                            || frame.origin.y + frame.size.height <= other.origin.y
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn layout_display_policy_card_grows_with_native_text_measurements() {
-        let (short, _, _) = display_card_geometry(100.0, 344.0, &[20.0, 18.0], &[]);
-        let (wrapped, _, _) = display_card_geometry(100.0, 344.0, &[60.0, 63.0], &[]);
-        assert_eq!(wrapped.size.height - short.size.height, 85.0);
-        let next_top = wrapped.origin.y - 12.0;
-        let (next, _, _) = display_card_geometry(next_top, 344.0, &[20.0, 18.0], &[]);
-        assert_eq!(wrapped.origin.y - (next.origin.y + next.size.height), 12.0);
-    }
 
     #[test]
     fn display_policies_show_actual_named_slots_and_rootless_ownership() {
@@ -13067,7 +12127,10 @@ mod tests {
                 assert!((sidebar + list + detail - width).abs() < 0.001);
                 assert!(sidebar >= 208.0);
                 assert!(list >= LIST_MIN_WIDTH);
-                if matches!(nav, NAV_APPLE_CONTAINER | NAV_DOCKER | NAV_ORBSTACK) {
+                if matches!(
+                    nav,
+                    NAV_DISPLAYS | NAV_APPLE_CONTAINER | NAV_DOCKER | NAV_ORBSTACK
+                ) {
                     assert_eq!(detail, 0.0);
                 } else {
                     assert!(detail >= DETAIL_MIN_WIDTH);

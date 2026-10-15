@@ -28,6 +28,7 @@ objc2-app-kit = { version = "=0.2.2", default-features = false, features = [
     "NSControl", "NSText", "NSTextField", "NSSecureTextField",
     "NSButton", "NSPopUpButton", "NSScrollView", "NSTextView", "NSFont", "NSBox", "NSColor",
     "NSStatusBar", "NSStatusItem", "NSStatusBarButton",
+    "NSStackView", "NSLayoutConstraint", "NSUserInterfaceLayout", "NSImageView", "NSClipView",
     "NSOpenPanel", "NSSavePanel", "NSPanel",
     "NSPasteboard",
     "NSBitmapImageRep", "NSImageRep",
@@ -48,6 +49,11 @@ tempfile = "3.8"
 
 [build-dependencies]
 pkg-config = "0.3"
+
+[[test]]
+name = "native-panel-layout"
+path = "tests/native_panel_layout.rs"
+harness = false
 
 [workspace]
 members = [
