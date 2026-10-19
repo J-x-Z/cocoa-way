@@ -1094,10 +1094,11 @@ impl AppState {
             .wrapping_add(1);
         self.pending_guest_clipboard_mime = None;
         self.pasteboard_change_count = snapshot.change_count;
-        self.host_clipboard = HostClipboardContents {
-            text: snapshot.text,
-            image_png: snapshot.image_png,
-        };
+        self.host_clipboard = HostClipboardContents::from_snapshot(
+            snapshot.text,
+            snapshot.image_png,
+            snapshot.image_tiff.is_some() || snapshot.image_error.is_some(),
+        );
         let token = HostImageToken {
             generation,
             change_count: snapshot.change_count,
@@ -1253,10 +1254,14 @@ impl AppState {
         payload: ClipboardPayload,
     ) {
         // A slow source must not replace a newer guest selection or host copy.
-        if self.guest_clipboard_generation.load(Ordering::Relaxed) != generation
-            || unsafe { objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() }
-                != pasteboard_change_count
-        {
+        let source = HostImageToken {
+            generation,
+            change_count: pasteboard_change_count,
+        };
+        if !source.source_is_current(
+            self.guest_clipboard_generation.load(Ordering::Relaxed),
+            unsafe { objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() },
+        ) {
             return;
         }
         self.host_clipboard_images.replace_pending(None);
@@ -1264,14 +1269,11 @@ impl AppState {
         let byte_count = payload.as_bytes().len();
         match payload {
             ClipboardPayload::Text(text) => {
-                if self.host_clipboard.text.as_deref() == Some(&*text)
-                    && self.host_clipboard.image_png.is_none()
-                {
+                if self.host_clipboard.matches_text_only(&text) {
                     return;
                 }
                 self.pasteboard_change_count = write_to_pasteboard(&text);
-                self.host_clipboard.text = Some(text);
-                self.host_clipboard.image_png = None;
+                self.host_clipboard = HostClipboardContents::from_snapshot(Some(text), None, false);
             }
             ClipboardPayload::Image(image) => {
                 if self.host_clipboard.image_png.as_deref() == Some(&*image)
@@ -1292,8 +1294,8 @@ impl AppState {
                     }
                     self.pasteboard_change_count = pb.changeCount();
                 }
-                self.host_clipboard.text = None;
-                self.host_clipboard.image_png = Some(image);
+                self.host_clipboard =
+                    HostClipboardContents::from_snapshot(None, Some(image), false);
             }
         }
         crate::diagnostics::record_clipboard_guest_install(byte_count);

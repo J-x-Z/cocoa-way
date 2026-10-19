@@ -12,10 +12,12 @@ pub struct HostImageToken {
 }
 
 impl HostImageToken {
+    pub fn source_is_current(self, generation: u64, live_count: isize) -> bool {
+        self.generation == generation && self.change_count == live_count
+    }
+
     pub fn is_current(self, generation: u64, cached_count: isize, live_count: isize) -> bool {
-        self.generation == generation
-            && self.change_count == cached_count
-            && self.change_count == live_count
+        self.source_is_current(generation, live_count) && self.change_count == cached_count
     }
 }
 
@@ -30,9 +32,28 @@ pub struct HostImageCompletion {
 pub struct HostClipboardContents {
     pub text: Option<Arc<str>>,
     pub image_png: Option<Arc<[u8]>>,
+    // Worker cancellation or failure does not remove native image representations.
+    text_only: bool,
 }
 
 impl HostClipboardContents {
+    /// Unresolved native images remain present even after their worker is gone.
+    pub fn from_snapshot(
+        text: Option<Arc<str>>,
+        image_png: Option<Arc<[u8]>>,
+        image_unresolved: bool,
+    ) -> Self {
+        Self {
+            text_only: image_png.is_none() && !image_unresolved,
+            text,
+            image_png,
+        }
+    }
+
+    pub fn matches_text_only(&self, text: &str) -> bool {
+        self.text_only && self.image_png.is_none() && self.text.as_deref() == Some(text)
+    }
+
     /// Delayed images augment, never replace, the text from the same snapshot.
     pub fn merge_image(
         &mut self,
@@ -343,6 +364,7 @@ mod tests {
             let mut contents = HostClipboardContents {
                 text: Some(Arc::from("new selection")),
                 image_png: Some(Arc::from(&b"new png"[..])),
+                ..HostClipboardContents::default()
             };
             assert!(
                 !contents
@@ -369,6 +391,7 @@ mod tests {
         let mut contents = HostClipboardContents {
             text: Some(text.clone()),
             image_png: None,
+            ..HostClipboardContents::default()
         };
         assert!(
             contents
@@ -398,6 +421,120 @@ mod tests {
             result: Err("obsolete".into()),
         };
         assert!(!contents.merge_image(stale_failure, 8, 23, 23).unwrap());
+    }
+
+    #[test]
+    fn cancelled_pending_tiff_does_not_dedupe_same_guest_text() {
+        let token = image_token(7, 23);
+        for in_flight in [false, true] {
+            let mut contents =
+                HostClipboardContents::from_snapshot(Some(Arc::from("T")), None, true);
+            let (mut worker, wakes) = image_test_worker();
+            let mut requests = PendingHostImageRequests::default();
+            worker.replace_pending(Some((token, Box::from(&b"tiff"[..]))));
+            requests.reset(Some(token));
+            let (release, gate) = std::sync::mpsc::channel();
+            if in_flight {
+                worker
+                    .start_pending(move |_| {
+                        gate.recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                        Ok(Some(Arc::from(&b"png"[..])))
+                    })
+                    .unwrap();
+                assert!(worker.pending_token().is_none());
+            }
+
+            // new_selection cancels both tokens before install_guest_clipboard runs.
+            worker.replace_pending(None);
+            requests.reset(None);
+            assert_eq!(worker.has_work(), in_flight);
+            assert!(worker.pending_token().is_none());
+            assert!(requests.token().is_none());
+            assert!(!contents.matches_text_only("T"));
+            if in_flight {
+                release.send(()).unwrap();
+                wakes
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert!(
+                    !contents
+                        .merge_image(worker.poll().unwrap(), 8, 23, 23)
+                        .unwrap()
+                );
+                assert!(!worker.has_work());
+                assert!(!contents.matches_text_only("T"));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_or_empty_conversion_does_not_prove_same_text_is_text_only() {
+        let token = image_token(7, 23);
+        for result in [Err("decode failed".into()), Ok(None)] {
+            let mut contents =
+                HostClipboardContents::from_snapshot(Some(Arc::from("T")), None, true);
+            let _ = contents.merge_image(HostImageCompletion { token, result }, 7, 23, 23);
+            assert_eq!(contents.text.as_deref(), Some("T"));
+            assert!(contents.image_png.is_none());
+            assert!(!contents.matches_text_only("T"));
+        }
+    }
+
+    #[test]
+    fn stale_conversion_does_not_enable_same_text_dedupe() {
+        let token = image_token(7, 23);
+        for (generation, cached, live) in [(8, 23, 23), (7, 24, 23), (7, 23, 24)] {
+            for result in [Ok(Some(Arc::from(&b"png"[..]))), Err("obsolete".into())] {
+                let mut contents =
+                    HostClipboardContents::from_snapshot(Some(Arc::from("T")), None, true);
+                assert!(
+                    !contents
+                        .merge_image(
+                            HostImageCompletion { token, result },
+                            generation,
+                            cached,
+                            live
+                        )
+                        .unwrap()
+                );
+                assert!(contents.image_png.is_none());
+                assert!(!contents.matches_text_only("T"));
+            }
+        }
+    }
+
+    #[test]
+    fn completed_text_only_snapshot_and_guest_install_keep_dedupe() {
+        let text: Arc<str> = Arc::from("T");
+        let mut contents = HostClipboardContents::from_snapshot(Some(text.clone()), None, false);
+        assert!(contents.matches_text_only("T"));
+        assert!(!contents.matches_text_only("different"));
+
+        contents = HostClipboardContents::from_snapshot(Some(text.clone()), None, true);
+        assert!(!contents.matches_text_only("T"));
+        // A successful guest text write clears the native TIFF, proving text-only.
+        contents = HostClipboardContents::from_snapshot(Some(text.clone()), None, false);
+        assert!(contents.matches_text_only("T"));
+
+        contents =
+            HostClipboardContents::from_snapshot(Some(text), Some(Arc::from(&b"png"[..])), false);
+        assert!(!contents.matches_text_only("T"));
+        assert!(!HostClipboardContents::default().matches_text_only(""));
+    }
+
+    #[test]
+    fn guest_source_change_guard_rejects_stale_text_before_dedupe_or_install() {
+        let source = image_token(7, 23);
+        for image_unresolved in [false, true] {
+            let contents =
+                HostClipboardContents::from_snapshot(Some(Arc::from("T")), None, image_unresolved);
+            for (generation, live) in [(8, 23), (7, 24), (8, 24)] {
+                assert!(!source.source_is_current(generation, live));
+            }
+            assert!(source.source_is_current(7, 23));
+            assert_eq!(contents.matches_text_only("T"), !image_unresolved);
+        }
     }
 
     fn image_test_worker() -> (HostImageWorker, std::sync::mpsc::Receiver<()>) {
