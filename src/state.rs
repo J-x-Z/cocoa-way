@@ -1292,6 +1292,10 @@ impl CompositorHandler for AppState {
         // No-op: pre-commit hook logging removed to avoid 60fps log spam
     }
     fn commit(&mut self, surface: &WlSurface) {
+        let commit_arrived_at = self
+            .latency_trace
+            .enabled()
+            .then(crate::latency_trace::now_ns);
         if let Some(callbacks) = self.native_cursor.committed(surface) {
             self.cursor_frame_callbacks.extend(callbacks);
             self.commit_counter = self.commit_counter.saturating_add(1);
@@ -1303,7 +1307,7 @@ impl CompositorHandler for AppState {
         // Resolve the owner before walking the tree. Smithay holds its surface-tree
         // mutex during traversal, so calling get_parent from the visitor deadlocks.
         let root_surface = self.root_toplevel_id_for_surface(surface);
-        let trace_commit = if self.latency_trace.enabled() {
+        let trace_commit = if let Some(commit_arrived_at) = commit_arrived_at {
             let id = crate::latency_trace::next_id();
             let surface_id = format!("{:?}", surface.id());
             let (probe_marker, commit_flags) =
@@ -1315,17 +1319,15 @@ impl CompositorHandler for AppState {
                         | (u64::from(!current.frame_callbacks.is_empty()) << 2);
                     let marker = match current.buffer.as_ref() {
                         Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buffer)) => {
-                            crate::render::with_buffer_pixels(buffer, |width, _, _, pixels, _| {
-                                crate::probe_marker::decode(width, pixels)
-                            })
-                            .flatten()
+                            crate::render::read_buffer_probe_marker(buffer)
                         }
                         _ => None,
                     };
                     (marker, flags)
                 });
-            self.latency_trace.record(
+            self.latency_trace.record_at_ns(
                 crate::latency_trace::Stage::SurfaceCommit,
+                commit_arrived_at,
                 crate::latency_trace::Tags {
                     correlation_id: Some(crate::latency_trace::Tag::U64(id)),
                     probe_marker,

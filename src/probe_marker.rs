@@ -1,11 +1,17 @@
 //! Decode only the explicit audit client's opaque SHM marker. Not a protocol.
 
+pub(crate) const PIXEL_COUNT: usize = 40;
+pub(crate) const PIXEL_BYTES: usize = PIXEL_COUNT * 4;
+
 pub fn decode(width: i32, bgra: &[u8]) -> Option<[u8; 120]> {
-    if width < 40 || bgra.len() < 160 {
+    if width < PIXEL_COUNT as i32 || bgra.len() < PIXEL_BYTES {
         return None;
     }
     let mut bytes = [0_u8; 120];
-    for (pixel, output) in bgra[..160].chunks_exact(4).zip(bytes.chunks_exact_mut(3)) {
+    for (pixel, output) in bgra[..PIXEL_BYTES]
+        .chunks_exact(4)
+        .zip(bytes.chunks_exact_mut(3))
+    {
         if pixel[3] != 255 {
             return None;
         }
@@ -38,5 +44,29 @@ mod tests {
         assert!(decode(39, &pixels).is_none());
         assert!(decode(40, &pixels[..159]).is_none());
         assert!(decode(40, &[0; 160]).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_malformed_headers_and_ignores_trailing_pixels() {
+        let mut marker = [0; 120];
+        marker[..4].copy_from_slice(b"CWIP");
+        marker[4] = 1;
+        marker[6] = 120;
+        let pixels: Vec<_> = marker
+            .chunks_exact(3)
+            .flat_map(|rgb| [rgb[2], rgb[1], rgb[0], 255])
+            .chain([0; 16])
+            .collect();
+        assert_eq!(decode(44, &pixels), Some(marker));
+        for index in [0, 4, 6] {
+            let mut invalid = marker;
+            invalid[index] ^= 1;
+            let pixels: Vec<_> = invalid
+                .chunks_exact(3)
+                .flat_map(|rgb| [rgb[2], rgb[1], rgb[0], 255])
+                .collect();
+            assert!(decode(40, &pixels).is_none());
+        }
+        assert!(decode(-1, &pixels).is_none());
     }
 }

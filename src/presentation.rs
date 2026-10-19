@@ -652,14 +652,6 @@ fn buffer_damage_rects(
     if damage.is_empty() {
         return Vec::new();
     }
-    if transform != Transform::Normal || has_viewport {
-        return vec![crate::metal_renderer::BufferDamage {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        }];
-    }
     damage
         .iter()
         .map(|damage| match damage {
@@ -669,6 +661,14 @@ fn buffer_damage_rects(
                 width: rect.size.w,
                 height: rect.size.h,
             },
+            Damage::Surface(_) if transform != Transform::Normal || has_viewport => {
+                crate::metal_renderer::BufferDamage {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }
+            }
             Damage::Surface(rect) => crate::metal_renderer::BufferDamage {
                 x: rect.loc.x.saturating_mul(buffer_scale),
                 y: rect.loc.y.saturating_mul(buffer_scale),
@@ -1506,6 +1506,89 @@ mod tests {
                 height: 100
             }]
         );
+    }
+
+    #[test]
+    fn buffer_damage_keeps_buffer_coordinates_with_every_transform_and_viewport() {
+        use crate::metal_renderer::BufferDamage;
+
+        let damage = [Damage::Buffer(Rectangle::new(
+            (-2, 7).into(),
+            (3, 4).into(),
+        ))];
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            for has_viewport in [false, true] {
+                assert_eq!(
+                    super::buffer_damage_rects(&damage, 200, 100, 2, transform, has_viewport),
+                    vec![BufferDamage {
+                        x: -2,
+                        y: 7,
+                        width: 3,
+                        height: 4,
+                    }],
+                    "{transform:?}, viewport={has_viewport}",
+                );
+                assert!(
+                    super::buffer_damage_rects(&[], 200, 100, 2, transform, has_viewport)
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_damage_only_converts_surface_coordinates() {
+        use crate::metal_renderer::BufferDamage;
+
+        let damage = [
+            Damage::Buffer(Rectangle::new((1, 2).into(), (3, 4).into())),
+            Damage::Surface(Rectangle::new((5, 6).into(), (7, 8).into())),
+        ];
+        let buffer = BufferDamage {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        assert_eq!(
+            super::buffer_damage_rects(&damage, 200, 100, 2, Transform::Normal, false),
+            vec![
+                buffer,
+                BufferDamage {
+                    x: 10,
+                    y: 12,
+                    width: 14,
+                    height: 16,
+                },
+            ]
+        );
+        for (transform, viewport) in [
+            (Transform::_90, false),
+            (Transform::Normal, true),
+            (Transform::Flipped270, true),
+        ] {
+            assert_eq!(
+                super::buffer_damage_rects(&damage, 200, 100, 2, transform, viewport),
+                vec![
+                    buffer,
+                    BufferDamage {
+                        x: 0,
+                        y: 0,
+                        width: 200,
+                        height: 100,
+                    },
+                ]
+            );
+        }
     }
 
     #[test]

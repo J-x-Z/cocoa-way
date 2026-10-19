@@ -921,10 +921,12 @@ fn guest_relay_perl() -> &'static str {
 use strict;
 use warnings;
 use IO::Socket::UNIX;
-use IO::Select;
+use IO::Poll qw(POLLIN POLLOUT POLLHUP POLLERR POLLNVAL);
 use File::Path qw(make_path);
-use IO::Handle;
 use POSIX qw(WNOHANG);
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR);
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
 my $sock_path = shift @ARGV;
 my $dir = $sock_path;
 $dir =~ s{/[^/]+$}{};
@@ -935,94 +937,281 @@ my $server = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $sock_path, Lis
 my $pid = fork();
 die "fork: $!\n" unless defined $pid;
 if ($pid == 0) {
+  # The command must not consume framed stdin or mix diagnostics into stdout.
+  # Separate these before the relay makes its transport descriptors nonblocking.
+  open STDIN, '<', '/dev/null' or die "command stdin: $!\n";
+  open STDOUT, '>&', \*STDERR or die "command stdout: $!\n";
   exec @ARGV;
   die "exec @ARGV: $!\n";
 }
 binmode STDIN;
 binmode STDOUT;
-my $sel = IO::Select->new(\*STDIN, $server);
+$SIG{PIPE} = 'IGNORE';
+my $chunk_size = 65536;
+my $peer_limit = 256 * 1024;
+my $input_limit = 4 * 1024 * 1024;
+my $output_limit = 256 * 1024;
+my $chunks_limit = 256;
+my $max_peers = 128;
+my $deadline = 10;
 my %peers;
 my %peer_ids;
 my $next_id = 1;
-my $input = '';
+my @output;
+my ($output_bytes, $input_bytes) = (0, 0);
+my $header = '';
+my ($incoming_kind, $incoming_id, $incoming_left, $frame_started);
+my ($transport_eof, $child_exited, $exit_code, $read_cursor) = (0, 0, 0, 0);
+my $test_stats = exists $ENV{COCOA_WAY_RELAY_TEST_STATS};
+my %stats = map { $_ => 0 } qw(output_high input_high peer_high output_chunks_high peer_chunks_high
+  input_pauses output_pauses partial_writes write_eagain);
 
-sub write_all {
-  my ($fh, $data) = @_;
-  my $offset = 0;
-  while ($offset < length($data)) {
-    my $written = syswrite($fh, $data, length($data) - $offset, $offset);
-    return 0 unless defined $written && $written > 0;
-    $offset += $written;
-  }
-  return 1;
+sub now { clock_gettime(CLOCK_MONOTONIC) }
+sub nonblocking {
+  my ($fh) = @_;
+  my $flags = fcntl($fh, F_GETFL, 0);
+  die "get relay flags: $!\n" unless defined $flags;
+  die "set nonblocking: $!\n" unless defined fcntl($fh, F_SETFL, $flags | O_NONBLOCK);
 }
+nonblocking(\*STDIN);
+nonblocking(\*STDOUT);
+nonblocking($server);
 
 sub send_frame {
   my ($kind, $id, $data) = @_;
   $data = '' unless defined $data;
-  return write_all(\*STDOUT, pack('CNN', $kind, $id, length($data)) . $data);
+  my $frame = pack('CNN', $kind, $id, length($data)) . $data;
+  die "transport output limit exceeded\n" if $output_bytes + length($frame) > $output_limit || @output >= $chunks_limit;
+  push @output, [$frame, 0, now()];
+  $output_bytes += length($frame);
+  $stats{output_high} = $output_bytes if $test_stats && $output_bytes > $stats{output_high};
+  $stats{output_chunks_high} = @output if $test_stats && @output > $stats{output_chunks_high};
 }
 
-sub close_peer {
-  my ($id, $notify) = @_;
-  my $peer = delete $peers{$id};
-  return unless $peer;
-  delete $peer_ids{fileno($peer)};
-  $sel->remove($peer);
-  close $peer;
-  send_frame(3, $id, '') if $notify;
+sub closing_peer {
+  my ($id, $notify, $discard) = @_;
+  my $p = $peers{$id} or return;
+  $p->{closing} = 1;
+  $p->{notify} ||= $notify;
+  if ($discard) {
+    $input_bytes -= $p->{bytes};
+    $p->{bytes} = 0;
+    $p->{queue} = [];
+  }
 }
 
-while (1) {
-  last if waitpid($pid, WNOHANG) == $pid;
-  my @ready = $sel->can_read(0.25);
+sub retry_io {
+  return 0 if defined $_[0];
+  return 1 if $! == EINTR;
+  if ($! == EAGAIN || $! == EWOULDBLOCK) {
+    $stats{write_eagain}++ if $test_stats && $_[1];
+    return 1;
+  }
+  return 0;
+}
+
+# Charge whole retained allocations until completion, including short writes.
+sub write_queue {
+  my ($fh, $queue) = @_;
+  my $chunk = $queue->[0];
+  my $size = length($chunk->[0]) - $chunk->[1];
+  $size = $chunk_size if $size > $chunk_size;
+  my $n = syswrite($fh, $chunk->[0], $size, $chunk->[1]);
+  return 0 if retry_io($n, 1);
+  return undef unless defined $n && $n > 0;
+  $stats{partial_writes}++ if $test_stats && $n < $size;
+  $chunk->[1] += $n;
+  return 0 unless $chunk->[1] == length($chunk->[0]);
+  shift @$queue;
+  return length($chunk->[0]);
+}
+
+RELAY: while (1) {
+  if (!$child_exited && waitpid($pid, WNOHANG) == $pid) {
+    $child_exited = 1;
+    closing_peer($_, 1, 0) for keys %peers;
+  }
+  for my $id (sort { $a <=> $b } keys %peers) {
+    my $p = $peers{$id};
+    next unless $p->{closing} && !$p->{bytes};
+    next if $p->{notify} && ($output_bytes + 9 > $output_limit || @output >= $chunks_limit);
+    send_frame(3, $id, '') if $p->{notify};
+    delete $peer_ids{fileno($p->{fh})};
+    close $p->{fh};
+    delete $peers{$id};
+  }
+  last RELAY if ($transport_eof || $child_exited) && !$input_bytes && !$output_bytes;
+
+  my @expires;
+  push @expires, $frame_started + $deadline if defined $frame_started;
+  push @expires, $output[0][2] + $deadline if @output;
+  for my $p (values %peers) {
+    push @expires, $p->{queue}[0][2] + $deadline if @{$p->{queue}};
+  }
+  my $wait = 0.25;
+  for my $expires (@expires) {
+    my $remaining = $expires - now();
+    if ($remaining <= 0) {
+      print STDERR "stdio relay queue/frame deadline exceeded\n";
+      $exit_code = 1;
+      last RELAY;
+    }
+    $wait = $remaining if $remaining < $wait;
+  }
+  my $poll = IO::Poll->new();
+  $poll->mask(\*STDOUT => (@output ? POLLOUT : 0) | POLLHUP | POLLERR);
+  if (!$transport_eof && !$child_exited) {
+    # Residual HOL: a full current peer pauses this byte lane, including later
+    # frames for other peers. Never skip/reorder DATA to get around that pause.
+    my $p = defined $incoming_kind && $incoming_kind == 2 ? $peers{$incoming_id} : undef;
+    my $can_read = !$p || $p->{closing} || ($p->{bytes} < $peer_limit && $input_bytes < $input_limit
+      && @{$p->{queue}} < $chunks_limit);
+    $poll->mask(\*STDIN => POLLIN) if $can_read;
+    $stats{input_pauses}++ if $test_stats && !$can_read;
+    $poll->mask($server => POLLIN) if keys(%peers) < $max_peers && $output_bytes + 9 <= $output_limit
+      && @output < $chunks_limit;
+  }
+  for my $p (values %peers) {
+    my $events = $p->{bytes} ? POLLOUT : 0;
+    if (!$p->{closing} && !$transport_eof && !$child_exited) {
+      if ($output_bytes + $chunk_size + 9 <= $output_limit && @output < $chunks_limit) {
+        $events |= POLLIN;
+      } else {
+        $stats{output_pauses}++ if $test_stats;
+      }
+    }
+    $poll->mask($p->{fh} => $events) if $events;
+  }
+  my $ready = $poll->poll($wait);
+  next RELAY if $ready < 0 && $! == EINTR;
+  if ($ready < 0 || $poll->events(\*STDOUT) & (POLLHUP | POLLERR | POLLNVAL)) {
+    $exit_code = 1;
+    last RELAY;
+  }
+  for my $fh ($poll->handles(POLLOUT)) {
+    if ($fh == \*STDOUT) {
+      my $released = write_queue($fh, \@output);
+      if (!defined $released) { $exit_code = 1; last RELAY; }
+      $output_bytes -= $released;
+    } else {
+      my $id = $peer_ids{fileno($fh)};
+      my $p = $peers{$id} or next;
+      my $released = write_queue($fh, $p->{queue});
+      if (!defined $released) { closing_peer($id, 1, 1); next; }
+      $p->{bytes} -= $released;
+      $input_bytes -= $released;
+    }
+  }
+  my @ready = sort {
+    (($peer_ids{fileno($a)} // 0) - $read_cursor) % $next_id
+      <=> (($peer_ids{fileno($b)} // 0) - $read_cursor) % $next_id
+  } $poll->handles(POLLIN | POLLHUP | POLLERR | POLLNVAL);
   for my $fh (@ready) {
+    next if $fh == \*STDOUT;
     if ($fh == $server) {
+      next if keys(%peers) >= $max_peers || $output_bytes + 9 > $output_limit || @output >= $chunks_limit;
       my $peer = $server->accept();
       next unless $peer;
       binmode $peer;
+      nonblocking($peer);
       my $id = $next_id++;
-      $peers{$id} = $peer;
+      $peers{$id} = { fh => $peer, queue => [], bytes => 0, closing => 0, notify => 0 };
       $peer_ids{fileno($peer)} = $id;
-      $sel->add($peer);
-      send_frame(1, $id, '') or exit 1;
+      send_frame(1, $id, '');
       next;
     }
 
     if ($fh == \*STDIN) {
-      my $chunk = '';
-      my $n = sysread(STDIN, $chunk, 65536);
-      exit 0 unless defined $n && $n > 0;
-      $input .= $chunk;
-      while (length($input) >= 9) {
-        my ($kind, $id, $length) = unpack('CNN', substr($input, 0, 9));
-        die "relay frame too large\n" if $length > 16 * 1024 * 1024;
-        last if length($input) < 9 + $length;
-        substr($input, 0, 9, '');
-        my $data = substr($input, 0, $length, '');
-        if ($kind == 2 && exists $peers{$id}) {
-          close_peer($id, 1) unless write_all($peers{$id}, $data);
-        } elsif ($kind == 3) {
-          close_peer($id, 0);
+      my $size = defined $incoming_kind ? $incoming_left : 9 - length($header);
+      $size = $chunk_size if $size > $chunk_size;
+      my $p = defined $incoming_kind && $incoming_kind == 2 ? $peers{$incoming_id} : undef;
+      $p = undef if $p && $p->{closing};
+      if ($p) {
+        my $space = $peer_limit - $p->{bytes};
+        $space = $input_limit - $input_bytes if $input_limit - $input_bytes < $space;
+        $size = $space if $space < $size;
+        next if !$size || @{$p->{queue}} >= $chunks_limit;
+      }
+      my $data = '';
+      my $n = sysread(STDIN, $data, $size);
+      next if retry_io($n, 0);
+      if (!defined $n || $n == 0) {
+        if (!defined $n || length($header) || defined $incoming_kind) {
+          print STDERR "truncated or failed stdio relay frame\n";
+          $exit_code = 1;
+          last RELAY;
         }
+        $transport_eof = 1;
+        closing_peer($_, 0, 0) for keys %peers;
+        next;
+      }
+      if (!defined $incoming_kind) {
+        $frame_started = now() unless defined $frame_started;
+        $header .= $data;
+        next unless length($header) == 9;
+        ($incoming_kind, $incoming_id, $incoming_left) = unpack('CNN', $header);
+        $header = '';
+        if ($incoming_left > 16 * 1024 * 1024 || ($incoming_kind != 2 && $incoming_kind != 3)
+            || ($incoming_kind == 3 && $incoming_left != 0)) {
+          print STDERR "invalid stdio relay frame header\n";
+          $exit_code = 1;
+          last RELAY;
+        }
+        closing_peer($incoming_id, 0, 0) if $incoming_kind == 3;
+      } else {
+        if ($p) {
+          # Copy the actual bytes, not a short sysread's requested-size buffer.
+          push @{$p->{queue}}, [pack('a*', $data), 0, now()];
+          $p->{bytes} += $n;
+          $input_bytes += $n;
+          $stats{peer_high} = $p->{bytes} if $test_stats && $p->{bytes} > $stats{peer_high};
+          $stats{input_high} = $input_bytes if $test_stats && $input_bytes > $stats{input_high};
+          $stats{peer_chunks_high} = @{$p->{queue}} if $test_stats && @{$p->{queue}} > $stats{peer_chunks_high};
+        }
+        $incoming_left -= $n;
+      }
+      unless ($incoming_left) {
+        ($incoming_kind, $incoming_id, $incoming_left, $frame_started) = (undef, undef, undef, undef);
       }
       next;
     }
 
     my $id = $peer_ids{fileno($fh)};
+    my $p = $peers{$id} or next;
+    next if $p->{closing} || $output_bytes + $chunk_size + 9 > $output_limit || @output >= $chunks_limit;
+    $read_cursor = $id + 1;
     my $data = '';
-    my $n = sysread($fh, $data, 65536);
+    my $n = sysread($fh, $data, $chunk_size);
+    next if retry_io($n, 0);
     if (!defined $n || $n == 0) {
-      close_peer($id, 1);
+      closing_peer($id, 1, 0);
     } else {
-      send_frame(2, $id, $data) or exit 1;
+      send_frame(2, $id, $data);
     }
   }
 }
 for my $id (keys %peers) {
-  close_peer($id, 1);
+  close $peers{$id}{fh};
 }
-waitpid($pid, 0);
+unless ($child_exited) {
+  kill 'TERM', $pid;
+  my $until = now() + 0.2;
+  while (waitpid($pid, WNOHANG) == 0 && now() < $until) {
+    select undef, undef, undef, 0.005;
+  }
+  # Only the relay's own child is signalled; outer owner-checked cleanup stays
+  # responsible for the container. Never block here on an uncooperative child.
+  if (waitpid($pid, WNOHANG) == 0) {
+    kill 'KILL', $pid;
+    $until = now() + 0.2;
+    while (waitpid($pid, WNOHANG) == 0 && now() < $until) {
+      select undef, undef, undef, 0.005;
+    }
+  }
+}
+unlink $sock_path;
+print STDERR "cocoa-way stdio relay stats: ", join(' ', map { "$_=$stats{$_}" } sort keys %stats), "\n" if $test_stats;
+exit $exit_code;
 "#
 }
 

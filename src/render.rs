@@ -74,6 +74,48 @@ pub fn with_buffer_pixels<T>(
     ))
 }
 
+/// Read only the audit marker's first-row prefix, without a full-image snapshot.
+pub fn read_buffer_probe_marker(buffer: &WlBuffer) -> Option<[u8; 120]> {
+    let (data, pixels) = with_buffer_contents(buffer, |ptr, len, data| {
+        // SAFETY: Only the fixed raw copy touches SHM, inside its mapping/SIGBUS guard.
+        let pixels = unsafe { snapshot_probe_pixels(ptr, len, data) }?;
+        Some((data, pixels))
+    })
+    .ok()??;
+    decode_probe_pixels(data, pixels)
+}
+
+// Convert only owned marker bytes after the SHM guard has returned successfully.
+fn decode_probe_pixels(
+    data: BufferData,
+    mut pixels: [u8; crate::probe_marker::PIXEL_BYTES],
+) -> Option<[u8; 120]> {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let bgra = pixel_to_bgra(data.format, pixel)?;
+        pixel.copy_from_slice(&bgra);
+    }
+    crate::probe_marker::decode(data.width, &pixels)
+}
+
+/// # Safety
+/// `ptr` must address `pool_len` mapped bytes, with SHM calls inside Smithay's guard.
+unsafe fn snapshot_probe_pixels(
+    ptr: *const u8,
+    pool_len: usize,
+    data: BufferData,
+) -> Option<[u8; crate::probe_marker::PIXEL_BYTES]> {
+    shm_format_alpha(data.format)?;
+    if ptr.is_null() || data.width < crate::probe_marker::PIXEL_COUNT as i32 {
+        return None;
+    }
+    let layout = PixelLayout::for_buffer(pool_len, data)?;
+    let mut pixels = [0; crate::probe_marker::PIXEL_BYTES];
+    unsafe {
+        std::ptr::copy_nonoverlapping(ptr.add(layout.offset), pixels.as_mut_ptr(), pixels.len());
+    }
+    Some(pixels)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PixelLayout {
     offset: usize,
@@ -84,6 +126,16 @@ struct PixelLayout {
 }
 
 impl PixelLayout {
+    fn for_buffer(pool_len: usize, data: BufferData) -> Option<Self> {
+        Self::new(
+            pool_len,
+            usize::try_from(data.offset).ok()?,
+            usize::try_from(data.width).ok()?,
+            usize::try_from(data.height).ok()?,
+            usize::try_from(data.stride).ok()?,
+        )
+    }
+
     fn new(
         pool_len: usize,
         offset: usize,
@@ -125,13 +177,7 @@ unsafe fn snapshot_pool_pixels(
     pixels: &mut Vec<u8>,
 ) -> Option<PixelLayout> {
     shm_format_alpha(data.format)?;
-    let layout = PixelLayout::new(
-        pool_len,
-        usize::try_from(data.offset).ok()?,
-        usize::try_from(data.width).ok()?,
-        usize::try_from(data.height).ok()?,
-        usize::try_from(data.stride).ok()?,
-    )?;
+    let layout = PixelLayout::for_buffer(pool_len, data)?;
     if ptr.is_null() {
         return None;
     }
@@ -223,6 +269,135 @@ mod tests {
     fn snapshot_into(pool: &[u8], data: BufferData, pixels: &mut Vec<u8>) -> Option<PixelLayout> {
         // SAFETY: Tests use initialized host memory, disjoint from the destination.
         unsafe { snapshot_pool_pixels(pool.as_ptr(), pool.len(), data, pixels) }
+    }
+
+    fn probe_fixture(format: Format) -> (BufferData, Vec<u8>, [u8; 120]) {
+        let data = BufferData {
+            offset: 7,
+            width: 44,
+            height: 2,
+            stride: 192,
+            format,
+        };
+        let mut marker = std::array::from_fn(|i| i as u8);
+        marker[..4].copy_from_slice(b"CWIP");
+        marker[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        marker[6..8].copy_from_slice(&120_u16.to_le_bytes());
+        let mut pool = vec![0xEE; data.offset as usize + data.stride as usize + 44 * 4];
+        let alpha = if shm_format_alpha(format) == Some(TextureAlpha::Opaque) {
+            17 // Opaque formats must ignore the unused X channel.
+        } else {
+            255
+        };
+        for (index, rgb) in marker.chunks_exact(3).enumerate() {
+            let [r, g, b] = [rgb[0], rgb[1], rgb[2]];
+            let pixel = match format {
+                Format::Argb8888 | Format::Xrgb8888 => [b, g, r, alpha],
+                Format::Abgr8888 | Format::Xbgr8888 => [r, g, b, alpha],
+                Format::Rgba8888 | Format::Rgbx8888 => [alpha, b, g, r],
+                Format::Bgra8888 | Format::Bgrx8888 => [alpha, r, g, b],
+                _ => panic!("unsupported test format"),
+            };
+            let start = data.offset as usize + index * 4;
+            pool[start..start + 4].copy_from_slice(&pixel);
+        }
+        (data, pool, marker)
+    }
+
+    #[test]
+    fn probe_prefix_is_bounded_owned_and_correct_for_all_supported_formats() {
+        for format in [
+            Format::Argb8888,
+            Format::Xrgb8888,
+            Format::Abgr8888,
+            Format::Xbgr8888,
+            Format::Rgba8888,
+            Format::Rgbx8888,
+            Format::Bgra8888,
+            Format::Bgrx8888,
+        ] {
+            let (data, mut pool, marker) = probe_fixture(format);
+            // SAFETY: The source is initialized host storage, not client SHM.
+            let pixels = unsafe { snapshot_probe_pixels(pool.as_ptr(), pool.len(), data) }.unwrap();
+            assert_eq!(pixels.len(), 160);
+            assert_eq!(&pixels, &pool[7..167]);
+            pool.fill(0);
+            assert_eq!(
+                decode_probe_pixels(data, pixels),
+                Some(marker),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_prefix_rejects_nonopaque_alpha_pixels() {
+        for format in [
+            Format::Argb8888,
+            Format::Abgr8888,
+            Format::Rgba8888,
+            Format::Bgra8888,
+        ] {
+            let (data, pool, _) = probe_fixture(format);
+            // SAFETY: The source is initialized host storage, not client SHM.
+            let mut pixels =
+                unsafe { snapshot_probe_pixels(pool.as_ptr(), pool.len(), data) }.unwrap();
+            let alpha = match format {
+                Format::Argb8888 | Format::Abgr8888 => 159,
+                _ => 156,
+            };
+            pixels[alpha] = 254;
+            assert!(decode_probe_pixels(data, pixels).is_none(), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn probe_prefix_rejects_invalid_or_truncated_buffer_layouts() {
+        let (data, pool, _) = probe_fixture(Format::Argb8888);
+        for invalid in [
+            BufferData { offset: -1, ..data },
+            BufferData { width: -1, ..data },
+            BufferData { width: 39, ..data },
+            BufferData { height: 0, ..data },
+            BufferData { height: -1, ..data },
+            BufferData { stride: -1, ..data },
+            BufferData {
+                stride: 175,
+                ..data
+            },
+            BufferData {
+                offset: i32::MAX,
+                ..data
+            },
+            BufferData {
+                height: i32::MAX,
+                ..data
+            },
+            BufferData {
+                width: i32::MAX,
+                stride: i32::MAX,
+                ..data
+            },
+            BufferData {
+                format: Format::Rgb565,
+                ..data
+            },
+        ] {
+            // SAFETY: Invalid metadata is rejected before any source read.
+            assert!(unsafe { snapshot_probe_pixels(pool.as_ptr(), pool.len(), invalid) }.is_none());
+        }
+        // A readable prefix does not excuse an invalid complete buffer extent.
+        assert!(unsafe { snapshot_probe_pixels(pool.as_ptr(), 167, data) }.is_none());
+        assert!(unsafe { snapshot_probe_pixels(std::ptr::null(), pool.len(), data) }.is_none());
+        let one_row = BufferData {
+            offset: 0,
+            width: 40,
+            height: 1,
+            stride: 160,
+            ..data
+        };
+        assert!(unsafe { snapshot_probe_pixels(pool.as_ptr(), 159, one_row) }.is_none());
+        assert!(unsafe { snapshot_probe_pixels(pool.as_ptr(), 160, one_row) }.is_some());
     }
 
     #[test]

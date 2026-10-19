@@ -253,6 +253,7 @@ struct Input {
     used: usize,
     remaining: Option<usize>,
     started: Option<Instant>,
+    rejected_open: bool,
 }
 
 impl Input {
@@ -271,10 +272,12 @@ impl Input {
             return true;
         }
         match self.kind() {
+            // A full destination still blocks later frames in this byte lane.
+            // Preserve framing/FIFO; opposite-direction writes remain independent.
             DATA => peers
                 .get(&self.id())
                 .is_none_or(|peer| peer.guest_closed || peer.input.room() > 0),
-            OPEN => output.room() >= HEADER,
+            OPEN => !self.rejected_open || output.room() >= HEADER,
             _ => true,
         }
     }
@@ -319,25 +322,28 @@ impl Input {
         }
         match kind {
             OPEN => {
+                if !self.rejected_open {
+                    if peers.contains_key(&id) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "duplicate relay stream id",
+                        ));
+                    }
+                    if peers.len() < limits.peers {
+                        if let Ok(peer) = connect(path, limits) {
+                            peers.insert(id, peer);
+                            self.reset();
+                            return Ok(true);
+                        }
+                    }
+                    // Only a rejected OPEN needs return-lane capacity. Remember
+                    // the decision so a blocked CLOSE does not retry the connect.
+                    self.rejected_open = true;
+                }
                 if output.room() < HEADER {
                     return Ok(true);
                 }
-                if peers.contains_key(&id) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "duplicate relay stream id",
-                    ));
-                }
-                let peer = if peers.len() < limits.peers {
-                    connect(path, limits).ok()
-                } else {
-                    None
-                };
-                if let Some(peer) = peer {
-                    peers.insert(id, peer);
-                } else {
-                    output.push(encoded(CLOSE, id, &[]));
-                }
+                output.push(encoded(CLOSE, id, &[]));
                 self.reset();
             }
             CLOSE => {
@@ -648,6 +654,72 @@ pub fn bridge_with_limits<R: Read + AsRawFd, W: Write + AsRawFd>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_open_does_not_need_output_byte_or_chunk_capacity() {
+        for (byte_limit, chunk_limit) in [(HEADER + 1, 4), (1024, 1)] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let path = directory.path().join("p");
+            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let mut peers = BTreeMap::new();
+            let mut output = Queue::new(byte_limit, chunk_limit);
+            output.push(encoded(DATA, 99, b"x"));
+            assert_eq!(output.room(), 0);
+            let mut input = Input::default();
+            input
+                .read(
+                    &mut encoded(OPEN, 1, &[]).as_slice(),
+                    &mut peers,
+                    &mut output,
+                    path.to_str().unwrap(),
+                    Limits::default(),
+                )
+                .unwrap();
+            assert!(peers.contains_key(&1));
+            assert_eq!(input.used, 0);
+            assert_eq!(output.chunks.len(), 1);
+        }
+    }
+
+    #[test]
+    fn rejected_open_waits_for_close_capacity_without_retrying_connect() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let path = directory.path().join("p");
+        let mut peers = BTreeMap::new();
+        let mut output = Queue::new(1024, 1);
+        output.push(encoded(CLOSE, 99, &[]));
+        let mut input = Input::default();
+        let mut no_more_bytes = io::empty();
+        input
+            .read(
+                &mut encoded(OPEN, 1, &[]).as_slice(),
+                &mut peers,
+                &mut output,
+                "",
+                Limits::default(),
+            )
+            .unwrap();
+        assert!(input.rejected_open);
+        assert!(!input.readable(&peers, &output));
+        output.write(&mut Vec::new()).unwrap();
+        assert!(input.readable(&peers, &output));
+        // Even if a valid listener is now available, rejection is already decided.
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        input
+            .read(
+                &mut no_more_bytes,
+                &mut peers,
+                &mut output,
+                path.to_str().unwrap(),
+                Limits::default(),
+            )
+            .unwrap();
+        assert!(peers.is_empty());
+        let mut bytes = Vec::new();
+        output.write(&mut bytes).unwrap();
+        assert_eq!(bytes, encoded(CLOSE, 1, &[]));
+        assert_eq!(input.used, 0);
+    }
 
     #[test]
     fn idle_poll_has_no_periodic_wakeup() {
