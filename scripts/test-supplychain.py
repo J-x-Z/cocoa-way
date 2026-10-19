@@ -167,11 +167,23 @@ class SourceAndProvenanceTests(unittest.TestCase):
 
     def test_formula_drift_and_fabricated_checksum_fail(self):
         text = (ROOT / "Formula/cocoa-way.rb").read_text()
-        checks.check_formula(text, POLICY, "2.1.0")
+        checks.check_formula(text, POLICY, POLICY["workspace_version"])
         with self.assertRaises(ValueError):
             checks.check_formula(text, POLICY, "2.2.0")
         with self.assertRaises(ValueError):
-            checks.check_formula(text.replace(POLICY["formula"]["sha256"], "0" * 64), POLICY, "2.1.0")
+            checks.check_formula(text.replace(POLICY["formula"]["sha256"], "0" * 64), POLICY, POLICY["workspace_version"])
+
+    def test_formula_can_lag_a_reviewed_candidate_but_never_lead_it(self):
+        text = (ROOT / "Formula/cocoa-way.rb").read_text()
+        policy = copy.deepcopy(POLICY)
+        policy["workspace_version"] = policy["formula"]["version"]
+        checks.check_formula(text, policy, policy["workspace_version"])
+        policy["workspace_version"] = "2.0.9"
+        with self.assertRaisesRegex(ValueError, "newer"):
+            checks.check_formula(text, policy, "2.0.9")
+        policy["workspace_version"] = "2.1.1-rc.1"
+        with self.assertRaisesRegex(ValueError, "Invalid stable"):
+            checks.check_formula(text, policy, "2.1.1-rc.1")
 
     def test_graph_excludes_disconnected_non_macos_nodes_and_checks_consumers(self):
         root = str(ROOT / "Cargo.toml")

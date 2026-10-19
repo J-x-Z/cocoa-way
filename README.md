@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-2.1.0-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
+[![Version](https://img.shields.io/badge/version-2.1.1-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
 [![Build Status](https://github.com/J-x-Z/cocoa-way/actions/workflows/release.yml/badge.svg)](https://github.com/J-x-Z/cocoa-way/actions)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
@@ -30,6 +30,8 @@ Applications are modeled around three objects:
 
 Version 2.1 adds an opt-in interactive desktop background, event-driven Wayland wakeups, display-aware frame pacing, and bounded transport backpressure. It also reduces dependency maintenance with pinned upstream Smithay, a small reproducible patch set, no unused Pixman linkage, and pinned native window bindings. Existing SSH, container, Desktop, and Rootless workflows remain available.
 
+Version 2.1.1 focuses on startup diagnostics, clearer native controls, language settings, bounded client dispatch, and safer application and rendering lifecycles. End-to-end input and display latency remains under investigation; this update does not claim to eliminate it.
+
 ## Demo
 
 ### Cocoa-Way 2.0
@@ -54,7 +56,7 @@ The Niri and DankMaterialShell setup in this video is an optional demo configura
 | Transport | Apple Container Transport V2 over `--publish-socket`, with a compatibility relay fallback |
 | Integration | Bidirectional text and PNG clipboard (images up to 64 MiB), low-latency CoreAudio forwarding, keyboard, pointer, and gestures |
 | Control plane | Native runtime panels, `cocoa-wayctl --json`, diagnostics, tasks, logs, and resource warnings |
-| Automation | Optional read-only MCP server and onboarding skill; launch, stop, and deletion remain explicit user actions |
+| Automation | Read-only-by-default MCP diagnostics and onboarding; optional allowlisted controls, with no resource-deletion tools |
 
 ## Installation
 
@@ -103,7 +105,7 @@ Start Cocoa-Way:
 cocoa-way
 ```
 
-Startup opens the application panel, not an empty compositor window. The Cocoa-Way icon on the right side of the macOS menu bar provides applications, saved connections, displays, environment checks, and diagnostic logs. Closing the panel keeps Cocoa-Way running; use **Quit Cocoa-Way** to exit. A Desktop display opens when a client connects, or through **Show Default Display**. Rootless applications still open their own native windows.
+Startup installs the menu bar controls without opening an application panel or an empty display window. The Cocoa-Way icon on the right side of the macOS menu bar provides applications, saved connections, displays, environment checks, and diagnostic logs. Open the panel from this menu when needed; closing it keeps Cocoa-Way running. Use **Quit Cocoa-Way** to exit. A Desktop display opens when a client connects, or through **New Display Window**. Rootless applications still open their own native windows.
 
 Connect to an SSH host with the compatibility script:
 
@@ -151,6 +153,8 @@ This opt-in placement uses public AppKit APIs and the existing input path. It is
 
 The runtime panels expose system state, machines or contexts, containers, images, logs, terminal access, CPU/memory statistics, and guarded lifecycle actions. Cocoa-Way does not require Docker or OrbStack for Apple Container sessions.
 
+Managed Docker lifecycle actions require a captured local Unix-socket endpoint. Docker image and volume deletion is temporarily disabled until those resources have endpoint-bound identities; use Docker's own tools instead. This prevents a later context switch from redirecting a destructive action.
+
 ### Apple Container transport
 
 When socket publishing is available, Cocoa-Way prefers Transport V2. It publishes a host Unix socket into the container, multiplexes Waypipe streams over that channel, and ties the relay lifetime to the application instance. If publishing is unavailable or fails during startup, it can fall back to the stdio relay. Both paths still need Waypipe to reconstruct cross-system shared memory and file descriptors; publishing a raw Wayland socket alone is not sufficient.
@@ -184,6 +188,9 @@ While Cocoa-Way is running it exposes a private Unix-socket control API. `cocoa-
 cocoa-wayctl --json status
 cocoa-wayctl --json applications
 cocoa-wayctl --json displays
+cocoa-wayctl --json debug-snapshot
+cocoa-wayctl --json performance
+cocoa-wayctl open-panel diagnostics
 cocoa-wayctl diagnostics "Niri Desktop"
 cocoa-wayctl launch "Niri Desktop"
 cocoa-wayctl stop "Niri Desktop"
@@ -191,7 +198,9 @@ cocoa-wayctl display-create "Research Window"
 cocoa-wayctl display-close "Research Window"
 ```
 
-`cocoa-way-mcp` is an optional local stdio adapter. Its tools can inspect the environment, suggest trusted image paths, generate reviewable application/connection templates, collect diagnostics, and prepare issue reports. MCP tools are read-only by design; they cannot silently launch applications or delete containers, images, or volumes.
+`cocoa-way-mcp` is an optional local stdio adapter. By default its tools are read-only: inspect the environment, suggest trusted image paths, generate reviewable application/connection templates, collect diagnostics, and prepare issue drafts without posting them. Cached debug snapshots, per-display performance and cursor-path data, and clipboard metadata help diagnose problems without starting runtime probes or exposing clipboard contents. CPU-submit timing is not screen-presentation timing.
+
+For a trusted local agent, explicitly start `cocoa-way-mcp --allow-control` to also expose panel opening, application check/launch/stop by persistent profile ID, and named display creation/closure. Closing a display or stopping an application can discard unsaved work; queued acceptance does not mean the operation succeeded. Container, image, and volume deletion, arbitrary commands, and configuration writes are never exposed. Do not enable this flag for an untrusted agent.
 
 The bundled `skills/cocoa-way-onboarding` workflow guides new users through image selection and profile creation without replacing explicit GUI confirmation.
 

@@ -70,9 +70,10 @@ jobs:
       - name: Calculate SHA256
         run: shasum -a 256 "Cocoa-Way-${GITHUB_REF_NAME}-arm64-macos.zip" "Cocoa-Way-${GITHUB_REF_NAME}-arm64-macos.dmg" > SHA256SUMS
 
-      - name: Upload Release Assets
+      - name: Upload Draft Release Assets
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          draft: true
           fail_on_unmatched_files: true
           files: |
             Cocoa-Way-${{ github.ref_name }}-arm64-macos.zip

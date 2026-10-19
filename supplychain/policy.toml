@@ -1,4 +1,6 @@
 reviewed = 2026-10-15
+# Reviewed workspace candidate; the Formula below remains a real published archive.
+workspace_version = "2.1.1"
 # Evidence snapshot only. CI fetches CURRENT RustSec data, not this revision.
 rustsec_review_revision = "edb58f5974b83eb8302332821cb6d389777aa351"
 cargo_audit_version = "0.22.2"

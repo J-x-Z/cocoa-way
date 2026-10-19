@@ -153,7 +153,14 @@ def evaluate_audit(report, policy, graphs, today=None):
 
 def check_formula(text, policy, version):
     formula = policy["formula"]
-    require(formula["version"] == version, "Formula/repository version drift; verify a real release before updating")
+    require(policy["workspace_version"] == version, "Unreviewed workspace release version")
+    # A new tag cannot include its own archive hash. Keep the previous verified
+    # Formula until publishing succeeds, then update it from the actual archive.
+    versions = [formula["version"], version]
+    require(all(re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", value)
+                for value in versions), "Invalid stable release version")
+    require(tuple(map(int, formula["version"].split("."))) <= tuple(map(int, version.split("."))),
+            "Published Formula is newer than the reviewed workspace")
     for field in ("url", "sha256"):
         match = re.search(rf'^  {field} "([^"]+)"$', text, re.MULTILINE)
         require(match and match[1] == formula[field], f"Formula {field} differs from verified release")
