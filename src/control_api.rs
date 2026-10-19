@@ -158,16 +158,34 @@ pub fn remove_socket(path: &Path) {
 }
 
 fn handle_connection(
-    mut stream: UnixStream,
+    stream: UnixStream,
     sender: &Sender<CompositorMessage>,
     path: &Path,
     deadline: Instant,
 ) {
-    REQUEST_DEADLINE.with(|budget| budget.set(Some(deadline)));
+    handle_connection_with(stream, sender, path, deadline, dispatch);
+}
+
+fn collection_deadline(deadline: Instant, now: Instant) -> Instant {
+    let remaining = deadline.saturating_duration_since(now);
+    deadline - WRITE_TIMEOUT.min(remaining / 4)
+}
+
+fn handle_connection_with(
+    mut stream: UnixStream,
+    sender: &Sender<CompositorMessage>,
+    path: &Path,
+    deadline: Instant,
+    collect: impl FnOnce(ControlRequest, &Sender<CompositorMessage>, &Path) -> ControlResponse,
+) {
+    // Collection and subprocess cleanup must leave time to return a partial
+    // diagnostic report. The overall I/O deadline is never extended.
+    let collection_deadline = collection_deadline(deadline, Instant::now());
+    REQUEST_DEADLINE.with(|budget| budget.set(Some(collection_deadline)));
     let request = read_frame_before(
         &mut stream,
         MAX_REQUEST_BYTES,
-        deadline.min(Instant::now() + READ_TIMEOUT),
+        collection_deadline.min(Instant::now() + READ_TIMEOUT),
     )
     .map_err(|error| format!("failed to read control request: {error}"))
     .and_then(|line| {
@@ -175,7 +193,7 @@ fn handle_connection(
             .map_err(|error| format!("invalid control request: {error}"))
     });
     let response = match request {
-        Ok(request) if Instant::now() < deadline => dispatch(request, sender, path),
+        Ok(request) if Instant::now() < collection_deadline => collect(request, sender, path),
         Ok(_) => ControlResponse::failure("invalid", "control request deadline exceeded"),
         Err(error) => ControlResponse::failure("invalid", error),
     };
@@ -280,6 +298,23 @@ fn queue_session_command(
     selector: Option<&str>,
     sender: &Sender<CompositorMessage>,
 ) -> ControlResponse {
+    if command == "stop" {
+        let id = match stop_profile_id(selector, resolve_session) {
+            Ok(id) => id,
+            Err(error) => return ControlResponse::failure(command, error),
+        };
+        return match queue_message(sender, CompositorMessage::StopContainerSession(id)) {
+            Ok(()) => ControlResponse::success(
+                command,
+                json!({
+                    "accepted": true,
+                    "id": id,
+                    "note": "Stop was queued by persistent ID; configuration is not required to release an owned instance.",
+                }),
+            ),
+            Err(error) => ControlResponse::failure(command, error),
+        };
+    }
     let (index, session) = match resolve_session(selector) {
         Ok(resolved) => resolved,
         Err(error) => return ControlResponse::failure(command, error),
@@ -298,6 +333,16 @@ fn queue_session_command(
         ),
         Err(error) => ControlResponse::failure(command, error),
     }
+}
+
+fn stop_profile_id(
+    selector: Option<&str>,
+    resolve: impl FnOnce(Option<&str>) -> Result<(usize, ContainerSession), String>,
+) -> Result<container_sessions::ProfileId, String> {
+    if let Some(id) = selector.and_then(|selector| selector.trim().parse().ok()) {
+        return Ok(id);
+    }
+    resolve(selector).map(|(_, session)| session.id)
 }
 
 fn session_command_message(command: &str, session: &ContainerSession) -> CompositorMessage {
@@ -360,11 +405,32 @@ fn queue_display_command(
 }
 
 fn resolve_session(selector: Option<&str>) -> Result<(usize, ContainerSession), String> {
-    let report = container_sessions::load_sessions_report();
+    let report = inspect_profile_config();
     if let Some(error) = report.error {
         return Err(error);
     }
-    resolve_session_in(selector, &report.sessions)
+    let resolved = resolve_session_in(selector, &report.sessions)?;
+    if !resolved.1.id.is_saved() {
+        return Err("This legacy profile needs a persistent ID. Save it in Cocoa-Way before launching or checking it.".into());
+    }
+    Ok(resolved)
+}
+
+fn inspect_profile_config() -> container_sessions::SessionLoadReport {
+    inspect_profile_config_at(&container_sessions::config_path())
+}
+
+fn inspect_profile_config_at(path: &Path) -> container_sessions::SessionLoadReport {
+    match container_sessions::inspect_sessions(path) {
+        Ok(sessions) => container_sessions::SessionLoadReport {
+            sessions,
+            error: None,
+        },
+        Err(error) => container_sessions::SessionLoadReport {
+            sessions: Vec::new(),
+            error: Some(format!("Cannot read application configuration: {error}")),
+        },
+    }
 }
 
 fn resolve_session_in(
@@ -407,6 +473,7 @@ fn resolve_session_in(
 }
 
 fn status_snapshot(path: &Path) -> Value {
+    let config = inspect_profile_config();
     let active = active_sessions_json();
     let performance = container_mode::control_performance_snapshot().map(
         |(
@@ -437,7 +504,9 @@ fn status_snapshot(path: &Path) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "pid": std::process::id(),
         "control_socket": path,
-        "configured_sessions": container_sessions::load_sessions().len(),
+        "configured_sessions": config.sessions.len(),
+        "configuration_error": config.error,
+        "configuration_migration_required": config.sessions.iter().any(|session| !session.id.is_saved()),
         "active_sessions": active,
         "performance": performance,
         "resources": diagnostics::resource_snapshot(),
@@ -449,16 +518,21 @@ fn status_snapshot(path: &Path) -> Value {
 }
 
 fn sessions_snapshot() -> Value {
+    let config = inspect_profile_config();
+    if let Some(error) = config.error {
+        return json!({ "error": error, "sessions": [] });
+    }
     let active = container_mode::control_active_sessions();
     Value::Array(
-        container_sessions::load_sessions()
+        config.sessions
             .into_iter()
             .enumerate()
             .map(|(index, session)| {
                 let tracked = active.iter().find(|active| active.1 == session.id);
                 let state = container_mode::control_session_state(session.id);
                 json!({
-                    "id": session.id,
+                    "id": session.id.is_saved().then_some(session.id),
+                    "migration_required": !session.id.is_saved(),
                     "index": index,
                     "name": session.name,
                     "runtime": session.runtime,
@@ -467,7 +541,7 @@ fn sessions_snapshot() -> Value {
                     "profile": session.profile,
                     "display": session.display.as_deref().unwrap_or("auto"),
                     "audio": session.audio,
-                    "state": state.as_ref().map(|state| state.0.as_str()).unwrap_or(if tracked.is_some() { "Running" } else { "Idle" }),
+                    "state": if !session.id.is_saved() { "Migration required" } else { state.as_ref().map(|state| state.0.as_str()).unwrap_or(if tracked.is_some() { "Running" } else { "Idle" }) },
                     "state_detail": state.map(|state| state.1),
                     "active": tracked.map(|active| json!({
                         "instance_id": active.0,
@@ -520,7 +594,7 @@ fn displays_snapshot() -> Value {
 }
 
 fn active_sessions_json() -> Value {
-    let sessions = container_sessions::load_sessions();
+    let sessions = inspect_profile_config().sessions;
     Value::Array(
         container_mode::control_active_sessions()
             .into_iter()
@@ -802,6 +876,7 @@ fn run_command(
     let timeout = REQUEST_DEADLINE.with(|budget| match budget.get() {
         Some(deadline) => deadline
             .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
             .map(|remaining| remaining.min(timeout))
             .ok_or_else(|| "control request deadline exceeded".to_string()),
         None => Ok(timeout),
@@ -876,6 +951,150 @@ mod tests {
             first.id
         );
     }
+
+    #[test]
+    fn stop_by_persistent_id_does_not_consult_broken_configuration() {
+        let id = container_sessions::ProfileId::new().unwrap();
+        let captured = stop_profile_id(Some(&format!(" {id} ")), |_| {
+            panic!("stopping an owned ID must not read configuration")
+        })
+        .unwrap();
+        assert_eq!(captured, id);
+        let path = container_sessions::config_path();
+        let broken = "[[session]\nthis is not TOML";
+        std::fs::write(&path, broken).unwrap();
+        let (sender, receiver) = crate::event_loop_signal::channel_with_waker(|| {});
+        let response = queue_session_command("stop", Some(&id.to_string()), &sender);
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.data["id"], id.to_string());
+        assert!(
+            matches!(receiver.try_recv(), Ok(CompositorMessage::StopContainerSession(queued)) if queued == id)
+        );
+        sender.message_received();
+        assert!(!sender.finish_turn());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), broken);
+        assert!(
+            stop_profile_id(Some("legacy name"), |_| Err("invalid configuration".into())).is_err()
+        );
+    }
+
+    #[test]
+    fn read_only_queries_never_create_or_migrate_configuration() {
+        let path = container_sessions::config_path();
+        // The test harness can reuse a worker thread and its private config.
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        let entries = || {
+            let mut names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = entries();
+        assert!(!path.exists());
+        assert_eq!(sessions_snapshot(), json!([]));
+        assert_eq!(
+            status_snapshot(Path::new("unused"))["configured_sessions"],
+            0
+        );
+        active_sessions_json();
+        assert!(!path.exists());
+        assert_eq!(entries(), before);
+
+        let legacy = "[[session]]\nname='legacy'\nimage='test'\n";
+        std::fs::write(&path, legacy).unwrap();
+        let before = entries();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let sessions = sessions_snapshot();
+        assert!(sessions[0]["id"].is_null());
+        assert_eq!(sessions[0]["migration_required"], true);
+        assert_eq!(
+            status_snapshot(Path::new("unused"))["configuration_migration_required"],
+            true
+        );
+        assert!(
+            resolve_session(Some("legacy"))
+                .unwrap_err()
+                .contains("persistent ID")
+        );
+        active_sessions_json();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(entries(), before);
+
+        std::fs::write(&path, "[invalid").unwrap();
+        assert!(status_snapshot(Path::new("unused"))["configuration_error"].is_string());
+        assert!(sessions_snapshot()["error"].is_string());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "[invalid");
+    }
+
+    #[test]
+    fn diagnostic_collection_reserves_time_for_the_response() {
+        let now = Instant::now();
+        assert_eq!(
+            collection_deadline(now + TOTAL_TIMEOUT, now),
+            now + TOTAL_TIMEOUT - WRITE_TIMEOUT
+        );
+        assert_eq!(
+            collection_deadline(now + Duration::from_millis(400), now),
+            now + Duration::from_millis(300)
+        );
+        assert_eq!(collection_deadline(now, now), now);
+    }
+
+    #[test]
+    fn exhausted_diagnostic_collection_returns_its_partial_report() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            handle_connection_with(
+                server,
+                &test_sender(),
+                Path::new("unused"),
+                Instant::now() + Duration::from_millis(400),
+                |request, _, _| {
+                    let until = REQUEST_DEADLINE.with(|budget| budget.get().unwrap());
+                    std::thread::sleep(
+                        until.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+                    );
+                    let error = run_command(
+                        Path::new("/must-not-execute"),
+                        &[],
+                        "",
+                        Duration::from_secs(3),
+                    )
+                    .unwrap_err();
+                    ControlResponse::success(
+                        &request.command,
+                        json!({ "partial": true, "probe_error": error }),
+                    )
+                },
+            );
+        });
+        peer.write_all(b"{\"command\":\"diagnostics\"}\n").unwrap();
+        let response = read_frame_before(
+            &mut peer,
+            MAX_RESPONSE_BYTES,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        let response: ControlResponse = serde_json::from_slice(&response).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.command, "diagnostics");
+        assert_eq!(response.data["partial"], true);
+        assert!(
+            response.data["probe_error"]
+                .as_str()
+                .unwrap()
+                .contains("deadline exceeded")
+        );
+        worker.join().unwrap();
+    }
     use std::io::{BufRead, BufReader, Write};
 
     fn test_sender() -> Sender<CompositorMessage> {
@@ -946,13 +1165,20 @@ mod tests {
                 Instant::now() + Duration::from_millis(50),
             )
         });
-        let error = read_frame_before(
+        let response = read_frame_before(
             &mut peer,
             MAX_RESPONSE_BYTES,
             Instant::now() + Duration::from_secs(1),
         )
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        .unwrap();
+        let response: ControlResponse = serde_json::from_slice(&response).unwrap();
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .unwrap()
+                .contains("failed to read control request")
+        );
         worker.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
     }

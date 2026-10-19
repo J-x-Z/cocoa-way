@@ -58,7 +58,9 @@ fn clear_status(index: ProfileId) {
 }
 
 pub fn snapshot() -> serde_json::Value {
-    let sessions = crate::container_sessions::load_sessions();
+    let sessions =
+        crate::container_sessions::inspect_sessions(&crate::container_sessions::config_path())
+            .unwrap_or_default();
     let mut entries = statuses()
         .lock()
         .map(|statuses| {
