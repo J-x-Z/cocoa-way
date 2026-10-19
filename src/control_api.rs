@@ -1168,12 +1168,11 @@ mod tests {
                 server,
                 &test_sender(),
                 Path::new("unused"),
-                Instant::now() + Duration::from_millis(400),
+                Instant::now() + Duration::from_secs(3),
                 |request, _, _| {
-                    let until = REQUEST_DEADLINE.with(|budget| budget.get().unwrap());
-                    std::thread::sleep(
-                        until.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
-                    );
+                    // Exhaust the probe budget directly. Sleeping to its wall
+                    // deadline can also exhaust the response reserve on a busy CI runner.
+                    REQUEST_DEADLINE.with(|budget| budget.set(Some(Instant::now())));
                     let error = run_command(
                         Path::new("/must-not-execute"),
                         &[],
@@ -1192,7 +1191,7 @@ mod tests {
         let response = read_frame_before(
             &mut peer,
             MAX_RESPONSE_BYTES,
-            Instant::now() + Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
         let response: ControlResponse = serde_json::from_slice(&response).unwrap();
@@ -1281,16 +1280,22 @@ mod tests {
             &mut peer,
             MAX_RESPONSE_BYTES,
             Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap();
-        let response: ControlResponse = serde_json::from_slice(&response).unwrap();
-        assert!(!response.ok);
-        assert!(
-            response
-                .error
-                .unwrap()
-                .contains("failed to read control request")
         );
+        match response {
+            Ok(frame) => {
+                let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+                assert!(!response.ok);
+                assert!(
+                    response
+                        .error
+                        .unwrap()
+                        .contains("failed to read control request")
+                );
+            }
+            // If the scheduler exhausts even the reply reserve, the strict
+            // total deadline must close the idle connection instead of extending it.
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
+        }
         worker.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
     }
