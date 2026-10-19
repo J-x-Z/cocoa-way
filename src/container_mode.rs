@@ -26,6 +26,10 @@ use crate::container_sessions::{self, ContainerSession, ProfileId};
 use crate::event_loop_signal::Sender;
 use crate::i18n::{Language, tr, tr_format};
 use crate::messages::CompositorMessage;
+use crate::runtime_commands::action_targets::{
+    DockerDeleteTarget, DockerEndpoint, StoppableProfile, capture_docker_endpoint,
+    resolve_owned_stop, unpinned_resource_delete_error,
+};
 use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quote};
 
 mod displays;
@@ -60,7 +64,7 @@ static VOLUME_DELETE_ACTIONS: Mutex<Vec<VolumeDeleteAction>> = Mutex::new(Vec::n
 static VOLUME_SELECT_ACTIONS: Mutex<Vec<SelectedVolume>> = Mutex::new(Vec::new());
 static SELECTED_IMAGE: Mutex<Option<SelectedImage>> = Mutex::new(None);
 static SELECTED_VOLUME: Mutex<Option<SelectedVolume>> = Mutex::new(None);
-static RUNTIME_CONTAINER_ACTIONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static RUNTIME_CONTAINER_ACTIONS: Mutex<Vec<RuntimeContainerAction>> = Mutex::new(Vec::new());
 static RUNTIME_CONTAINER_SELECT_ACTIONS: Mutex<Vec<SelectedRuntimeContainer>> =
     Mutex::new(Vec::new());
 static SELECTED_RUNTIME_CONTAINER: Mutex<Option<SelectedRuntimeContainer>> = Mutex::new(None);
@@ -70,6 +74,7 @@ static DOCKER_CONTEXT_ACTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static ORBSTACK_MACHINE_ACTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static PERFORMANCE: Mutex<Option<PerformanceSnapshot>> = Mutex::new(None);
 static ACTIVE_SESSIONS: Mutex<Vec<ActiveSessionSnapshot>> = Mutex::new(Vec::new());
+static STOPPABLE_PROFILES: Mutex<Vec<StoppableProfile<ProfileId>>> = Mutex::new(Vec::new());
 static MANAGED_DISPLAYS: Mutex<Vec<ManagedDisplaySnapshot>> = Mutex::new(Vec::new());
 static PENDING_MANAGED_DISPLAYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static CLOSING_MANAGED_DISPLAYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -211,6 +216,14 @@ struct SelectedRuntimeContainer {
     name: String,
     label: String,
     running: bool,
+    docker_target: Option<DockerDeleteTarget>,
+}
+
+#[derive(Clone)]
+struct RuntimeContainerAction {
+    runtime: String,
+    name: String,
+    docker_target: Option<DockerDeleteTarget>,
 }
 
 #[derive(Clone)]
@@ -351,6 +364,46 @@ fn profile_action_index(sender: &AnyObject) -> Option<usize> {
         return None;
     }
     view_index(id)
+}
+
+fn owned_stop_id(sender: &AnyObject) -> Option<ProfileId> {
+    let identifier: Option<Retained<NSString>> = unsafe { msg_send_id![sender, identifier] };
+    let id = identifier?.to_string().parse::<ProfileId>().ok()?;
+    let tracked = resolve_owned_stop(&id, &STOPPABLE_PROFILES.lock().unwrap()).is_some();
+    if tracked {
+        Some(id)
+    } else {
+        show_error_alert("No active or pending instance is tracked for this application.");
+        None
+    }
+}
+
+pub(crate) fn control_stoppable_profiles() -> Vec<(ProfileId, String)> {
+    STOPPABLE_PROFILES
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|profile| (profile.id, profile.name.clone()))
+        .collect()
+}
+
+pub(crate) fn record_stoppable_profiles(mut profiles: Vec<StoppableProfile<ProfileId>>) {
+    profiles.sort_by_key(|profile| profile.id);
+    profiles.dedup_by_key(|profile| profile.id);
+    let changed = {
+        let mut stored = STOPPABLE_PROFILES.lock().unwrap();
+        if *stored == profiles {
+            false
+        } else {
+            *stored = profiles;
+            true
+        }
+    };
+    if changed {
+        unsafe {
+            refresh_window_without_focus();
+        }
+    }
 }
 
 fn schedule_automatic_profile_validation(sessions: &[ContainerSession]) {
@@ -3785,6 +3838,10 @@ unsafe fn show_delete_image_dialog() {
 
     let runtime = field_string(&runtime_field);
     let image = field_string(&image_field);
+    if let Some(error) = unpinned_resource_delete_error(&runtime) {
+        show_error_alert(error);
+        return;
+    }
     if image.is_empty() {
         show_error_alert("Image is required.");
         return;
@@ -3966,6 +4023,10 @@ fn confirm_delete_resource(kind: &str, runtime: &str, name: &str) -> bool {
 }
 
 fn confirm_image_removal(action: &ImageDeleteAction, remove_tag: bool) -> bool {
+    if let Some(error) = unpinned_resource_delete_error(&action.runtime) {
+        show_error_alert(error);
+        return false;
+    }
     let sessions = container_sessions::load_sessions();
     let known_references = if remove_tag {
         vec![action.reference.clone()]
@@ -4052,6 +4113,10 @@ fn confirm_image_removal(action: &ImageDeleteAction, remove_tag: bool) -> bool {
 }
 
 fn confirm_volume_removal(action: &VolumeDeleteAction) -> bool {
+    if let Some(error) = unpinned_resource_delete_error(&action.runtime) {
+        show_error_alert(error);
+        return false;
+    }
     let usage = volume_usage(&action.runtime, &action.name);
     if usage.loading {
         show_error_alert(
@@ -4127,18 +4192,13 @@ fn confirm_close_managed_display(slot: &str) -> bool {
 }
 
 fn confirm_stop_apple_runtime() -> Option<Vec<ProfileId>> {
-    let sessions = container_sessions::load_sessions();
-    let mut running = active_sessions_snapshot()
+    let mut running = STOPPABLE_PROFILES
+        .lock()
+        .unwrap()
+        .clone()
         .into_iter()
-        .filter_map(|active| {
-            let session = sessions
-                .iter()
-                .find(|session| session.id == active.profile_id)?;
-            if normalized_runtime_key(&session.runtime) != "apple" {
-                return None;
-            }
-            Some((active.profile_id, session.name.clone()))
-        })
+        .filter(|profile| normalized_runtime_key(&profile.runtime) == "apple")
+        .map(|profile| (profile.id, profile.name))
         .collect::<Vec<_>>();
     running.sort_by_key(|(index, _)| *index);
     running.dedup_by_key(|(index, _)| *index);
@@ -4463,31 +4523,16 @@ fn show_error_alert(message: &str) {
     }
 }
 
-fn remember_stop_request(index: usize) {
-    let message = match session_for_view(index) {
-        Some(session) => {
-            start_operation_task(
-                stop_task_key(index),
-                "Stop instance",
-                &session.name,
-                [
-                    "Ask application to exit",
-                    "Stop application process",
-                    "Stop Waypipe worker",
-                    "Release display",
-                    "Stop container",
-                    "Mark instance exited",
-                ],
-            );
-            set_session_state(index, "Stopping", format!("Stopping {}.", session.name));
-            format!("Stop requested: {}", session.name)
-        }
-        None => format!(
-            "Stop requested for missing application profile #{}",
-            index + 1
-        ),
+fn remember_stop_request(id: ProfileId) {
+    let owned = STOPPABLE_PROFILES.lock().unwrap();
+    let Some(profile) = resolve_owned_stop(&id, &owned) else {
+        return;
     };
-    push_activity(message);
+    let name = profile.name.clone();
+    drop(owned);
+    ensure_stop_task(id, &name);
+    set_session_state(id, "Stopping", format!("Stopping {name}."));
+    push_activity(format!("Stop requested: {name}"));
 }
 
 declare_class!(
@@ -4581,30 +4626,26 @@ declare_class!(
 
         #[method(stopContainerSession:)]
         fn stop_container_session(&self, sender: &AnyObject) {
-            let Some(index) = profile_action_index(sender) else { return; };
-            if !session_can_stop(session_state(index).as_ref()) {
-                let name = container_sessions::load_sessions()
-                    .get(index)
-                    .map(|session| session.name.clone())
-                    .unwrap_or_else(|| format!("session #{}", index + 1));
-                push_activity(format!("Stop ignored: {} is not running.", name));
-                *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-                *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
-                unsafe { rebuild_window(); }
-                return;
-            }
-            remember_stop_request(index);
+            let Some(id) = owned_stop_id(sender) else { return; };
+            remember_stop_request(id);
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
-            if let Some(id) = profile_id_at(index) { send(CompositorMessage::StopContainerSession(id)); }
+            *SELECTED_SESSION.lock().unwrap() = Some(id);
+            send(CompositorMessage::StopContainerSession(id));
             unsafe { rebuild_window(); }
         }
 
         #[method(forceStopContainerSession:)]
         fn force_stop_container_session(&self, sender: &AnyObject) {
-            let Some(index) = profile_action_index(sender) else { return; };
-            push_activity(format!("Force Stop requested for application #{}", index + 1));
-            if let Some(id) = profile_id_at(index) { send(CompositorMessage::ForceStopContainerSession(id)); }
+            let Some(id) = owned_stop_id(sender) else { return; };
+            remember_stop_request(id);
+            push_activity(format!("Force Stop requested for application {id}"));
+            let pending = STOPPABLE_PROFILES.lock().unwrap().iter()
+                .any(|profile| profile.id == id && profile.pending);
+            send(if pending {
+                CompositorMessage::StopContainerSession(id)
+            } else {
+                CompositorMessage::ForceStopContainerSession(id)
+            });
             unsafe { rebuild_window(); }
         }
 
@@ -4803,17 +4844,9 @@ declare_class!(
 
         #[method(releaseDisplayAttachment:)]
         fn release_display_attachment(&self, sender: &AnyObject) {
-            let Some(index) = profile_action_index(sender) else { return; };
-            if !session_can_stop(session_state(index).as_ref()) {
-                push_activity(format!(
-                    "Display release ignored: application #{} is not running.",
-                    index + 1
-                ));
-                unsafe { rebuild_window(); }
-                return;
-            }
-            remember_stop_request(index);
-            if let Some(id) = profile_id_at(index) { send(CompositorMessage::StopContainerSession(id)); }
+            let Some(id) = owned_stop_id(sender) else { return; };
+            remember_stop_request(id);
+            send(CompositorMessage::StopContainerSession(id));
             unsafe { rebuild_window(); }
         }
 
@@ -4979,7 +5012,7 @@ declare_class!(
                 return;
             };
             for index in running_profiles {
-                if let Some(view) = view_index(index) { remember_stop_request(view); }
+                remember_stop_request(index);
                 if let Some(id) = profile_id_at(index) { send(CompositorMessage::ForceStopContainerSession(id)); }
             }
             send(CompositorMessage::RuntimeSystemAction {
@@ -5149,11 +5182,11 @@ declare_class!(
                 .unwrap()
                 .get(tag.max(0) as usize)
                 .cloned();
-            let Some((runtime, name)) = action else {
+            let Some(RuntimeContainerAction { runtime, name, docker_target }) = action else {
                 show_error_alert("Container action no longer exists. Press Reload and try again.");
                 return;
             };
-            send(CompositorMessage::StopRuntimeContainer { runtime, name });
+            send(CompositorMessage::StopRuntimeContainer { runtime, name, docker_target });
         }
 
         #[method(selectQuickRuntimeContainer:)]
@@ -5169,11 +5202,11 @@ declare_class!(
                 .unwrap()
                 .get(tag.max(0) as usize)
                 .cloned();
-            let Some((runtime, name)) = action else {
+            let Some(RuntimeContainerAction { runtime, name, docker_target }) = action else {
                 show_error_alert("Container action no longer exists. Press Reload and try again.");
                 return;
             };
-            send(CompositorMessage::StartRuntimeContainer { runtime, name });
+            send(CompositorMessage::StartRuntimeContainer { runtime, name, docker_target });
         }
 
         #[method(deleteRuntimeContainer:)]
@@ -5184,14 +5217,21 @@ declare_class!(
                 .unwrap()
                 .get(tag.max(0) as usize)
                 .cloned();
-            let Some((runtime, name)) = action else {
+            let Some(RuntimeContainerAction { runtime, name, docker_target }) = action else {
                 show_error_alert("Container action no longer exists. Press Reload and try again.");
                 return;
             };
-            if !confirm_delete_resource("Container", &runtime, &name) {
+            if runtime != "apple" && runtime != "container" && docker_target.is_none() {
+                show_error_alert("Delete is unavailable: the inventory did not capture a local Docker endpoint and full container ID. Reload and select the container again.");
                 return;
             }
-            send(CompositorMessage::DeleteRuntimeContainer { runtime, name });
+            let confirmed_name = docker_target.as_ref().map(|target| {
+                format!("{}\nEndpoint: {}\nContainer ID: {}", name, target.endpoint(), target.id())
+            }).unwrap_or_else(|| name.clone());
+            if !confirm_delete_resource("Container", &runtime, &confirmed_name) {
+                return;
+            }
+            send(CompositorMessage::DeleteRuntimeContainer { runtime, name, docker_target });
         }
 
         #[method(restartRuntimeContainer:)]
@@ -5202,11 +5242,11 @@ declare_class!(
                 .unwrap()
                 .get(tag.max(0) as usize)
                 .cloned();
-            let Some((runtime, name)) = action else {
+            let Some(RuntimeContainerAction { runtime, name, docker_target }) = action else {
                 show_error_alert("Container action no longer exists. Press Reload and try again.");
                 return;
             };
-            send(CompositorMessage::RestartRuntimeContainer { runtime, name });
+            send(CompositorMessage::RestartRuntimeContainer { runtime, name, docker_target });
         }
 
         #[method(openRuntimeContainerTerminal:)]
@@ -5217,7 +5257,7 @@ declare_class!(
                 .unwrap()
                 .get(tag.max(0) as usize)
                 .cloned();
-            let Some((runtime, name)) = action else {
+            let Some(RuntimeContainerAction { runtime, name, .. }) = action else {
                 show_error_alert("Container action no longer exists. Press Reload and try again.");
                 return;
             };
@@ -5693,6 +5733,13 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     }
 
     let row_height = 180.0;
+    let recovery_profiles = STOPPABLE_PROFILES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|profile| !sessions.iter().any(|session| session.id == profile.id))
+        .cloned()
+        .collect::<Vec<_>>();
     let viewport = unsafe { scroll.contentSize() };
     let content_w = viewport.width;
     let min_page_height = match selected_nav {
@@ -5705,7 +5752,13 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         NAV_COMMANDS => 1080.0,
         _ => height - toolbar_h,
     };
-    let content_height = (sessions.len().max(1) as f64 * row_height + 18.0).max(min_page_height);
+    let content_height = ((sessions.len() + recovery_profiles.len()).max(1) as f64 * row_height
+        + if recovery_profiles.is_empty() {
+            18.0
+        } else {
+            120.0
+        })
+    .max(min_page_height);
     let content: Retained<NSView> = unsafe {
         msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, content_w, content_height)]
     };
@@ -5738,9 +5791,22 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
             nav_title(selected_nav),
             mtm,
         );
+    } else if !recovery_profiles.is_empty() && (config_error.is_some() || sessions.is_empty()) {
+        add_owned_recovery_list(
+            &content,
+            content_w,
+            content_height,
+            &recovery_profiles,
+            config_error.as_deref(),
+            handler,
+            mtm,
+        );
     } else if let Some(error) = config_error.as_deref() {
         add_config_error_list(&content, content_w, content_height, error, handler, mtm);
-    } else if selected_nav == NAV_RUNNING && active_sessions_snapshot().is_empty() {
+    } else if selected_nav == NAV_RUNNING
+        && active_sessions_snapshot().is_empty()
+        && recovery_profiles.is_empty()
+    {
         add_running_empty_list(&content, content_w, content_height, mtm);
     } else if sessions.is_empty() {
         add_session_empty_list(&content, content_w, content_height, handler, mtm);
@@ -5750,6 +5816,7 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
             .enumerate()
             .filter(|(index, _)| selected_nav == NAV_SESSIONS || active_session(*index).is_some())
             .collect::<Vec<_>>();
+        let visible_count = visible_sessions.len();
         for (row, (index, session)) in visible_sessions.into_iter().enumerate() {
             let y = content_height - ((row + 1) as f64 * row_height);
             unsafe {
@@ -5765,6 +5832,16 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
                     mtm,
                 );
             }
+        }
+        for (row, profile) in recovery_profiles.iter().enumerate() {
+            add_owned_recovery_row(
+                &content,
+                content_w,
+                content_height - (visible_count + row + 1) as f64 * row_height,
+                profile,
+                handler,
+                mtm,
+            );
         }
     }
 
@@ -6124,6 +6201,95 @@ fn add_running_empty_list(parent: &NSView, width: f64, content_height: f64, mtm:
         mtm,
         TextStyle::Body,
     );
+}
+
+fn add_owned_recovery_row(
+    parent: &NSView,
+    width: f64,
+    y: f64,
+    profile: &StoppableProfile<ProfileId>,
+    handler: *mut AnyObject,
+    mtm: MainThreadMarker,
+) {
+    add_card(parent, rect(12.0, y + 10.0, width - 24.0, 160.0), mtm);
+    add_label(
+        parent,
+        &profile.name,
+        rect(30.0, y + 130.0, width - 60.0, 24.0),
+        mtm,
+        TextStyle::Heading,
+    );
+    add_label(
+        parent,
+        &format!(
+            "{}\n{}",
+            profile.id,
+            if profile.pending {
+                "Pending work; cancellation remains available."
+            } else {
+                "Tracked instance; the saved profile is unavailable."
+            }
+        ),
+        rect(30.0, y + 63.0, width - 60.0, 52.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    let force = session_state(profile.id).is_some_and(|state| state.force_stop_available)
+        && !profile.pending;
+    let stop = add_button(
+        parent,
+        if force {
+            "Force Stop"
+        } else if profile.pending {
+            "Cancel Pending"
+        } else {
+            "Stop Instance"
+        },
+        rect(30.0, y + 22.0, 130.0, 30.0),
+        handler,
+        if force {
+            sel!(forceStopContainerSession:)
+        } else {
+            sel!(stopContainerSession:)
+        },
+        mtm,
+    );
+    unsafe {
+        let _: () = msg_send![&*stop, setIdentifier: &*NSString::from_str(&profile.id.to_string())];
+    }
+}
+
+fn add_owned_recovery_list(
+    parent: &NSView,
+    width: f64,
+    content_height: f64,
+    profiles: &[StoppableProfile<ProfileId>],
+    error: Option<&str>,
+    handler: *mut AnyObject,
+    mtm: MainThreadMarker,
+) {
+    let notice = error
+        .unwrap_or("Saved profiles are unavailable. These instances are still owned by Cocoa-Way.");
+    let label = add_label(
+        parent,
+        &short_text(notice, 220),
+        rect(30.0, content_height - 104.0, width - 60.0, 80.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    unsafe {
+        let _: () = msg_send![&*label, setToolTip: &*NSString::from_str(notice)];
+    }
+    for (row, profile) in profiles.iter().enumerate() {
+        add_owned_recovery_row(
+            parent,
+            width,
+            content_height - 120.0 - (row + 1) as f64 * 180.0,
+            profile,
+            handler,
+            mtm,
+        );
+    }
 }
 
 fn add_config_error_list(
@@ -6917,6 +7083,7 @@ fn add_runtime_list(
             name: None,
             label: "Runtime is unavailable or stopped. Reload after starting it.".into(),
             running: false,
+            docker_target: None,
         }],
     };
     let selected_container = runtime_container_detail_selection(
@@ -7419,6 +7586,7 @@ fn apple_container_rows(
                     name: None,
                     label: "No local Apple containers".into(),
                     running: false,
+                    docker_target: None,
                 });
             }
             rows
@@ -7434,12 +7602,14 @@ fn apple_container_rows(
                     .unwrap_or("container list failed")
                     .to_string(),
                 running: false,
+                docker_target: None,
             }]
         }
         Err(error) => vec![RuntimeContainerRow {
             name: None,
             label: ui_command_error("container list failed", &error),
             running: false,
+            docker_target: None,
         }],
     }
 }
@@ -7451,6 +7621,7 @@ fn parse_apple_container_row(line: &str) -> RuntimeContainerRow {
             name: None,
             label: short_text(line, 96),
             running: false,
+            docker_target: None,
         };
     }
 
@@ -7462,6 +7633,7 @@ fn parse_apple_container_row(line: &str) -> RuntimeContainerRow {
             name: None,
             label: format!("BuildKit helper  {}", state),
             running: state.eq_ignore_ascii_case("running"),
+            docker_target: None,
         };
     }
 
@@ -7474,6 +7646,7 @@ fn parse_apple_container_row(line: &str) -> RuntimeContainerRow {
             short_text(image, 38)
         ),
         running: state.eq_ignore_ascii_case("running"),
+        docker_target: None,
     }
 }
 
@@ -7878,6 +8051,7 @@ fn add_runtime_container_row(
             name: name.clone(),
             label: row.label.clone(),
             running: row.running,
+            docker_target: row.docker_target.clone(),
         });
         index
     };
@@ -7890,7 +8064,7 @@ fn add_runtime_container_row(
         mtm,
     );
 
-    let action_index = push_runtime_container_action(runtime, name);
+    let action_index = push_runtime_container_action(runtime, name, row.docker_target.clone());
     let primary = add_button(
         parent,
         if row.running {
@@ -7917,7 +8091,7 @@ fn add_runtime_container_row(
         let _: () = msg_send![&*primary, setToolTip: &*NSString::from_str(tooltip)];
     }
 
-    let action_index = push_runtime_container_action(runtime, name);
+    let action_index = push_runtime_container_action(runtime, name, row.docker_target.clone());
     let delete = add_button(
         parent,
         &tr("Delete"),
@@ -7928,7 +8102,9 @@ fn add_runtime_container_row(
     );
     unsafe {
         let _: () = msg_send![&*delete, setTag: action_index as isize];
-        let _: () = msg_send![&*delete, setEnabled: !row.running];
+        let deletion_captured =
+            matches!(runtime, "apple" | "container") || row.docker_target.is_some();
+        let _: () = msg_send![&*delete, setEnabled: !row.running && deletion_captured];
         let _: () = msg_send![&*delete, setToolTip:
         &*NSString::from_str(if row.running {
             "Stop this container before deleting it"
@@ -7938,10 +8114,18 @@ fn add_runtime_container_row(
     }
 }
 
-fn push_runtime_container_action(runtime: &str, name: &str) -> usize {
+fn push_runtime_container_action(
+    runtime: &str,
+    name: &str,
+    docker_target: Option<DockerDeleteTarget>,
+) -> usize {
     let mut actions = RUNTIME_CONTAINER_ACTIONS.lock().unwrap();
     let index = actions.len();
-    actions.push((runtime.to_string(), name.to_string()));
+    actions.push(RuntimeContainerAction {
+        runtime: runtime.to_string(),
+        name: name.to_string(),
+        docker_target,
+    });
     index
 }
 
@@ -8033,25 +8217,61 @@ struct RuntimeContainerRow {
     name: Option<String>,
     label: String,
     running: bool,
+    docker_target: Option<DockerDeleteTarget>,
+}
+
+impl RuntimeContainerRow {
+    fn message(label: impl Into<String>) -> Self {
+        Self {
+            name: None,
+            label: label.into(),
+            running: false,
+            docker_target: None,
+        }
+    }
+}
+
+fn captured_docker_endpoint(
+    path: &std::path::Path,
+    child_path: &str,
+) -> Result<DockerEndpoint, String> {
+    capture_docker_endpoint(
+        std::env::var("DOCKER_CONTEXT").ok().as_deref(),
+        std::env::var("DOCKER_HOST").ok().as_deref(),
+        |args| {
+            let output = run_ui_command(path, child_path, args, Duration::from_secs(2))?;
+            if !output.status.success() {
+                return Err(first_stderr_line(&output, "Docker endpoint lookup failed"));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        },
+    )
 }
 
 fn docker_container_rows(child_path: &str) -> Vec<RuntimeContainerRow> {
     let Some(path) = find_command_path("docker", child_path) else {
-        return vec![RuntimeContainerRow {
-            name: None,
-            label: "docker command not found".into(),
-            running: false,
-        }];
+        return vec![RuntimeContainerRow::message("docker command not found")];
     };
-
+    let endpoint = match captured_docker_endpoint(&path, child_path) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            return vec![RuntimeContainerRow::message(ui_command_error(
+                "Docker inventory unavailable",
+                &error,
+            ))];
+        }
+    };
     match run_ui_command(
         &path,
         child_path,
         &[
+            "--host",
+            endpoint.host(),
             "ps",
             "-a",
+            "--no-trunc",
             "--format",
-            "{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Image}}",
+            "{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Image}}\t{{.ID}}",
         ],
         Duration::from_secs(2),
     ) {
@@ -8059,27 +8279,29 @@ fn docker_container_rows(child_path: &str) -> Vec<RuntimeContainerRow> {
             let mut rows = String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .filter(|line| !line.trim().is_empty())
-                .map(format_docker_container_row)
+                .map(|line| {
+                    let mut row = format_docker_container_row(line);
+                    row.docker_target = line.split('\t').nth(4).and_then(|id| {
+                        DockerDeleteTarget::capture(&path, endpoint.clone(), id.trim()).ok()
+                    });
+                    row
+                })
                 .collect::<Vec<_>>();
             if rows.is_empty() {
-                rows.push(RuntimeContainerRow {
-                    name: None,
-                    label: "No Docker containers to stop or delete".into(),
-                    running: false,
-                });
+                rows.push(RuntimeContainerRow::message(
+                    "No Docker containers to stop or delete",
+                ));
             }
             rows
         }
-        Ok(output) => vec![RuntimeContainerRow {
-            name: None,
-            label: first_stderr_line(&output, "Docker container list failed"),
-            running: false,
-        }],
-        Err(error) => vec![RuntimeContainerRow {
-            name: None,
-            label: ui_command_error("Docker container list failed", &error),
-            running: false,
-        }],
+        Ok(output) => vec![RuntimeContainerRow::message(first_stderr_line(
+            &output,
+            "Docker container list failed",
+        ))],
+        Err(error) => vec![RuntimeContainerRow::message(ui_command_error(
+            "Docker container list failed",
+            &error,
+        ))],
     }
 }
 
@@ -8219,6 +8441,7 @@ fn format_docker_container_row(line: &str) -> RuntimeContainerRow {
             name: None,
             label: short_text(line, 96),
             running: false,
+            docker_target: None,
         };
     }
     let name = parts[0].trim().to_string();
@@ -8234,6 +8457,7 @@ fn format_docker_container_row(line: &str) -> RuntimeContainerRow {
             short_text(image, 30)
         ),
         running: matches!(state, "running" | "restarting" | "paused"),
+        docker_target: None,
     }
 }
 
@@ -8522,6 +8746,9 @@ fn execute_ui_command(
     timeout: Duration,
 ) -> Result<Output, String> {
     let mut process = Command::new(command);
+    if args.first().is_some_and(|argument| argument == "--host") {
+        DockerEndpoint::pin_environment(&mut process);
+    }
     process.env("PATH", child_path).args(args);
     crate::runtime_commands::capture(process, timeout).map_err(|error| error.to_string())
 }
@@ -11525,9 +11752,11 @@ fn runtime_container_detail_selection(
     {
         container.label = row.label.clone();
         container.running = row.running;
+        container.docker_target = row.docker_target.clone();
         None
     } else {
         container.running = false;
+        container.docker_target = None;
         let reason = rows
             .iter()
             .find(|row| row.name.is_none())
@@ -11707,7 +11936,11 @@ fn add_runtime_container_detail(
         }
     }
 
-    let action_index = push_runtime_container_action(&container.runtime, &container.name);
+    let action_index = push_runtime_container_action(
+        &container.runtime,
+        &container.name,
+        container.docker_target.clone(),
+    );
     let primary = add_button(
         parent,
         if container.running { "Stop" } else { "Start" },
@@ -11782,6 +12015,12 @@ fn add_runtime_container_detail(
             ))
         {
             let _: () = msg_send![&**button, setEnabled: enabled];
+        }
+        if !matches!(container.runtime.as_str(), "apple" | "container")
+            && container.docker_target.is_none()
+        {
+            let _: () = msg_send![&*delete, setEnabled: false];
+            let _: () = msg_send![&*delete, setToolTip: &*NSString::from_str("Delete requires a captured local endpoint and full container ID. Reload the inventory.")];
         }
     }
 
@@ -12808,6 +13047,7 @@ mod runtime_container_detail_tests {
             name: "example".into(),
             label: "old inventory label".into(),
             running: true,
+            docker_target: None,
         }
     }
 
@@ -12824,12 +13064,14 @@ mod runtime_container_detail_tests {
                     name: Some(format!("other-{index}")),
                     label: "other".into(),
                     running: true,
+                    docker_target: None,
                 })
                 .collect();
             rows.push(RuntimeContainerRow {
                 name: Some(container.name.clone()),
                 label: "fresh stopped inventory label".into(),
                 running: false,
+                docker_target: None,
             });
             let (resolved, notice) =
                 runtime_container_detail_selection(Some(&container), nav, &rows).unwrap();
@@ -12852,11 +13094,13 @@ mod runtime_container_detail_tests {
                 name: None,
                 label: UI_COMMAND_LOADING.into(),
                 running: false,
+                docker_target: None,
             }],
             vec![RuntimeContainerRow {
                 name: Some("replacement".into()),
                 label: "another container".into(),
                 running: true,
+                docker_target: None,
             }],
         ] {
             let (resolved, notice) =

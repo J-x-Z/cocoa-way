@@ -3061,6 +3061,35 @@ mod tests {
         (directory, binary)
     }
 
+    const MOCK_DOCKER_ENDPOINT: &str = "unix:///tmp/cocoa-way-docker-fixture.sock";
+
+    fn mock_docker_runtime(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        mock_runtime(&format!(
+            r#"
+case "$1:$2" in
+    context:show) printf '%s\n' cocoa-way-fixture; exit 0 ;;
+    context:inspect) printf '%s\n' '{MOCK_DOCKER_ENDPOINT}'; exit 0 ;;
+esac
+if [ "$1" = run ]; then
+    printf '%s\n' "$DOCKER_HOST" > "${{0%/*}}/run-endpoint"
+    printf '%s\n' "${{DOCKER_CONTEXT-unset}}" > "${{0%/*}}/run-context"
+fi
+{script}
+"#
+        ))
+    }
+
+    fn assert_docker_run_endpoint(directory: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(directory.join("run-endpoint")).unwrap(),
+            format!("{MOCK_DOCKER_ENDPOINT}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("run-context")).unwrap(),
+            "unset\n"
+        );
+    }
+
     fn diagnostic_session(runtime: &str) -> ContainerSession {
         let mut session: ContainerSession = toml::from_str(&format!(
             "name = 'Diagnostics'\nimage = 'test:latest'\ncommand = 'foot'\nruntime = '{runtime}'"
@@ -3287,7 +3316,7 @@ fi
 
     #[test]
     fn docker_launch_uses_checked_binary_and_labels_the_attempt() {
-        let (runtime_directory, runtime) = mock_runtime(
+        let (runtime_directory, runtime) = mock_docker_runtime(
             r#"
 if [ "$1" = inspect ]; then printf 'false\n'; exit 0; fi
 printf '%s\n' "$@" > "${0%/*}/run-argv"
@@ -3306,8 +3335,10 @@ printf '%s\n' "$@" > "${0%/*}/run-argv"
             while !ready.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
-            assert!(ready.exists(), "fake Waypipe did not start");
-            std::os::unix::net::UnixListener::bind(listener_path).unwrap()
+            if !ready.exists() {
+                return Err("fake Waypipe did not start".to_string());
+            }
+            std::os::unix::net::UnixListener::bind(listener_path).map_err(|error| error.to_string())
         });
         let mut session = diagnostic_session("docker");
         session.socket = Some(socket.to_string_lossy().into_owned());
@@ -3323,8 +3354,9 @@ printf '%s\n' "$@" > "${0%/*}/run-argv"
             warnings: Vec::new(),
         };
         let result = launch_checked_session(&session, "/tmp", "wayland-test", check, |_, _| {});
-        let _listener = listener.join().unwrap();
+        let listener_result = listener.join().unwrap();
         let mut report = result.unwrap();
+        let _listener = listener_result.unwrap();
         let _ = report.waypipe_child.kill();
         let _ = report.waypipe_child.wait();
         assert!(
@@ -3337,6 +3369,7 @@ printf '%s\n' "$@" > "${0%/*}/run-argv"
                 .success()
         );
         assert_eq!(report.identity.runtime_binary(), runtime);
+        assert_docker_run_endpoint(runtime_directory.path());
         let args = std::fs::read_to_string(runtime_directory.path().join("run-argv")).unwrap();
         assert_run_owner_label(
             &args.lines().map(str::to_string).collect::<Vec<_>>(),
@@ -3348,9 +3381,12 @@ printf '%s\n' "$@" > "${0%/*}/run-argv"
     #[test]
     fn image_probes_also_have_unique_owner_labels() {
         for runtime in ["container", "docker"] {
-            let (directory, binary) = mock_runtime(
-                "printf '%s\\n' \"$@\" > \"${0%/*}/run-argv\"; printf 'COCOA_WAY_IMAGE_PROBE_STARTED\\n'",
-            );
+            let script = "printf '%s\\n' \"$@\" > \"${0%/*}/run-argv\"; printf 'COCOA_WAY_IMAGE_PROBE_STARTED\\n'";
+            let (directory, binary) = if runtime == "docker" {
+                mock_docker_runtime(script)
+            } else {
+                mock_runtime(script)
+            };
             let mut session = diagnostic_session(runtime);
             session.audio = false;
             verify_gui_tools_in_image(
@@ -3362,6 +3398,9 @@ printf '%s\n' "$@" > "${0%/*}/run-argv"
                 &session.image,
             )
             .unwrap();
+            if runtime == "docker" {
+                assert_docker_run_endpoint(directory.path());
+            }
             let args = std::fs::read_to_string(directory.path().join("run-argv")).unwrap();
             let args = args.lines().collect::<Vec<_>>();
             let label = args.windows(2).find(|pair| pair[0] == "--label").unwrap()[1];
@@ -3570,7 +3609,7 @@ printf '%s\n' "$@" > "${0%/*}/run-argv"
     fn docker_preflight_requires_no_apple_runtime_or_relay_tools_and_never_pulls() {
         let directory = tempfile::tempdir().unwrap();
         let calls = directory.path().join("calls");
-        let (_binary_directory, binary) = mock_runtime(&format!(
+        let (binary_directory, binary) = mock_docker_runtime(&format!(
             "printf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = run ]; then printf 'COCOA_WAY_IMAGE_PROBE_STARTED\\n'; fi",
             shell_single_quote(calls.to_str().unwrap())
         ));
@@ -3581,6 +3620,7 @@ printf '%s\n' "$@" > "${0%/*}/run-argv"
                 .unwrap()
                 .is_empty()
         );
+        assert_docker_run_endpoint(binary_directory.path());
         let calls = std::fs::read_to_string(calls).unwrap();
         assert!(calls.contains("image inspect test:latest"));
         assert!(calls.contains("--pull=never"));

@@ -5,6 +5,9 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "container_mode/action_targets.rs"]
+pub(crate) mod action_targets;
+
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub(crate) const ACTION_TIMEOUT: Duration = Duration::from_secs(60);

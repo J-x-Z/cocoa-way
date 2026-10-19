@@ -20,6 +20,7 @@ fn options(nav: usize, rows: &[RuntimeContainerRow]) -> Vec<SelectedRuntimeConta
                 name: row.name.as_ref()?.clone(),
                 label: row.label.clone(),
                 running: row.running,
+                docker_target: row.docker_target.clone(),
             })
         })
         .collect()
@@ -138,7 +139,9 @@ pub(super) fn add(
         mtm,
         TextStyle::Caption,
     );
-    let action_index = selected.map(|row| push_runtime_container_action(&row.runtime, &row.name));
+    let action_index = selected.map(|row| {
+        push_runtime_container_action(&row.runtime, &row.name, row.docker_target.clone())
+    });
     let detail_index = selected.map(|row| {
         let mut actions = RUNTIME_CONTAINER_SELECT_ACTIONS.lock().unwrap();
         let index = actions.len();
@@ -197,6 +200,7 @@ mod tests {
             name: name.map(str::to_owned),
             label: "raw label".into(),
             running,
+            docker_target: None,
         }
     }
 

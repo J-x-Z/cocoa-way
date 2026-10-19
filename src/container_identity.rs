@@ -1,3 +1,4 @@
+use crate::runtime_commands::action_targets::{DockerEndpoint, capture_docker_endpoint};
 use serde::Deserialize;
 use serde::de::{MapAccess, Visitor};
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ pub struct OwnedContainerIdentity {
     runtime_binary: PathBuf,
     owner_token: String,
     child_path: String,
+    docker_endpoint: Option<DockerEndpoint>,
 }
 
 impl OwnedContainerIdentity {
@@ -44,7 +46,24 @@ impl OwnedContainerIdentity {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        Self::with_token(runtime, name, binary, child_path, &token)
+        let mut identity = Self::with_token(runtime, name, binary, child_path, &token)?;
+        if identity.runtime == Runtime::Docker {
+            identity.docker_endpoint = Some(capture_docker_endpoint(
+                std::env::var("DOCKER_CONTEXT").ok().as_deref(),
+                std::env::var("DOCKER_HOST").ok().as_deref(),
+                |args| {
+                    let mut command = Command::new(binary);
+                    command.env("PATH", child_path).args(args);
+                    let output = crate::runtime_commands::capture(command, Duration::from_secs(3))
+                        .map_err(|error| error.to_string())?;
+                    if !output.status.success() {
+                        return Err("Docker endpoint could not be captured; no owned container was started.".into());
+                    }
+                    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+                },
+            )?);
+        }
+        Ok(identity)
     }
 
     pub(super) fn with_token(
@@ -84,6 +103,7 @@ impl OwnedContainerIdentity {
             runtime_binary: binary.to_path_buf(),
             owner_token: token.to_string(),
             child_path: child_path.to_string(),
+            docker_endpoint: None,
         })
     }
 
@@ -108,6 +128,11 @@ impl OwnedContainerIdentity {
     }
 
     pub(super) fn append_owner_label(&self, command: &mut Command) {
+        if let Some(endpoint) = &self.docker_endpoint {
+            // `run` already occupies argv[1]; use a pinned environment for creation.
+            DockerEndpoint::pin_environment(command);
+            command.env("DOCKER_HOST", endpoint.host());
+        }
         if self.runtime != Runtime::OrbStack {
             command
                 .arg("--label")
@@ -277,7 +302,16 @@ pub fn cleanup_owned_instance(identity: &OwnedContainerIdentity) -> Result<(), S
             inspect.args(["inspect", &identity.name]);
         }
         Runtime::Docker => {
-            inspect.args(["container", "inspect", &identity.name]);
+            let endpoint = identity.docker_endpoint.as_ref()
+                .ok_or("owned cleanup refused: no captured Docker endpoint; current context will not be used")?;
+            DockerEndpoint::pin_environment(&mut inspect);
+            inspect.args([
+                "--host",
+                endpoint.host(),
+                "container",
+                "inspect",
+                &identity.name,
+            ]);
         }
         Runtime::OrbStack => unreachable!(),
     }
@@ -300,7 +334,12 @@ pub fn cleanup_owned_instance(identity: &OwnedContainerIdentity) -> Result<(), S
             delete.args(["delete", "--force", &target]);
         }
         Runtime::Docker => {
-            delete.args(["rm", "--force", &target]);
+            let endpoint = identity
+                .docker_endpoint
+                .as_ref()
+                .ok_or("owned cleanup refused: no captured Docker endpoint")?;
+            DockerEndpoint::pin_environment(&mut delete);
+            delete.args(["--host", endpoint.host(), "rm", "--force", "--", &target]);
         }
         Runtime::OrbStack => unreachable!(),
     }
@@ -340,6 +379,7 @@ mod tests {
                 r#"#!/bin/sh
 root=${0%/*}
 printf '%s\n' "$*" >> "$root/commands"
+if [ "$1" = --host ]; then shift 2; fi
 case "$1" in
     inspect|container)
         /bin/cat "$root/inspect.json"
@@ -357,8 +397,19 @@ exit 0
         }
 
         fn identity(&self, runtime: &str) -> OwnedContainerIdentity {
-            OwnedContainerIdentity::with_token(runtime, NAME, &self.binary, "/usr/bin:/bin", TOKEN)
-                .unwrap()
+            let mut identity = OwnedContainerIdentity::with_token(
+                runtime,
+                NAME,
+                &self.binary,
+                "/usr/bin:/bin",
+                TOKEN,
+            )
+            .unwrap();
+            if identity.runtime == Runtime::Docker {
+                identity.docker_endpoint =
+                    Some(DockerEndpoint::local("unix:///captured/docker.sock").unwrap());
+            }
+            identity
         }
 
         fn inspect(&self, value: &str) {
@@ -469,7 +520,9 @@ exit 0
         cleanup_owned_instance(&mock.identity("docker")).unwrap();
         assert_eq!(
             mock.commands(),
-            format!("container inspect {NAME}\nrm --force {DOCKER_ID}\n")
+            format!(
+                "--host unix:///captured/docker.sock container inspect {NAME}\n--host unix:///captured/docker.sock rm --force -- {DOCKER_ID}\n"
+            )
         );
     }
 
@@ -500,7 +553,7 @@ exit 0
                 let expected = if runtime == "container" {
                     format!("inspect {NAME}\n")
                 } else {
-                    format!("container inspect {NAME}\n")
+                    format!("--host unix:///captured/docker.sock container inspect {NAME}\n")
                 };
                 assert_eq!(mock.commands(), expected);
             }
@@ -674,7 +727,7 @@ exit 0
         let competing = mock.directory.path().join("docker");
         std::fs::write(&competing, "#!/bin/sh\nexit 99\n").unwrap();
         std::fs::set_permissions(&competing, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let identity = OwnedContainerIdentity::with_token(
+        let mut identity = OwnedContainerIdentity::with_token(
             "docker",
             NAME,
             &mock.binary,
@@ -682,10 +735,14 @@ exit 0
             TOKEN,
         )
         .unwrap();
+        identity.docker_endpoint =
+            Some(DockerEndpoint::local("unix:///captured/docker.sock").unwrap());
         cleanup_owned_instance(&identity).unwrap();
         assert_eq!(
             mock.commands(),
-            format!("container inspect {NAME}\nrm --force {DOCKER_ID}\n")
+            format!(
+                "--host unix:///captured/docker.sock container inspect {NAME}\n--host unix:///captured/docker.sock rm --force -- {DOCKER_ID}\n"
+            )
         );
 
         mock.inspect("not json");

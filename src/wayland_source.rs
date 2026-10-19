@@ -3,12 +3,15 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use smithay::reexports::wayland_server::backend::{ClientId, Handle};
 use smithay::reexports::wayland_server::{DisplayHandle, ListeningSocket};
 use winit::event_loop::EventLoopProxy;
+
+const MAX_ACCEPTS_PER_PASS: usize = 32;
 
 #[derive(Default)]
 struct OutputInterest {
@@ -16,11 +19,188 @@ struct OutputInterest {
     blocked: HashSet<ClientId>,
 }
 
+#[derive(Default)]
+struct FailureState {
+    recorded: bool,
+    message: Option<String>,
+}
+
+#[derive(Default)]
+struct SourceStatus {
+    stopping: AtomicBool,
+    failure: Mutex<FailureState>,
+    retry: Condvar,
+}
+
+impl SourceStatus {
+    fn stop(&self) {
+        let _guard = self
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.stopping.store(true, Ordering::Release);
+        self.retry.notify_all();
+    }
+
+    fn record_failure(&self, message: String) -> bool {
+        let mut failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.stopping.load(Ordering::Acquire) || failure.recorded {
+            return false;
+        }
+        failure.recorded = true;
+        failure.message = Some(message);
+        true
+    }
+
+    fn fail(&self, message: String, wake: &impl Fn() -> bool) {
+        if self.record_failure(message) {
+            // Failure notification is independent of the ordinary readiness arm.
+            let _ = wake();
+        }
+    }
+
+    fn take_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .message
+            .take()
+    }
+
+    fn retry_interrupted<T>(
+        &self,
+        mut operation: impl FnMut() -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            match operation() {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    let guard = self
+                        .failure
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    // Only interrupted operations back off; the idle poll has no timer.
+                    let _ = self
+                        .retry
+                        .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                            !self.stopping.load(Ordering::Acquire)
+                        })
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+                result => return result.map(Some),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    #[test]
+    fn failure_is_published_before_one_wake_and_taken_once() {
+        let status = SourceStatus::default();
+        let wakes = AtomicUsize::new(0);
+        let wake = || {
+            assert!(status.failure.lock().unwrap().message.is_some());
+            wakes.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        status.fail("first failure".into(), &wake);
+        assert_eq!(status.take_failure().as_deref(), Some("first failure"));
+        assert!(status.take_failure().is_none());
+        status.fail("later failure".into(), &wake);
+        assert!(status.take_failure().is_none());
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn normal_stop_suppresses_failure_and_further_operations() {
+        let status = SourceStatus::default();
+        status.stop();
+        status.fail("shutdown error".into(), &|| {
+            panic!("stop must not wake for failure")
+        });
+        assert!(status.take_failure().is_none());
+        assert_eq!(
+            status
+                .retry_interrupted::<()>(|| panic!("stop must not retry IO"))
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn interrupted_operations_back_off_then_recover() {
+        let status = SourceStatus::default();
+        let started = Instant::now();
+        let mut attempts = 0;
+        let result = status.retry_interrupted(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(42)
+            }
+        });
+        assert_eq!(result.unwrap(), Some(42));
+        assert_eq!(attempts, 3);
+        assert!(started.elapsed() >= Duration::from_millis(2));
+        assert!(status.take_failure().is_none());
+    }
+
+    #[test]
+    fn repeated_interruptions_do_not_fail_a_valid_source_or_spin() {
+        let status = SourceStatus::default();
+        let started = Instant::now();
+        let mut attempts = 0;
+        let result = status
+            .retry_interrupted::<()>(|| {
+                attempts += 1;
+                if attempts <= 16 {
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(result, Some(()));
+        assert_eq!(attempts, 17);
+        assert!(started.elapsed() >= Duration::from_millis(16));
+        assert!(status.take_failure().is_none());
+    }
+
+    #[test]
+    fn stop_cancels_interrupted_retries_without_failure() {
+        let status = SourceStatus::default();
+        let mut attempts = 0;
+        assert_eq!(
+            status
+                .retry_interrupted::<()>(|| {
+                    attempts += 1;
+                    status.stop();
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                })
+                .unwrap(),
+            None,
+        );
+        assert_eq!(attempts, 1);
+        assert!(status.take_failure().is_none());
+    }
+}
+
 /// The readiness thread never dispatches client code; AppKit stays on the main thread.
 pub struct WaylandSource {
     control: UnixStream,
     armed: Arc<AtomicBool>,
-    stopping: Arc<AtomicBool>,
+    status: Arc<SourceStatus>,
     output: Arc<Mutex<OutputInterest>>,
     backend_handle: Option<Handle>,
     thread: Option<JoinHandle<()>>,
@@ -40,50 +220,56 @@ impl WaylandSource {
             Some(listener_fd.as_fd()),
             move || proxy.send_event(()).is_ok(),
             move |output| {
-                loop {
-                    match listener.accept() {
-                        Ok(Some(stream)) => {
-                            log::info!("New client connected");
-                            let monitor = match stream.try_clone() {
-                                Ok(monitor) => Arc::new(monitor),
-                                Err(error) => {
-                                    log::warn!("Could not monitor a Wayland client: {error}");
-                                    continue;
-                                }
-                            };
-                            match handle.insert_client(
-                                stream,
-                                Arc::new(crate::state::ClientState {
-                                    compositor_state: Default::default(),
-                                }),
-                            ) {
-                                Ok(client) => {
-                                    // Backend registration finishes before taking the source lock.
-                                    output.lock().unwrap().clients.insert(client.id(), monitor);
-                                }
-                                Err(error) => {
-                                    log::warn!("Could not register a Wayland client: {error}");
-                                }
-                            }
-                        }
-                        Ok(None) => return true,
-                        Err(error) => {
-                            log::error!("Wayland accept failed: {error}");
-                            return false;
-                        }
-                    }
-                }
+                let Some(stream) = listener.accept()? else {
+                    return Ok(false);
+                };
+                log::info!("New client connected");
+                let monitor = Arc::new(stream.try_clone().map_err(|error| {
+                    io::Error::other(format!("Could not monitor a Wayland client: {error}"))
+                })?);
+                let client = handle
+                    .insert_client(
+                        stream,
+                        Arc::new(crate::state::ClientState {
+                            compositor_state: Default::default(),
+                        }),
+                    )
+                    .map_err(|error| {
+                        io::Error::other(format!("Could not register a Wayland client: {error}"))
+                    })?;
+                // Backend registration finishes before taking the source lock.
+                output.lock().unwrap().clients.insert(client.id(), monitor);
+                Ok(true)
             },
         )?;
         source.backend_handle = Some(backend_handle);
         Ok(source)
     }
 
+    // Accept one client per callback; false means the nonblocking listener is drained.
     fn watch(
         display: BorrowedFd<'_>,
         listener: Option<BorrowedFd<'_>>,
         wake: impl Fn() -> bool + Send + 'static,
-        mut accept: impl FnMut(&Mutex<OutputInterest>) -> bool + Send + 'static,
+        accept: impl FnMut(&Mutex<OutputInterest>) -> io::Result<bool> + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::watch_with_poll(display, listener, wake, accept, |fds| {
+            // No timeout: only readiness, interest changes, rearm, or shutdown wake us.
+            let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn watch_with_poll(
+        display: BorrowedFd<'_>,
+        listener: Option<BorrowedFd<'_>>,
+        wake: impl Fn() -> bool + Send + 'static,
+        mut accept: impl FnMut(&Mutex<OutputInterest>) -> io::Result<bool> + Send + 'static,
+        mut poll: impl FnMut(&mut [libc::pollfd]) -> io::Result<()> + Send + 'static,
     ) -> io::Result<Self> {
         let display = display.try_clone_to_owned()?;
         let listener = listener.map(|fd| fd.try_clone_to_owned()).transpose()?;
@@ -91,15 +277,15 @@ impl WaylandSource {
         control.set_nonblocking(true)?;
         reader.set_nonblocking(true)?;
         let armed = Arc::new(AtomicBool::new(true));
-        let stopping = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(SourceStatus::default());
         let output = Arc::new(Mutex::new(OutputInterest::default()));
         let thread_armed = armed.clone();
-        let thread_stopping = stopping.clone();
+        let thread_status = status.clone();
         let thread_output = output.clone();
         let thread = std::thread::Builder::new()
             .name("wayland-readiness".into())
             .spawn(move || {
-                while !thread_stopping.load(Ordering::Acquire) {
+                'watch: while !thread_status.stopping.load(Ordering::Acquire) {
                     let armed = thread_armed.load(Ordering::Acquire);
                     // Keep each socket alive until poll returns, even if the setter prunes it.
                     let writable: Vec<_> = if armed {
@@ -139,27 +325,51 @@ impl WaylandSource {
                         events: libc::POLLOUT,
                         revents: 0,
                     }));
-                    // No timeout: only readiness, interest changes, rearm, or shutdown wake us.
-                    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
-                    if result < 0 {
-                        let error = io::Error::last_os_error();
-                        if error.kind() == io::ErrorKind::Interrupted {
-                            continue;
+                    match thread_status.retry_interrupted(|| poll(&mut fds)) {
+                        Ok(Some(())) => {}
+                        Ok(None) => break,
+                        Err(error) => {
+                            thread_status
+                                .fail(format!("Wayland readiness wait failed: {error}"), &wake);
+                            break;
                         }
-                        log::error!("Wayland readiness wait failed: {error}");
+                    }
+                    if thread_status.stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if fds.iter().any(|fd| fd.revents & libc::POLLNVAL != 0)
+                        || fds[..3]
+                            .iter()
+                            .any(|fd| fd.revents & (libc::POLLERR | libc::POLLHUP) != 0)
+                    {
+                        thread_status.fail(
+                            "Wayland readiness poll reported an invalid or closed source".into(),
+                            &wake,
+                        );
                         break;
                     }
                     if fds[0].revents != 0 {
                         let mut bytes = [0; 64];
                         while matches!(reader.read(&mut bytes), Ok(count) if count > 0) {}
                     }
-                    if thread_stopping.load(Ordering::Acquire) {
+                    if thread_status.stopping.load(Ordering::Acquire) {
                         break;
                     }
                     let mut ready = fds[2].revents != 0;
                     if fds[1].revents != 0 {
-                        if !accept(&thread_output) {
-                            break;
+                        // Wake dispatch before a connection flood can keep this drain busy.
+                        // Remaining connections keep the listener level-readable; no timer.
+                        for _ in 0..MAX_ACCEPTS_PER_PASS {
+                            match thread_status.retry_interrupted(|| accept(&thread_output)) {
+                                Ok(Some(true)) => {}
+                                Ok(Some(false)) => break,
+                                Ok(None) => break 'watch,
+                                Err(error) => {
+                                    thread_status
+                                        .fail(format!("Wayland accept failed: {error}"), &wake);
+                                    break 'watch;
+                                }
+                            }
                         }
                         ready = true;
                     }
@@ -171,9 +381,13 @@ impl WaylandSource {
                                 && output.clients.contains_key(id)
                         });
                     }
-                    if ready {
+                    if ready && !thread_status.stopping.load(Ordering::Acquire) {
                         // Level readiness must be acknowledged after dispatch, not spun on.
                         if thread_armed.swap(false, Ordering::AcqRel) && !wake() {
+                            // The callback just rejected a wake; do not retry it in a loop.
+                            thread_status.record_failure(
+                                "Wayland readiness wake callback rejected notification".into(),
+                            );
                             break;
                         }
                     }
@@ -182,7 +396,7 @@ impl WaylandSource {
         Ok(Self {
             control,
             armed,
-            stopping,
+            status,
             output,
             backend_handle: None,
             thread: Some(thread),
@@ -237,6 +451,12 @@ impl WaylandSource {
         }
     }
 
+    /// Consume a terminal readiness failure once. Check on wake before dispatch;
+    /// on Some(error), log it and exit the event loop. Normal stop creates no failure.
+    pub fn take_failure(&self) -> Option<String> {
+        self.status.take_failure()
+    }
+
     fn notify(&self) {
         loop {
             match (&self.control).write(&[1]) {
@@ -252,7 +472,7 @@ impl WaylandSource {
     }
 
     pub fn stop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
+        self.status.stop();
         self.notify();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -274,13 +494,18 @@ mod tests {
     use super::*;
     use smithay::reexports::wayland_server::Display;
     use smithay::reexports::wayland_server::backend::DisconnectReason;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Weak, mpsc};
     use std::time::{Duration, Instant};
 
     fn watch_display(display: &Display<()>, tx: mpsc::Sender<()>) -> WaylandSource {
-        let mut source =
-            WaylandSource::watch(display.as_fd(), None, move || tx.send(()).is_ok(), |_| true)
-                .unwrap();
+        let mut source = WaylandSource::watch(
+            display.as_fd(),
+            None,
+            move || tx.send(()).is_ok(),
+            |_| Ok(false),
+        )
+        .unwrap();
         source.backend_handle = Some(display.handle().backend_handle());
         source
     }
@@ -372,9 +597,13 @@ mod tests {
     fn readiness_wakes_once_until_dispatch_acknowledges_it() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let (tx, rx) = mpsc::channel();
-        let source =
-            WaylandSource::watch(server.as_fd(), None, move || tx.send(()).is_ok(), |_| true)
-                .unwrap();
+        let source = WaylandSource::watch(
+            server.as_fd(),
+            None,
+            move || tx.send(()).is_ok(),
+            |_| Ok(false),
+        )
+        .unwrap();
         assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
         client.write_all(&[1]).unwrap();
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -388,10 +617,317 @@ mod tests {
 
     #[test]
     fn stop_interrupts_an_idle_wait() {
-        let (_, server) = UnixStream::pair().unwrap();
-        let mut source = WaylandSource::watch(server.as_fd(), None, || true, |_| true).unwrap();
+        let (_client, server) = UnixStream::pair().unwrap();
+        let mut source =
+            WaylandSource::watch(server.as_fd(), None, || true, |_| Ok(false)).unwrap();
         source.stop();
         assert!(source.thread.is_none());
+        assert!(source.take_failure().is_none());
+    }
+
+    #[test]
+    fn accept_failure_is_durable_and_wakes_once_even_when_disarmed() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let (mut signal, listener) = UnixStream::pair().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = attempts.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut source = WaylandSource::watch(
+            server.as_fd(),
+            Some(listener.as_fd()),
+            move || tx.send(()).is_ok(),
+            move |_| {
+                worker_attempts.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::from_raw_os_error(libc::EMFILE))
+            },
+        )
+        .unwrap();
+        source.armed.store(false, Ordering::Release);
+        signal.write_all(&[1]).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_until(|| source.thread.as_ref().unwrap().is_finished());
+        assert!(
+            source
+                .take_failure()
+                .unwrap()
+                .contains("Wayland accept failed")
+        );
+        assert!(source.take_failure().is_none());
+        source.rearm();
+        source.stop();
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(source.take_failure().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn interrupted_accept_retries_then_preserves_readiness() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let (mut signal, mut listener) = UnixStream::pair().unwrap();
+        let listener_fd = listener.as_fd().try_clone_to_owned().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = attempts.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut source = WaylandSource::watch(
+            server.as_fd(),
+            Some(listener_fd.as_fd()),
+            move || tx.send(()).is_ok(),
+            move |_| {
+                if worker_attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                listener.read_exact(&mut [0])?;
+                Ok(false)
+            },
+        )
+        .unwrap();
+        signal.write_all(&[1]).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert!(source.take_failure().is_none());
+        source.stop();
+        assert!(source.take_failure().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn accept_quantum_wakes_before_draining_a_backlogged_listener() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let (mut signal, mut listener) = UnixStream::pair().unwrap();
+        let listener_fd = listener.as_fd().try_clone_to_owned().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = attempts.clone();
+        let wake_attempts = attempts.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut source = WaylandSource::watch(
+            server.as_fd(),
+            Some(listener_fd.as_fd()),
+            move || tx.send(wake_attempts.load(Ordering::Relaxed)).is_ok(),
+            move |_| {
+                if worker_attempts.fetch_add(1, Ordering::Relaxed) < MAX_ACCEPTS_PER_PASS {
+                    return Ok(true);
+                }
+                listener.read_exact(&mut [0])?;
+                Ok(false)
+            },
+        )
+        .unwrap();
+        signal.write_all(&[1]).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            MAX_ACCEPTS_PER_PASS,
+        );
+        wait_until(|| attempts.load(Ordering::Relaxed) == MAX_ACCEPTS_PER_PASS + 1);
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        source.stop();
+        assert!(source.take_failure().is_none());
+    }
+
+    #[test]
+    fn poll_failure_is_recorded_before_one_wake_without_retry() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = attempts.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut source = WaylandSource::watch_with_poll(
+            server.as_fd(),
+            None,
+            move || tx.send(()).is_ok(),
+            |_| panic!("poll failure must not attempt accept"),
+            move |_| {
+                worker_attempts.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            },
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            source
+                .take_failure()
+                .unwrap()
+                .contains("Wayland readiness wait failed")
+        );
+        assert!(source.take_failure().is_none());
+        source.stop();
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn normal_stop_suppresses_a_concurrent_poll_error() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let (started, started_rx) = mpsc::channel();
+        let (finish, finish_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let mut source = WaylandSource::watch_with_poll(
+            server.as_fd(),
+            None,
+            move || tx.send(()).is_ok(),
+            |_| Ok(false),
+            move |_| {
+                started.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            },
+        )
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        source.status.stop();
+        finish.send(()).unwrap();
+        source.stop();
+        assert!(source.take_failure().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn normal_stop_cancels_a_continuously_accepting_callback() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let (mut signal, listener) = UnixStream::pair().unwrap();
+        let (started, started_rx) = mpsc::channel();
+        let mut announced = false;
+        let (tx, rx) = mpsc::channel();
+        let mut source = WaylandSource::watch(
+            server.as_fd(),
+            Some(listener.as_fd()),
+            move || tx.send(()).is_ok(),
+            move |_| {
+                if !announced {
+                    announced = true;
+                    started.send(()).unwrap();
+                }
+                std::thread::yield_now();
+                Ok(true)
+            },
+        )
+        .unwrap();
+        signal.write_all(&[1]).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        source.stop();
+        assert!(source.take_failure().is_none());
+        // The first bounded quantum may have posted its ordinary readiness wake.
+        assert!(rx.try_iter().count() <= 1);
+    }
+
+    #[test]
+    fn repeated_poll_interruptions_recover_without_losing_readiness() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&[1]).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = attempts.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut source = WaylandSource::watch_with_poll(
+            server.as_fd(),
+            None,
+            move || tx.send(()).is_ok(),
+            |_| panic!("interrupted poll must not attempt accept"),
+            move |fds| {
+                if worker_attempts.fetch_add(1, Ordering::Relaxed) < 20 {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+                if result < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(source.take_failure().is_none());
+        source.stop();
+        assert!(attempts.load(Ordering::Relaxed) >= 21);
+        assert!(source.take_failure().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn invalid_poll_descriptor_reports_failure_instead_of_hotlooping() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = attempts.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut source = WaylandSource::watch_with_poll(
+            server.as_fd(),
+            None,
+            move || tx.send(()).is_ok(),
+            |_| Ok(false),
+            move |fds| {
+                worker_attempts.fetch_add(1, Ordering::Relaxed);
+                fds[2].revents = libc::POLLNVAL;
+                Ok(())
+            },
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            source
+                .take_failure()
+                .unwrap()
+                .contains("invalid or closed source")
+        );
+        source.stop();
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(source.take_failure().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rejected_readiness_wake_records_failure_without_retrying_callback() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let worker_wakes = wakes.clone();
+        let mut source = WaylandSource::watch(
+            server.as_fd(),
+            None,
+            move || {
+                worker_wakes.fetch_add(1, Ordering::Relaxed);
+                false
+            },
+            |_| Ok(false),
+        )
+        .unwrap();
+        client.write_all(&[1]).unwrap();
+        wait_until(|| source.thread.as_ref().unwrap().is_finished());
+        assert!(
+            source
+                .take_failure()
+                .unwrap()
+                .contains("wake callback rejected")
+        );
+        source.rearm();
+        source.stop();
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(source.take_failure().is_none());
+    }
+
+    #[test]
+    fn rejected_failure_wake_keeps_diagnostic_without_retrying_callback() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let worker_wakes = wakes.clone();
+        let mut source = WaylandSource::watch_with_poll(
+            server.as_fd(),
+            None,
+            move || {
+                worker_wakes.fetch_add(1, Ordering::Relaxed);
+                false
+            },
+            |_| Ok(false),
+            |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap();
+        wait_until(|| source.thread.as_ref().unwrap().is_finished());
+        assert!(
+            source
+                .take_failure()
+                .unwrap()
+                .contains("Wayland readiness wait failed")
+        );
+        source.rearm();
+        source.stop();
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(source.take_failure().is_none());
     }
 
     #[test]
@@ -403,9 +939,13 @@ mod tests {
             .insert_client(server, Arc::new(()))
             .unwrap();
         let (tx, rx) = mpsc::channel();
-        let source =
-            WaylandSource::watch(display.as_fd(), None, move || tx.send(()).is_ok(), |_| true)
-                .unwrap();
+        let source = WaylandSource::watch(
+            display.as_fd(),
+            None,
+            move || tx.send(()).is_ok(),
+            |_| Ok(false),
+        )
+        .unwrap();
         // wl_display.sync, new callback ID 2. The backend handles this core request.
         for id in [2_u32, 3] {
             let mut message = Vec::new();
@@ -530,7 +1070,7 @@ mod tests {
                     .unwrap()
                     .clients
                     .insert(accepted_id.clone(), monitor.clone());
-                true
+                Ok(false)
             },
         )
         .unwrap();

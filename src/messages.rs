@@ -142,18 +142,22 @@ pub enum CompositorMessage {
     StopRuntimeContainer {
         runtime: String,
         name: String,
+        docker_target: Option<crate::runtime_commands::action_targets::DockerDeleteTarget>,
     },
     StartRuntimeContainer {
         runtime: String,
         name: String,
+        docker_target: Option<crate::runtime_commands::action_targets::DockerDeleteTarget>,
     },
     RestartRuntimeContainer {
         runtime: String,
         name: String,
+        docker_target: Option<crate::runtime_commands::action_targets::DockerDeleteTarget>,
     },
     DeleteRuntimeContainer {
         runtime: String,
         name: String,
+        docker_target: Option<crate::runtime_commands::action_targets::DockerDeleteTarget>,
     },
     OpenRuntimeContainerTerminal {
         runtime: String,

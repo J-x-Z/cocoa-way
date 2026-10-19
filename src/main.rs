@@ -682,6 +682,30 @@ fn sync_active_container_sessions(active: &[ActiveContainerSession]) {
     );
 }
 
+fn sync_stoppable_profiles(
+    active: &[ActiveContainerSession],
+    pending: &HashMap<ProfileId, PendingProfileOperation>,
+) {
+    use runtime_commands::action_targets::StoppableProfile;
+    container_mode::record_stoppable_profiles(
+        active
+            .iter()
+            .map(|instance| StoppableProfile {
+                id: instance.profile_id,
+                name: instance.launched_session.name.clone(),
+                runtime: instance.launched_session.runtime.clone(),
+                pending: false,
+            })
+            .chain(pending.iter().map(|(id, operation)| StoppableProfile {
+                id: *id,
+                name: operation.session.name.clone(),
+                runtime: operation.session.runtime.clone(),
+                pending: true,
+            }))
+            .collect(),
+    );
+}
+
 fn sync_managed_displays(displays: &[ManagedDisplay]) {
     container_mode::record_managed_displays(
         displays
@@ -1490,6 +1514,16 @@ fn spawn_apple_container_system_start(sender: Sender<CompositorMessage>) {
 }
 
 fn spawn_image_delete(sender: Sender<CompositorMessage>, runtime: String, image: String) {
+    if let Some(error) = runtime_commands::action_targets::unpinned_resource_delete_error(&runtime)
+    {
+        let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+            runtime: format!("delete:{runtime}"),
+            image,
+            success: false,
+            status: error.into(),
+        });
+        return;
+    }
     std::thread::spawn(move || {
         let child_path = runtime_paths::build_child_path();
         let runtime_key = runtime.trim().to_ascii_lowercase();
@@ -1499,7 +1533,6 @@ fn spawn_image_delete(sender: Sender<CompositorMessage>, runtime: String, image:
                 "container",
                 vec!["image".into(), "delete".into(), image.clone()],
             ),
-            "docker" => ("docker", vec!["image".into(), "rm".into(), image.clone()]),
             _ => {
                 let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
                     runtime: operation_runtime,
@@ -1579,6 +1612,16 @@ fn spawn_image_delete(sender: Sender<CompositorMessage>, runtime: String, image:
 }
 
 fn spawn_volume_delete(sender: Sender<CompositorMessage>, runtime: String, volume: String) {
+    if let Some(error) = runtime_commands::action_targets::unpinned_resource_delete_error(&runtime)
+    {
+        let _ = sender.send(CompositorMessage::ContainerVolumeDeleteFinished {
+            runtime,
+            volume,
+            success: false,
+            status: error.into(),
+        });
+        return;
+    }
     std::thread::spawn(move || {
         let child_path = runtime_paths::build_child_path();
         let runtime_key = runtime.trim().to_ascii_lowercase();
@@ -1587,7 +1630,6 @@ fn spawn_volume_delete(sender: Sender<CompositorMessage>, runtime: String, volum
                 "container",
                 vec!["volume".into(), "delete".into(), volume.clone()],
             ),
-            "docker" => ("docker", vec!["volume".into(), "rm".into(), volume.clone()]),
             _ => {
                 let _ = sender.send(CompositorMessage::ContainerVolumeDeleteFinished {
                     runtime,
@@ -1820,7 +1862,15 @@ fn spawn_runtime_container_action(
     runtime: String,
     name: String,
     action: String,
+    docker_target: Option<runtime_commands::action_targets::DockerDeleteTarget>,
 ) {
+    if matches!(
+        runtime.trim().to_ascii_lowercase().as_str(),
+        "docker" | "orb" | "orbstack"
+    ) {
+        spawn_captured_docker_action(sender, runtime, name, action, docker_target);
+        return;
+    }
     if action == "restart"
         && matches!(
             runtime.trim().to_ascii_lowercase().as_str(),
@@ -1916,6 +1966,63 @@ fn spawn_runtime_container_action(
     });
 }
 
+fn spawn_runtime_container_delete(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    name: String,
+    docker_target: Option<runtime_commands::action_targets::DockerDeleteTarget>,
+) {
+    if matches!(runtime.as_str(), "apple" | "container") {
+        spawn_runtime_container_action(sender, runtime, name, "delete".into(), None);
+        return;
+    }
+    spawn_captured_docker_action(sender, runtime, name, "delete".into(), docker_target);
+}
+
+fn spawn_captured_docker_action(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    name: String,
+    action: String,
+    docker_target: Option<runtime_commands::action_targets::DockerDeleteTarget>,
+) {
+    std::thread::spawn(move || {
+        let result = docker_target.ok_or_else(|| {
+            "Action refused: no captured Docker endpoint and immutable container ID. Reload the inventory.".to_string()
+        }).and_then(|target| {
+            let mut command = target.operation_command(&action)?;
+            command.env("PATH", runtime_paths::build_child_path());
+            runtime_commands::capture(command, runtime_commands::ACTION_TIMEOUT)
+                .map_err(|error| error.to_string())
+        });
+        let (success, status) = match result {
+            Ok(output) => {
+                for line in process_output::captured_lines(&output, &[]) {
+                    process_output::send(
+                        &sender,
+                        line.len(),
+                        CompositorMessage::RuntimeContainerActionLog {
+                            runtime: runtime.clone(),
+                            name: name.clone(),
+                            action: action.clone(),
+                            line,
+                        },
+                    );
+                }
+                (output.status.success(), output.status.to_string())
+            }
+            Err(error) => (false, error),
+        };
+        let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+            runtime,
+            name,
+            action,
+            success,
+            status,
+        });
+    });
+}
+
 fn runtime_container_command(
     runtime: &str,
     action: &str,
@@ -1930,15 +2037,8 @@ fn runtime_container_command(
             "container",
             vec!["delete".into(), "--force".into(), name.into()],
         )),
-        ("docker" | "orb" | "orbstack", "start" | "stop") => {
-            Some(("docker", vec![action.into(), name.into()]))
-        }
-        ("docker" | "orb" | "orbstack", "restart") => {
-            Some(("docker", vec!["restart".into(), name.into()]))
-        }
-        ("docker" | "orb" | "orbstack", "delete") => {
-            Some(("docker", vec!["rm".into(), "-f".into(), name.into()]))
-        }
+        // Docker lifecycle operations must use the captured endpoint and full ID.
+        ("docker" | "orb" | "orbstack", _) => None,
         _ => None,
     }
 }
@@ -3141,11 +3241,11 @@ mod display_slot_tests {
         );
         assert_eq!(
             runtime_container_command("orbstack", "delete", "worker"),
-            Some(("docker", vec!["rm".into(), "-f".into(), "worker".into()]))
+            None
         );
         assert_eq!(
             runtime_container_command("docker", "restart", "desktop"),
-            Some(("docker", vec!["restart".into(), "desktop".into()]))
+            None
         );
     }
 
@@ -3960,6 +4060,13 @@ fn create_event_handler(
     let mut reveal_first_desktop_client = !presentation_mode.is_rootless();
     Ok(move |event: Event<()>, target: &ActiveEventLoop| {
         lifecycle_cleanup.poll();
+        if !matches!(&event, Event::LoopExiting)
+            && let Some(error) = wayland_source.take_failure()
+        {
+            log::error!("Wayland readiness cannot continue safely: {error}");
+            target.exit();
+            return;
+        }
         let input_trace = if state.latency_trace.enabled()
             && matches!(
                 &event,
@@ -4093,6 +4200,7 @@ fn create_event_handler(
         }
         let mut message_budget =
             event_turn::ControlWorkBudget::new(input_event, std::time::Instant::now());
+        let mut profile_ownership_changed = false;
         while message_budget.admit(std::time::Instant::now()) {
             let Ok(msg) = loop_receiver.try_recv() else {
                 break;
@@ -4136,6 +4244,19 @@ fn create_event_handler(
                 }
                 message => message,
             };
+            // Publish once after the batch, including branches that continue early.
+            profile_ownership_changed |= matches!(
+                &msg,
+                CompositorMessage::CheckContainerSession(_)
+                    | CompositorMessage::StartContainerSession(_)
+                    | CompositorMessage::ContainerSessionChecked { .. }
+                    | CompositorMessage::DedicatedDisplayStarted { .. }
+                    | CompositorMessage::DedicatedDisplayFailed { .. }
+                    | CompositorMessage::ContainerSessionLaunchFinished { .. }
+                    | CompositorMessage::StopContainerSession(_)
+                    | CompositorMessage::ForceStopContainerSession(_)
+                    | CompositorMessage::CreateManagedDisplay(_)
+            );
             match msg {
                 CompositorMessage::LifecycleCleanupReady => lifecycle_cleanup.poll(),
                 CompositorMessage::ProcessOutput { .. } => {
@@ -5366,6 +5487,11 @@ fn create_event_handler(
                     }
                 }
                 CompositorMessage::ForceStopContainerSession(i) => {
+                    if pending_profile_operations.contains_key(&i) {
+                        let _ =
+                            container_event_signal.send(CompositorMessage::StopContainerSession(i));
+                        continue;
+                    }
                     log::warn!("Force stopping container session #{}", i);
                     container_mode::record_stop_progress(
                         i,
@@ -5496,7 +5622,11 @@ fn create_event_handler(
                     container_mode::record_volume_create_started(&runtime, &volume);
                     spawn_volume_create(container_event_signal.clone(), runtime, volume);
                 }
-                CompositorMessage::StopRuntimeContainer { runtime, name } => {
+                CompositorMessage::StopRuntimeContainer {
+                    runtime,
+                    name,
+                    docker_target,
+                } => {
                     container_mode::record_runtime_container_action_started(
                         &runtime, &name, "stop",
                     );
@@ -5505,9 +5635,14 @@ fn create_event_handler(
                         runtime,
                         name,
                         "stop".into(),
+                        docker_target,
                     );
                 }
-                CompositorMessage::StartRuntimeContainer { runtime, name } => {
+                CompositorMessage::StartRuntimeContainer {
+                    runtime,
+                    name,
+                    docker_target,
+                } => {
                     container_mode::record_runtime_container_action_started(
                         &runtime, &name, "start",
                     );
@@ -5516,9 +5651,14 @@ fn create_event_handler(
                         runtime,
                         name,
                         "start".into(),
+                        docker_target,
                     );
                 }
-                CompositorMessage::RestartRuntimeContainer { runtime, name } => {
+                CompositorMessage::RestartRuntimeContainer {
+                    runtime,
+                    name,
+                    docker_target,
+                } => {
                     container_mode::record_runtime_container_action_started(
                         &runtime, &name, "restart",
                     );
@@ -5527,17 +5667,22 @@ fn create_event_handler(
                         runtime,
                         name,
                         "restart".into(),
+                        docker_target,
                     );
                 }
-                CompositorMessage::DeleteRuntimeContainer { runtime, name } => {
+                CompositorMessage::DeleteRuntimeContainer {
+                    runtime,
+                    name,
+                    docker_target,
+                } => {
                     container_mode::record_runtime_container_action_started(
                         &runtime, &name, "delete",
                     );
-                    spawn_runtime_container_action(
+                    spawn_runtime_container_delete(
                         container_event_signal.clone(),
                         runtime,
                         name,
-                        "delete".into(),
+                        docker_target,
                     );
                 }
                 CompositorMessage::OpenRuntimeContainerTerminal { runtime, name } => {
@@ -5724,6 +5869,9 @@ fn create_event_handler(
                     );
                 }
             }
+        }
+        if profile_ownership_changed {
+            sync_stoppable_profiles(&active_container_sessions, &pending_profile_operations);
         }
         reconcile_pointer_lock(
             &mut state,
@@ -6678,6 +6826,7 @@ fn create_event_handler(
                 if now >= next_maintenance {
                     state.poll_host_clipboard();
                     reap_classic_connections(&mut active_classic_connections);
+                    let previous_active_count = active_container_sessions.len();
                     reap_exited_managed_displays(
                         &mut managed_displays,
                         &mut active_container_sessions,
@@ -6689,6 +6838,12 @@ fn create_event_handler(
                         &mut lifecycle_cleanup,
                     );
                     sync_active_container_sessions(&active_container_sessions);
+                    if active_container_sessions.len() != previous_active_count {
+                        sync_stoppable_profiles(
+                            &active_container_sessions,
+                            &pending_profile_operations,
+                        );
+                    }
                     next_maintenance = now + maintenance_interval;
                 }
                 let wayland_dispatch_pending = match dispatch_wayland_turn(&mut display, &mut state)
