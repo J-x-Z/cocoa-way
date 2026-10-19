@@ -201,6 +201,97 @@ class Relay:
         return stats
 
 
+class StdioReadAdmission(unittest.TestCase):
+    def check_admission(self, setup, expected_size, expected_data):
+        # Seed real production queues without draining stdout or depending on
+        # kernel pipe sizes. Exercise both the production poll mask and read arm.
+        imports = SCRIPT[:SCRIPT.index("my $sock_path = shift @ARGV;")]
+        state = SCRIPT[SCRIPT.index("my $chunk_size ="):SCRIPT.index("RELAY: while (1) {")]
+        watch_start = SCRIPT.index("  for my $p (values %peers) {\n    my $events =")
+        watch = SCRIPT[watch_start:SCRIPT.index("\n  my $ready =", watch_start)]
+        read_start = SCRIPT.index("\n    my $id = $peer_ids{fileno($fh)};") + 1
+        read = SCRIPT[read_start:SCRIPT.index("\n  }\n}\nfor my $id", read_start)]
+        script = imports + r"""
+use Socket qw(AF_UNIX SOCK_STREAM PF_UNSPEC);
+socketpair(my $server, my $writer, AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die "socketpair: $!";
+binmode $server;
+binmode $writer;
+""" + state + setup + f"""
+my $expected_size = {expected_size};
+my $expected_data = pack('H*', '{expected_data.hex()}');
+""" + r"""
+my @before = map { $_->[0] } @output;
+my $before_bytes = $output_bytes;
+$peers{7} = { fh => $server, queue => [], bytes => 0, closing => 0, notify => 0 };
+$peer_ids{fileno($server)} = 7;
+syswrite($writer, 'tiny') == 4 or die "fixture write: $!";
+die "wrong read size" unless peer_read_size() == $expected_size;
+my $poll = IO::Poll->new();
+""" + watch + r"""
+my $admitted = (($poll->mask($server) || 0) & POLLIN) != 0;
+die "wrong poll admission" unless $admitted == ($expected_size > 0);
+if ($admitted) {
+  $poll->poll(0);
+  die "tiny peer not ready" unless $poll->events($server) & POLLIN;
+}
+# Also exercise the final guard for a stale ready handle with no capacity.
+for my $fh ($server) {
+""" + read + r"""
+}
+die "peer spuriously closed" if $peers{7}{closing};
+die "queue overflow" if $output_bytes > $output_limit || @output > $chunks_limit;
+for my $i (0 .. $#before) {
+  die "FIFO changed" unless $output[$i][0] eq $before[$i] && $output[$i][1] == 0;
+}
+my $added = length($expected_data) ? 1 : 0;
+die "wrong frame count" unless @output == @before + $added;
+die "wrong byte count" unless $output_bytes == $before_bytes + ($added ? 9 + length($expected_data) : 0);
+die "wrong read cursor" unless $read_cursor == ($added ? 8 : 0);
+if ($added) {
+  die "wrong DATA frame" unless $output[-1][0] eq pack('CNN', 2, 7, length($expected_data)) . $expected_data;
+}
+if (length($expected_data) < 4) {
+  my $left = '';
+  my $n = sysread($server, $left, 4);
+  die "peer bytes lost" unless defined $n && $left eq substr('tiny', length($expected_data));
+}
+print "ok\n";
+"""
+        result = subprocess.run(["perl", "-e", script], capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertEqual(result.stdout, b"ok\n")
+
+    def test_three_full_frames_admit_tiny_peer_without_draining_output(self):
+        self.check_admission(
+            "send_frame(2, 1, 'b' x $chunk_size) for 1 .. 3;\n",
+            65500, b"tiny",
+        )
+
+    def test_no_header_or_payload_capacity_does_not_read_or_close_peer(self):
+        for remaining in (0, 8, 9):
+            with self.subTest(remaining=remaining):
+                self.check_admission(
+                    "send_frame(2, 1, 'b' x $chunk_size) for 1 .. 3;\n"
+                    f"send_frame(2, 1, 'c' x ($output_limit - $output_bytes - 9 - {remaining}));\n",
+                    0, b"",
+                )
+
+    def test_one_payload_byte_fills_capacity_without_overflow(self):
+        self.check_admission(
+            "send_frame(2, 1, 'b' x $chunk_size) for 1 .. 3;\n"
+            "send_frame(2, 1, 'c' x ($output_limit - $output_bytes - 9 - 10));\n",
+            1, b"t",
+        )
+
+    def test_max_payload_and_chunk_limit_are_retained(self):
+        with self.subTest(limit="payload"):
+            self.check_admission("", 65536, b"tiny")
+        with self.subTest(limit="chunks"):
+            self.check_admission(
+                "send_frame(2, 1, '') for 1 .. $chunks_limit;\n", 0, b"",
+            )
+
+
 class StdioBackpressure(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -5979,6 +5979,7 @@ fn create_event_handler(
                             let callback_time = state.start_time.elapsed().as_millis() as u32;
                             let root_surface = rootless.surface_id();
                             state.send_frame_callbacks_for(Some(&root_surface), callback_time);
+                            flush_wayland_output(&mut display, &wayland_source);
                         } else {
                             state.rootless_dirty_surfaces.insert(rootless.surface_id());
                             state.needs_redraw = true;
@@ -6569,6 +6570,7 @@ fn create_event_handler(
                                 } else if submitted {
                                     let t = state.start_time.elapsed().as_millis() as u32;
                                     state.send_frame_callbacks_for(None, t);
+                                    flush_wayland_output(&mut display, &wayland_source);
                                 } else {
                                     failed_redraw_retries.insert(
                                         window_id,

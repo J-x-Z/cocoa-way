@@ -988,6 +988,13 @@ sub send_frame {
   $stats{output_chunks_high} = @output if $test_stats && @output > $stats{output_chunks_high};
 }
 
+sub peer_read_size {
+  return 0 if @output >= $chunks_limit;
+  my $size = $output_limit - $output_bytes - 9;
+  return 0 if $size <= 0;
+  return $size < $chunk_size ? $size : $chunk_size;
+}
+
 sub closing_peer {
   my ($id, $notify, $discard) = @_;
   my $p = $peers{$id} or return;
@@ -1074,7 +1081,7 @@ RELAY: while (1) {
   for my $p (values %peers) {
     my $events = $p->{bytes} ? POLLOUT : 0;
     if (!$p->{closing} && !$transport_eof && !$child_exited) {
-      if ($output_bytes + $chunk_size + 9 <= $output_limit && @output < $chunks_limit) {
+      if (peer_read_size()) {
         $events |= POLLIN;
       } else {
         $stats{output_pauses}++ if $test_stats;
@@ -1178,10 +1185,11 @@ RELAY: while (1) {
 
     my $id = $peer_ids{fileno($fh)};
     my $p = $peers{$id} or next;
-    next if $p->{closing} || $output_bytes + $chunk_size + 9 > $output_limit || @output >= $chunks_limit;
+    my $size = peer_read_size();
+    next if $p->{closing} || !$size;
     $read_cursor = $id + 1;
     my $data = '';
-    my $n = sysread($fh, $data, $chunk_size);
+    my $n = sysread($fh, $data, $size);
     next if retry_io($n, 0);
     if (!defined $n || $n == 0) {
       closing_peer($id, 1, 0);

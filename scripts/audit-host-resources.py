@@ -40,6 +40,25 @@ resources = module("audit_resource_sampler", ROOT / "scripts/sample-process-reso
 native = module("audit_process_identity", ROOT / "scripts/audit-native-probe.py")
 
 
+def mach_ticks_to_ns(ticks, numer, denom):
+    if any(type(value) is not int for value in (ticks, numer, denom)) or ticks < 0 or numer <= 0 or denom <= 0:
+        raise ValueError("invalid Mach tick count or timebase")
+    return ticks * numer // denom
+
+
+def mach_timebase():
+    class Timebase(ctypes.Structure):
+        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+    system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    system.mach_timebase_info.argtypes = [ctypes.POINTER(Timebase)]
+    system.mach_timebase_info.restype = ctypes.c_int
+    result = Timebase()
+    if system.mach_timebase_info(ctypes.byref(result)):
+        raise RuntimeError("Mach timebase unavailable; refusing mislabeled CPU times")
+    mach_ticks_to_ns(0, result.numer, result.denom)
+    return result.numer, result.denom
+
+
 def kernel_interval(previous, current):
     elapsed = current["kernel_host_monotonic_ns"] - previous["kernel_host_monotonic_ns"]
     if elapsed <= 0:
@@ -78,6 +97,7 @@ def capture(args):
     identity = native.process_identity(libproc, pid)
     if expected_uuid != identity[0]:
         raise ValueError("loaded host UUID differs from verified executable file")
+    numer, denom = mach_timebase()
     def read_usage():
         started = time.monotonic_ns()
         data = native.Usage()
@@ -88,7 +108,11 @@ def capture(args):
             raise ProcessLookupError("host exited/reused during observation")
         return {"kernel_host_monotonic_ns": (started + finished) // 2,
             "kernel_read_started_ns": started, "kernel_read_finished_ns": finished,
-            "cpu_ns": data.user + data.system, "interrupt_wakes": data.interrupt_wakes,
+            # XNU fill_task_rusage -> task_power_info_locked returns Mach ticks.
+            # https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/bsd_kern.c
+            "cpu_mach_ticks": data.user + data.system,
+            "cpu_ns": mach_ticks_to_ns(data.user + data.system, numer, denom),
+            "interrupt_wakes": data.interrupt_wakes,
             "package_idle_wakes": data.package_wakes, "resident_bytes": data.resident,
             "physical_footprint_bytes": data.footprint}
     deadline = time.monotonic() + args.duration + 6
@@ -106,6 +130,8 @@ def capture(args):
     report.update(kind="actual_host_resources", label=args.label, fixture=fixture,
         pid_identity_verified=True, loaded_uuid=identity[0].hex(), process_start_abstime=identity[1],
         kernel_api="macOS proc_pid_rusage RUSAGE_INFO_V0", kernel_intervals=intervals,
+        cpu_time_conversion={"source_units": "mach_absolute_ticks", "numer": numer, "denom": denom,
+                             "reported_units": "nanoseconds", "conversion": "ticks * numer // denom"},
         measured_watts=None, battery_impact=None, idle_condition_verified_by_sampler=False,
         host_or_client_lifecycle_modified=False)
     report["kernel_summary"] = {key: resources.quantiles([row[key] for row in intervals]) for key in
@@ -123,6 +149,16 @@ def capture(args):
 
 
 class Tests(unittest.TestCase):
+    def test_mach_ticks_are_not_nanoseconds_on_apple_silicon(self):
+        self.assertEqual(mach_ticks_to_ns(24_000_000, 125, 3), 1_000_000_000)
+        self.assertEqual(mach_ticks_to_ns(1_000_000_000, 1, 1), 1_000_000_000)
+        self.assertEqual(mach_ticks_to_ns(2**64 - 1, 125, 3), (2**64 - 1) * 125 // 3)
+
+    def test_invalid_mach_conversion_rejected(self):
+        for values in ((1, 1, 0), (-1, 125, 3), (1, 0, 3), (1, 1.5, 3), (True, 1, 1)):
+            with self.assertRaises(ValueError):
+                mach_ticks_to_ns(*values)
+
     def test_rates_and_rejection(self):
         before = {"kernel_host_monotonic_ns": 0, "cpu_ns": 0, "interrupt_wakes": 0, "package_idle_wakes": 0}
         after = {"kernel_host_monotonic_ns": 1_000_000_000, "cpu_ns": 50_000_000, "interrupt_wakes": 2, "package_idle_wakes": 1}
