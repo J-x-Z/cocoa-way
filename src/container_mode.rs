@@ -31,6 +31,7 @@ use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quo
 mod displays;
 mod native_layout;
 mod panel_shell;
+mod runtime_quick_controls;
 mod startup_report;
 use native_layout::{TextStyle, label_font, scroll_distance_from_top, scroll_origin_for_distance};
 
@@ -5155,6 +5156,11 @@ declare_class!(
             send(CompositorMessage::StopRuntimeContainer { runtime, name });
         }
 
+        #[method(selectQuickRuntimeContainer:)]
+        fn select_quick_runtime_container(&self, sender: &AnyObject) {
+            runtime_quick_controls::select(sender);
+        }
+
         #[method(startRuntimeContainer:)]
         fn start_runtime_container(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
@@ -5690,9 +5696,9 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     let viewport = unsafe { scroll.contentSize() };
     let content_w = viewport.width;
     let min_page_height = match selected_nav {
-        NAV_APPLE_CONTAINER => 1892.0,
-        NAV_ORBSTACK => 1520.0,
-        NAV_DOCKER => 1760.0,
+        NAV_APPLE_CONTAINER => 1892.0 + runtime_quick_controls::RESERVED_HEIGHT,
+        NAV_ORBSTACK => 1520.0 + runtime_quick_controls::RESERVED_HEIGHT,
+        NAV_DOCKER => 1760.0 + runtime_quick_controls::RESERVED_HEIGHT,
         NAV_IMAGES => 1800.0,
         NAV_VOLUMES => 1400.0,
         NAV_ACTIVITY => 1560.0,
@@ -6945,6 +6951,16 @@ fn add_runtime_list(
         }
     }
     y -= 42.0;
+
+    y = runtime_quick_controls::add(
+        parent,
+        width,
+        y,
+        selected_nav,
+        &container_rows,
+        handler,
+        mtm,
+    );
 
     if let Some((container, notice)) = selected_container {
         add_label(

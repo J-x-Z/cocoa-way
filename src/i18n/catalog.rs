@@ -92,6 +92,12 @@ macro_rules! chinese_catalog {
 }
 
 chinese_catalog! {
+    "Container Quick Controls" => "容器快捷操作",
+    "Controls container lifecycle, not application launch." => "管理容器的启停；图形应用仍从“应用”页面启动。",
+    "Select a container" => "选择容器",
+    "No actionable containers. Reload after starting the runtime." => "暂无可操作容器，请启动运行时后重新加载。",
+    "Start Container" => "启动容器",
+    "Stop Container" => "停止容器",
     "New Display Window" => "新建显示窗口",
     "Startup Diagnostics" => "启动诊断",
     "Diagnostics cancelled because Cocoa-Way is shutting down." => "Cocoa-Way 正在退出，诊断已取消。",
