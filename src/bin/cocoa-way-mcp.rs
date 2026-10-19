@@ -1,4 +1,4 @@
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -13,17 +13,27 @@ use control_protocol::ControlRequest;
 
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const MAX_MCP_FRAME_BYTES: usize = 64 * 1024;
 
 fn main() {
     let options = parse_arguments(std::env::args().skip(1)).unwrap_or_else(|error| fail(&error));
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let mut initialized = false;
+    let mut input = stdin.lock();
 
-    for line in stdin.lock().lines() {
+    loop {
+        let line = match read_mcp_frame(&mut input) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) => {
+                eprintln!("cocoa-way-mcp: failed to read stdin: {error}");
+                break;
+            }
+        };
         let response = match line {
-            Ok(line) if line.trim().is_empty() => None,
-            Ok(line) => match serde_json::from_str::<Value>(&line) {
+            line if line.trim().is_empty() => None,
+            line => match serde_json::from_str::<Value>(&line) {
                 Ok(message) => handle_message(
                     &message,
                     &options.socket,
@@ -36,10 +46,6 @@ fn main() {
                     format!("Parse error: {error}"),
                 )),
             },
-            Err(error) => {
-                eprintln!("cocoa-way-mcp: failed to read stdin: {error}");
-                break;
-            }
         };
         if let Some(response) = response {
             match serde_json::to_string(&response) {
@@ -55,6 +61,28 @@ fn main() {
             }
         }
     }
+}
+
+fn read_mcp_frame(input: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut frame = Vec::new();
+    input
+        .take((MAX_MCP_FRAME_BYTES + 2) as u64)
+        .read_until(b'\n', &mut frame)?;
+    if frame.is_empty() {
+        return Ok(None);
+    }
+    if frame.last() == Some(&b'\n') {
+        frame.pop();
+    }
+    if frame.len() > MAX_MCP_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MCP frame exceeds 64 KiB",
+        ));
+    }
+    String::from_utf8(frame)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 struct Options {

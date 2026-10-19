@@ -14,6 +14,38 @@ const ACTIONS: &[&str] = &[
     "cocoa_way_display_close",
 ];
 
+#[test]
+fn stdio_frames_are_bounded_before_json_parsing() {
+    let mut input = std::io::Cursor::new(b"one\ntwo\n");
+    assert_eq!(read_mcp_frame(&mut input).unwrap().as_deref(), Some("one"));
+    assert_eq!(read_mcp_frame(&mut input).unwrap().as_deref(), Some("two"));
+    assert!(read_mcp_frame(&mut input).unwrap().is_none());
+    for newline in [false, true] {
+        let mut exact = vec![b'a'; MAX_MCP_FRAME_BYTES];
+        if newline {
+            exact.push(b'\n');
+        }
+        assert_eq!(
+            read_mcp_frame(&mut std::io::Cursor::new(exact))
+                .unwrap()
+                .unwrap()
+                .len(),
+            MAX_MCP_FRAME_BYTES
+        );
+        let mut oversized = vec![b'a'; MAX_MCP_FRAME_BYTES + 100];
+        if newline {
+            oversized.push(b'\n');
+        }
+        assert_eq!(
+            read_mcp_frame(&mut std::io::Cursor::new(oversized))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+    assert!(read_mcp_frame(&mut std::io::Cursor::new([0xff, b'\n'])).is_err());
+}
+
 fn rpc(socket: &Path, method: &str, params: Value, allow_control: bool) -> Value {
     handle_message(
         &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
