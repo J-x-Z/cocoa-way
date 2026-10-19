@@ -13,6 +13,7 @@ from datetime import date
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -171,11 +172,21 @@ def check_formula(text, policy, version):
 def fetch_bytes(url, limit=20_000_000):
     require(url.startswith("https://"), "HTTPS is required")
     # Use macOS's configured curl trust store, not a Python-specific CA bundle.
-    data = subprocess.check_output([
-        "curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https",
+    command = [
+        "curl", "--fail", "--silent", "--show-error", "--proto", "=https",
         "--proto-redir", "=https", "--max-time", "60", "--max-filesize", str(limit),
-        "--user-agent", "cocoa-way-supplychain", url,
-    ])
+        "--user-agent", "cocoa-way-supplychain",
+    ]
+    token = os.environ.get("GITHUB_TOKEN") if url.startswith("https://api.github.com/") else None
+    options = {}
+    if token:
+        require(not any(char.isspace() for char in token), "Invalid GitHub API credential")
+        # Keep credentials out of argv/logs and never follow authenticated redirects.
+        command.extend(["--header", "@-"])
+        options["input"] = f"Authorization: Bearer {token}\n".encode()
+    else:
+        command.append("--location")
+    data = subprocess.check_output([*command, url], **options)
     require(len(data) <= limit, f"Unexpectedly large response: {url}")
     return data
 

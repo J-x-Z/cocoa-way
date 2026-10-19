@@ -47,6 +47,8 @@ jobs:
         run: cargo install cargo-audit --locked --version 0.22.2
 
       - name: Check current advisories, locked macOS graphs, vendor and provenance
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/check-supplychain.py --verify-upstreams
 
       - name: Run tests

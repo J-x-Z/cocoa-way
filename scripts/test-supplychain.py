@@ -10,6 +10,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +51,29 @@ class AuditTests(unittest.TestCase):
     def setUp(self):
         self.report = audit_report()
         self.graphs = {target: {("cgmath", "0.18.0")} for target in POLICY["targets"]}
+
+    def test_api_credential_stays_in_stdin_and_cannot_follow_redirects(self):
+        with mock.patch.dict(checks.os.environ, {"GITHUB_TOKEN": "test-token"}), \
+                mock.patch.object(checks.subprocess, "check_output", return_value=b"{}") as fetch:
+            checks.fetch_bytes("https://api.github.com/repos/actions/checkout/commits/test")
+            args, kwargs = fetch.call_args
+            self.assertNotIn("--location", args[0])
+            self.assertNotIn("test-token", " ".join(args[0]))
+            self.assertIn("@-", args[0])
+            self.assertEqual(kwargs["input"], b"Authorization: Bearer test-token\n")
+            for url in ["https://github.com/source.tar.gz", "https://api.github.com.example.com/test"]:
+                checks.fetch_bytes(url)
+                args, kwargs = fetch.call_args
+                self.assertIn("--location", args[0])
+                self.assertNotIn("input", kwargs)
+                self.assertNotIn("--header", args[0])
+
+    def test_api_credential_rejects_header_injection(self):
+        with mock.patch.dict(checks.os.environ, {"GITHUB_TOKEN": "bad\nheader"}), \
+                mock.patch.object(checks.subprocess, "check_output") as fetch:
+            with self.assertRaisesRegex(ValueError, "Invalid GitHub API credential"):
+                checks.fetch_bytes("https://api.github.com/test")
+            fetch.assert_not_called()
 
     def evaluate(self):
         return checks.evaluate_audit(self.report, POLICY, self.graphs, TODAY)
