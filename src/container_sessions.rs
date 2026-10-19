@@ -1620,6 +1620,11 @@ pub fn load_sessions_report() -> SessionLoadReport {
     load_sessions_report_from_path(&path)
 }
 
+/// Diagnostics must not migrate profiles, create a config directory or acquire a write lock.
+pub(crate) fn inspect_sessions(path: &Path) -> std::io::Result<Vec<ContainerSession>> {
+    profile_config::inspect(path)
+}
+
 fn load_sessions_report_from_path(path: &Path) -> SessionLoadReport {
     match profile_config::load(path) {
         Ok(sessions) => SessionLoadReport {
@@ -2147,7 +2152,7 @@ fn normalize_container_runtime(runtime: &str) -> ContainerRuntime {
     }
 }
 
-fn validate_session(session: &ContainerSession) -> Result<(), LaunchError> {
+pub(crate) fn validate_session(session: &ContainerSession) -> Result<(), LaunchError> {
     let invalid = |hint: String| LaunchError::InvalidSession {
         session: session.name.clone(),
         hint,

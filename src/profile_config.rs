@@ -210,6 +210,15 @@ pub(super) fn transaction<T>(
     Ok(result)
 }
 
+pub(super) fn inspect(path: &Path) -> io::Result<Vec<ContainerSession>> {
+    let Some(content) = read(path)? else {
+        return Ok(Vec::new());
+    };
+    let sessions = toml::from_str::<Config>(&content).map_err(invalid)?.session;
+    validate_ids(&sessions)?;
+    Ok(sessions)
+}
+
 pub(super) fn load(path: &Path) -> io::Result<Vec<ContainerSession>> {
     // Atomic writers publish whole files. Reading a saved configuration needs no
     // sidecar, mkdir, exclusive lock or fsync, including when another writer is busy.
@@ -396,6 +405,20 @@ mod tests {
         let path = directory.path().join("sessions.toml");
         std::fs::write(&path, "# keep this comment\nsetting = 'keep'\n\n[[session]] # inline header\nname = 'Alpha'\nimage = 'test:latest'\ncustom = 'preserved'\ncommand = '''echo hello\n[[session]]\n'''\n[session.extension]\nflag = true\n\n[[session]]\nname = 'Beta'\nimage = 'other:latest'\naudio = false\n\n[settings]\ncolor = 'green' # keep this too\n").unwrap();
         (directory, path)
+    }
+
+    #[test]
+    fn diagnostic_inspection_never_migrates_or_creates_files() {
+        let (directory, path) = fixture();
+        let original = std::fs::read(&path).unwrap();
+        let sessions = inspect(&path).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(!sessions[0].id.is_saved());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        let absent = directory.path().join("missing/profiles.toml");
+        assert!(inspect(&absent).unwrap().is_empty());
+        assert!(!absent.parent().unwrap().exists());
     }
 
     #[test]

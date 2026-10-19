@@ -48,6 +48,7 @@ mod runtime_paths;
 mod session_lifecycle;
 mod shutdown;
 mod startup;
+mod startup_diagnostics;
 mod state;
 mod wayland_source;
 
@@ -176,6 +177,7 @@ const DISPLAY_WORKER_SLOT_ENV: &str = "COCOA_WAY_DISPLAY_WORKER";
 const DISPLAY_WORKER_RUNTIME_ENV: &str = "COCOA_WAY_DISPLAY_RUNTIME_DIR";
 const DISPLAY_WORKER_READY_ENV: &str = "COCOA_WAY_DISPLAY_READY_FILE";
 const DISPLAY_WORKER_PARENT_ENV: &str = "COCOA_WAY_DISPLAY_PARENT_PID";
+const DISPLAY_WORKER_SHOW_ENV: &str = "COCOA_WAY_DISPLAY_SHOW_EMPTY";
 const DISPLAY_WORKER_PANIC_LOG: &str = "worker-panic.log";
 const DISPLAY_WORKER_STARTUP_ERROR_LOG: &str = "worker-startup-error.log";
 const DISPLAY_WORKER_PID_FILE: &str = "display.worker";
@@ -206,14 +208,14 @@ fn command_line_request(arguments: &[String]) -> Option<CommandLineRequest> {
 fn print_command_line_request(request: CommandLineRequest) {
     match request {
         CommandLineRequest::Help => println!(
-            "cocoa-way {}\n\nUsage: cocoa-way\n       cocoa-way --help\n       cocoa-way --version\n       cocoa-way --check-environment\n\nStartup opens the application panel and installs a menu bar control. Display windows open when needed. Environment checks do not start containers.",
+            "cocoa-way {}\n\nUsage: cocoa-way\n       cocoa-way --help\n       cocoa-way --version\n       cocoa-way --check-environment\n\nStartup installs a menu bar control without opening windows. Open Applications or New Display Window from the menu when needed. The Wayland socket is ready for command-line clients. Environment checks do not start containers.",
             env!("CARGO_PKG_VERSION")
         ),
         CommandLineRequest::Version => println!("cocoa-way {}", env!("CARGO_PKG_VERSION")),
         CommandLineRequest::Environment => {
             let keyboard = runtime_paths::configure_xkb_config_root();
             let home = startup::validate_home(std::env::var_os("HOME").as_deref());
-            println!("{}", startup::environment_report());
+            println!("{}", startup_diagnostics::collect().text());
             if let Err(error) = &keyboard {
                 println!("\nRequired keyboard data check FAILED: {error}");
             }
@@ -424,6 +426,7 @@ fn install_display_worker_panic_report() {
 fn spawn_display_worker(
     slot: &str,
     presentation: presentation::PresentationMode,
+    explicitly_created: bool,
 ) -> Result<(DisplayWorker, String, String), String> {
     let sequence = DISPLAY_WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let runtime_dir =
@@ -462,6 +465,10 @@ fn spawn_display_worker(
         .env(DISPLAY_WORKER_RUNTIME_ENV, &runtime_dir)
         .env(DISPLAY_WORKER_READY_ENV, &ready_file)
         .env(DISPLAY_WORKER_PARENT_ENV, std::process::id().to_string())
+        .env(
+            DISPLAY_WORKER_SHOW_ENV,
+            if explicitly_created { "1" } else { "0" },
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -552,7 +559,7 @@ fn spawn_display_worker_async(
         if lifecycle_producers::GLOBAL.closing() {
             return;
         }
-        let message = match spawn_display_worker(&display_slot, presentation) {
+        let message = match spawn_display_worker(&display_slot, presentation, false) {
             Ok((worker, runtime_dir, display)) => CompositorMessage::DedicatedDisplayStarted {
                 profile_id: index,
                 generation,
@@ -597,22 +604,25 @@ fn spawn_managed_display_worker_async(
         if lifecycle_producers::GLOBAL.closing() {
             return;
         }
-        let message =
-            match spawn_display_worker(&display_slot, presentation::PresentationMode::Desktop) {
-                Ok((worker, runtime_dir, display)) => CompositorMessage::ManagedDisplayStarted {
-                    generation,
-                    display_slot,
-                    runtime_dir,
-                    display,
-                    worker_child: worker.child,
-                    worker_runtime_dir: worker.runtime_dir,
-                },
-                Err(error) => CompositorMessage::ManagedDisplayFailed {
-                    generation,
-                    display_slot,
-                    error,
-                },
-            };
+        let message = match spawn_display_worker(
+            &display_slot,
+            presentation::PresentationMode::Desktop,
+            true,
+        ) {
+            Ok((worker, runtime_dir, display)) => CompositorMessage::ManagedDisplayStarted {
+                generation,
+                display_slot,
+                runtime_dir,
+                display,
+                worker_child: worker.child,
+                worker_runtime_dir: worker.runtime_dir,
+            },
+            Err(error) => CompositorMessage::ManagedDisplayFailed {
+                generation,
+                display_slot,
+                error,
+            },
+        };
         if let Err(send_error) = send_resource_message(&sender, message)
             && let CompositorMessage::ManagedDisplayStarted {
                 worker_child,
@@ -3095,6 +3105,21 @@ mod display_slot_tests {
     }
 
     #[test]
+    fn resumed_startup_registers_controls_without_opening_a_panel() {
+        let source = include_str!("main.rs");
+        let startup = source
+            .split_once("\n            Event::Resumed => {")
+            .unwrap()
+            .1
+            .split_once("\n            Event::Suspended => {")
+            .unwrap()
+            .0;
+        assert!(startup.contains("menu_bar::setup_menu("));
+        assert!(startup.contains("container_mode::set_event_sender(sender)"));
+        assert!(!startup.contains("container_mode::show("));
+    }
+
+    #[test]
     fn display_runtime_parent_pid_supports_marker_and_legacy_directory() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
@@ -3752,6 +3777,7 @@ fn create_event_handler(
         .with_visible(startup::show_display_at_startup(
             display_worker_slot.is_some(),
             presentation_mode.is_rootless(),
+            std::env::var(DISPLAY_WORKER_SHOW_ENV).as_deref() == Ok("1"),
         ))
         .with_inner_size(winit::dpi::LogicalSize::new(800.0f64, 600.0f64));
     let window = target
@@ -3915,8 +3941,7 @@ fn create_event_handler(
     let mut last_parent_check = std::time::Instant::now();
     let mut key_transitions = input_policy::KeyTransitionReducer::default();
     let mut desktop_keyboard_focus = None;
-    let mut reveal_first_desktop_client =
-        display_worker_slot.is_none() && !presentation_mode.is_rootless();
+    let mut reveal_first_desktop_client = !presentation_mode.is_rootless();
     Ok(move |event: Event<()>, target: &ActiveEventLoop| {
         lifecycle_cleanup.poll();
         let input_trace = if state.latency_trace.enabled()
@@ -4106,6 +4131,9 @@ fn create_event_handler(
                     } else {
                         renderer.window.set_fullscreen(None);
                     }
+                }
+                CompositorMessage::StartupDiagnosticsFinished(report) => {
+                    container_mode::finish_startup_diagnostics(report);
                 }
                 CompositorMessage::ShowDefaultDisplay => {
                     if display_worker_slot.is_none() {
@@ -6751,7 +6779,7 @@ fn create_event_handler(
                         sender.clone(),
                         mtm,
                     );
-                    container_mode::show(sender, mtm);
+                    container_mode::set_event_sender(sender);
                     // Disable macOS tab bar via NSView -> NSWindow
                     {
                         use raw_window_handle::{HasWindowHandle, RawWindowHandle};

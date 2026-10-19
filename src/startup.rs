@@ -295,8 +295,8 @@ pub fn prepare_private_directory(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-pub fn show_display_at_startup(worker: bool, rootless: bool) -> bool {
-    worker && !rootless
+pub fn show_display_at_startup(worker: bool, rootless: bool, explicitly_created: bool) -> bool {
+    worker && !rootless && explicitly_created
 }
 
 pub fn validate_home(home: Option<&std::ffi::OsStr>) -> Result<(), String> {
@@ -373,11 +373,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordinary_startup_has_no_empty_display_but_desktop_workers_do() {
-        assert!(!show_display_at_startup(false, false));
-        assert!(!show_display_at_startup(false, true));
-        assert!(show_display_at_startup(true, false));
-        assert!(!show_display_at_startup(true, true));
+    fn only_explicitly_created_desktop_workers_start_with_an_empty_window() {
+        for worker in [false, true] {
+            for rootless in [false, true] {
+                for explicit in [false, true] {
+                    assert_eq!(
+                        show_display_at_startup(worker, rootless, explicit),
+                        worker && !rootless && explicit
+                    );
+                }
+            }
+        }
     }
 
     #[test]

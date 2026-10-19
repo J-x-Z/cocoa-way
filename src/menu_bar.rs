@@ -148,18 +148,15 @@ declare_class!(
         #[method(checkEnvironment:)]
         fn check_environment(&self, _sender: &AnyObject) {
             activate_application();
-            let mtm = unsafe { MainThreadMarker::new_unchecked() };
-            unsafe {
-                let alert = NSAlert::new(mtm);
-                alert.setMessageText(&NSString::from_str(&tr("Cocoa-Way Environment")));
-                // Keep the diagnostic report's tool names, paths and values verbatim.
-                alert.setInformativeText(&NSString::from_str(&crate::startup::environment_report()));
-                alert.addButtonWithTitle(&NSString::from_str(&tr("OK")));
-                alert.addButtonWithTitle(&NSString::from_str(&tr("Open Diagnostic Logs")));
-                if alert.runModal() == 1001 {
-                    open_diagnostic_logs();
-                }
+            if let Some(tx) = sender() {
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                crate::container_mode::show_startup_diagnostics(tx, mtm);
             }
+        }
+
+        #[method(newDisplayWindow:)]
+        fn new_display_window(&self, _sender: &AnyObject) {
+            send(CompositorMessage::CreateManagedDisplay(None));
         }
 
         #[method(openDiagnosticLogs:)]
@@ -694,6 +691,13 @@ pub fn setup_menu(
         let view_item = label_item(&tr("View"), mtm);
         let view_menu =
             NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str(&tr("View")));
+        let new_display = action_item(
+            &tr("New Display Window"),
+            sel!(newDisplayWindow:),
+            &handler,
+            mtm,
+        );
+        view_menu.addItem(&new_display);
         let show_display = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
             &NSString::from_str(&tr("Show Default Display")),
@@ -788,6 +792,7 @@ unsafe fn install_status_menu(
     for (title, action) in [
         ("Applications...", sel!(openApplications:)),
         ("Connect to Machine...", sel!(quickConnect:)),
+        ("New Display Window", sel!(newDisplayWindow:)),
         ("Displays...", sel!(openDisplays:)),
         ("Diagnostics...", sel!(openDiagnostics:)),
         ("Check Environment...", sel!(checkEnvironment:)),

@@ -31,6 +31,7 @@ use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quo
 mod displays;
 mod native_layout;
 mod panel_shell;
+mod startup_report;
 use native_layout::{TextStyle, label_font, scroll_distance_from_top, scroll_origin_for_distance};
 
 static SENDER: Mutex<Option<Sender<CompositorMessage>>> = Mutex::new(None);
@@ -255,7 +256,8 @@ struct AppleContainerCompatibility {
 }
 
 const APPLE_CONTAINER_TRANSPORT_V2_MINIMUM: (u64, u64, u64) = (1, 1, 0);
-const APPLE_CONTAINER_SECURITY_BASELINE: (u64, u64, u64) = (1, 4, 1);
+const APPLE_CONTAINER_SECURITY_BASELINE: (u64, u64, u64) =
+    crate::startup_diagnostics::APPLE_SECURITY_BASELINE;
 
 #[derive(Clone)]
 struct UiCommandCacheEntry {
@@ -4179,6 +4181,21 @@ pub fn show_settings() {
     }
 }
 
+pub fn set_event_sender(sender: Sender<CompositorMessage>) {
+    *SENDER.lock().unwrap() = Some(sender);
+}
+
+pub fn show_startup_diagnostics(sender: Sender<CompositorMessage>, mtm: MainThreadMarker) {
+    *SENDER.lock().unwrap() = Some(sender.clone());
+    startup_report::start(sender, mtm);
+}
+
+pub fn finish_startup_diagnostics(report: crate::startup_diagnostics::Report) {
+    if MainThreadMarker::new().is_some() {
+        startup_report::finish(report);
+    }
+}
+
 fn show_container_settings_dialog() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
@@ -4190,12 +4207,12 @@ fn show_container_settings_dialog() {
         let _: () = msg_send![&*alert, setInformativeText:
             &*NSString::from_str(&tr("Personalize Cocoa-Way without changing your Linux applications."))];
         let view: Retained<NSView> = msg_send_id![
-            mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 440.0, 250.0)
+            mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 440.0, 322.0)
         ];
         add_label(
             &view,
             &tr("Interface language"),
-            rect(0.0, 222.0, 440.0, 22.0),
+            rect(0.0, 294.0, 440.0, 22.0),
             mtm,
             TextStyle::Heading,
         );
@@ -4214,13 +4231,13 @@ fn show_container_settings_dialog() {
             .iter()
             .position(|language| *language == crate::i18n::preference())
             .unwrap_or(0);
-        let languages = add_popup(&view, rect(0.0, 182.0, 440.0, 30.0), &names, selected, mtm);
+        let languages = add_popup(&view, rect(0.0, 254.0, 440.0, 30.0), &names, selected, mtm);
         add_label(
             &view,
             &tr(
                 "Language changes apply immediately to Cocoa-Way. Linux application languages and keyboard layouts are not changed.",
             ),
-            rect(0.0, 124.0, 440.0, 48.0),
+            rect(0.0, 196.0, 440.0, 48.0),
             mtm,
             TextStyle::Body,
         );
@@ -4229,7 +4246,7 @@ fn show_container_settings_dialog() {
             &tr(
                 "English and Simplified Chinese cover the main interface. Other languages currently translate navigation and common actions; remaining text falls back to English.",
             ),
-            rect(0.0, 65.0, 440.0, 52.0),
+            rect(0.0, 137.0, 440.0, 52.0),
             mtm,
             TextStyle::Caption,
         );
@@ -4249,6 +4266,22 @@ fn show_container_settings_dialog() {
             TextStyle::Mono,
         );
         path.setSelectable(true);
+        add_label(
+            &view,
+            &tr("Startup Diagnostics"),
+            rect(0.0, 110.0, 440.0, 22.0),
+            mtm,
+            TextStyle::Heading,
+        );
+        add_label(
+            &view,
+            &tr(
+                "Check runtime versions, service readiness, application configuration and local images without starting them.",
+            ),
+            rect(0.0, 62.0, 440.0, 46.0),
+            mtm,
+            TextStyle::Caption,
+        );
         let _: () =
             msg_send![&*path, setToolTip: &*NSString::from_str(&config_path.display().to_string())];
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
@@ -4258,6 +4291,8 @@ fn show_container_settings_dialog() {
             &*NSString::from_str(&tr("Cancel"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
             &*NSString::from_str(&tr("Open Configuration File"))];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str(&tr("Run Diagnostics"))];
         let response: isize = msg_send![&*alert, runModal];
         if response == 1000 {
             if let Some(language) = Language::ALL.get(popup_index(&languages).max(0) as usize) {
@@ -4275,6 +4310,11 @@ fn show_container_settings_dialog() {
             }
         } else if response == 1002 {
             let _ = Command::new("open").arg("-R").arg(config_path).spawn();
+        } else if response == 1003 {
+            let sender = SENDER.lock().unwrap().clone();
+            if let Some(sender) = sender {
+                startup_report::start(sender, mtm);
+            }
         }
     }
 }
@@ -4795,6 +4835,21 @@ declare_class!(
         #[method(openContainerSettings:)]
         fn open_container_settings(&self, _sender: &AnyObject) {
             show_container_settings_dialog();
+        }
+
+        #[method(runStartupDiagnostics:)]
+        fn run_startup_diagnostics(&self, _sender: &AnyObject) {
+            let sender = SENDER.lock().unwrap().clone();
+            if let Some(sender) = sender {
+                if let Some(mtm) = MainThreadMarker::new() {
+                    startup_report::start(sender, mtm);
+                }
+            }
+        }
+
+        #[method(copyStartupDiagnostics:)]
+        fn copy_startup_diagnostics(&self, _sender: &AnyObject) {
+            startup_report::copy();
         }
 
         #[method(addContainerSession:)]
