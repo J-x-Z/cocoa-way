@@ -66,11 +66,11 @@ sha = "3bb12739c298aeb8a4eeaf626c5b8d85266b0e65"
 
 [formula]
 # Real public release, downloaded and hashed, not a future release placeholder.
-# This archive predates this branch's fixes; updating a Formula does not publish
-# the working tree. The tag is unsigned, so this checksum is integrity evidence,
+# This archive matches the published source tag, not subsequent Formula metadata.
+# The tag is unsigned, so this checksum is integrity evidence,
 # not an independent publisher signature.
-version = "2.1.0"
-url = "https://github.com/J-x-Z/cocoa-way/archive/refs/tags/v2.1.0.tar.gz"
-sha256 = "107b9aeeebd3efbd7702c03fd1580634f1786ae4e32c55c5c4a9f029f66b549a"
-tag_object = "6a3191e490e55bafd7eb5770e9bbbdf5315c8ea0"
-commit = "e18c0b3e42cc1c6200ebf28a2d28f15ab56b2609"
+version = "2.1.1"
+url = "https://github.com/J-x-Z/cocoa-way/archive/refs/tags/v2.1.1.tar.gz"
+sha256 = "616f27a5164843a18f2f01c1d43dfb4da8634117a09fa0166cfbc9bf0a2050b2"
+tag_object = "ec26204045758523c0008028df3325bff672881f"
+commit = "4f34b094481ae5b1cfb04b846cffc8515b9b3113"
