@@ -23,6 +23,7 @@ mod desktop_background;
 mod diagnostics;
 mod display_link;
 mod event_loop_signal;
+mod event_turn;
 mod frame_clock;
 mod i18n;
 mod image_resources;
@@ -3692,6 +3693,17 @@ fn window_refresh_millihertz(window: &winit::window::Window) -> Option<u32> {
         .and_then(|monitor| monitor.refresh_rate_millihertz())
 }
 
+fn dispatch_wayland_turn(
+    display: &mut Display<AppState>,
+    state: &mut AppState,
+) -> std::io::Result<bool> {
+    // Yield between requests and rotate clients; a slow handler is not preempted.
+    display
+        .backend()
+        .dispatch_all_clients_with_budget(state, 128, std::time::Duration::from_millis(2), 8)
+        .map(|outcome| outcome.more_pending)
+}
+
 fn flush_wayland_output(display: &mut Display<AppState>, source: &wayland_source::WaylandSource) {
     let mut clients = Vec::new();
     display
@@ -3827,6 +3839,10 @@ fn create_event_handler(
     )
     .map_err(|error| format!("Cocoa-Way input initialization failed: {error}"))?;
     state.latency_trace = latency_trace;
+    let clipboard_proxy = event_proxy.clone();
+    state.set_host_clipboard_waker(std::sync::Arc::new(move || {
+        let _ = clipboard_proxy.send_event(());
+    }));
     let initial_size = renderer.window.inner_size();
     let (initial_width, initial_height) = layout::sanitize_logical_size(
         f64::from(initial_size.width),
@@ -3972,6 +3988,9 @@ fn create_event_handler(
         };
         state.trace_input = input_trace;
         state.trace_forwarded = None;
+        if matches!(&event, Event::UserEvent(())) {
+            state.poll_host_clipboard_results();
+        }
         // Winit delivers pending redraws before AboutToWait. Drain ready commits
         // before rendering so an already-arrived update is not delayed a frame.
         if matches!(
@@ -3982,8 +4001,11 @@ fn create_event_handler(
                     ..
                 }
         ) {
-            if let Err(error) = display.dispatch_clients(&mut state) {
-                log::debug!("Wayland dispatch failed: {error}");
+            // AboutToWait runs another bounded turn and schedules its continuation.
+            if let Err(error) = dispatch_wayland_turn(&mut display, &mut state) {
+                log::error!("Wayland dispatch cannot continue safely: {error}");
+                target.exit();
+                return;
             }
             state.request_pending_guest_clipboard();
             reconcile_pointer_lock(
@@ -3994,7 +4016,8 @@ fn create_event_handler(
             );
             state.refresh_native_cursor();
             flush_wayland_output(&mut display, &wayland_source);
-            wayland_source.rearm();
+            // Rearm only in AboutToWait. Replenishing proxy events here could
+            // keep Winit's user-event drain busy forever before native redraws.
         }
         let input_event = matches!(
             &event,
@@ -4013,13 +4036,43 @@ fn create_event_handler(
                 ..
             }
         );
-        if matches!(
-            &event,
+        let paste_press = match &event {
             Event::WindowEvent {
-                event: WindowEvent::Focused(true) | WindowEvent::KeyboardInput { .. },
+                event: WindowEvent::KeyboardInput { event, .. },
                 ..
+            } => {
+                let mods = state
+                    .seat
+                    .get_keyboard()
+                    .map(|keyboard| keyboard.modifier_state());
+                crate::keymap::map_key(event.physical_key)
+                    .zip(mods)
+                    .is_some_and(|(key, mods)| {
+                        input_policy::requests_clipboard_refresh(
+                            key,
+                            if event.state == ElementState::Pressed {
+                                input_policy::KeyTransition::Pressed
+                            } else {
+                                input_policy::KeyTransition::Released
+                            },
+                            event.repeat,
+                            mods.ctrl,
+                            mods.logo,
+                            mods.shift,
+                        )
+                    })
             }
-        ) {
+            _ => false,
+        };
+        if paste_press
+            || matches!(
+                &event,
+                Event::WindowEvent {
+                    event: WindowEvent::Focused(true),
+                    ..
+                }
+            )
+        {
             state.refresh_host_clipboard();
         }
         for gesture in macos_gestures::drain_swipe_events() {
@@ -4038,16 +4091,13 @@ fn create_event_handler(
                 state.handle_swipe_gesture(gesture.delta, gesture.phase, time);
             }
         }
-        let message_started = std::time::Instant::now();
-        let mut messages_dispatched = 0;
-        while messages_dispatched < 64
-            && message_started.elapsed() < std::time::Duration::from_millis(2)
-        {
+        let mut message_budget =
+            event_turn::ControlWorkBudget::new(input_event, std::time::Instant::now());
+        while message_budget.admit(std::time::Instant::now()) {
             let Ok(msg) = loop_receiver.try_recv() else {
                 break;
             };
             container_event_signal.message_received();
-            messages_dispatched += 1;
             let msg = match msg {
                 CompositorMessage::ProcessOutput { message, _permit } => *message,
                 message => message,
@@ -6516,15 +6566,29 @@ fn create_event_handler(
                                         );
                                     }
                                 }
-                                let deferred = state.layout.tiles.iter().any(|tile| {
-                                    presentation::toplevel_has_pending_buffer_uploads(
+                                let mut completed_roots = Vec::new();
+                                let mut deferred = false;
+                                for tile in &state.layout.tiles {
+                                    if presentation::toplevel_has_pending_buffer_uploads(
                                         &tile.toplevel,
                                         &state.popups,
-                                    )
-                                });
-                                if deferred {
-                                    renderer.discard_trace_frame();
+                                    ) {
+                                        deferred = true;
+                                    } else {
+                                        completed_roots.push(tile.toplevel.wl_surface().id());
+                                    }
                                 }
+                                // One retained upload must not suppress another owner's
+                                // submitted frame or make its callback wait for that upload.
+                                let submitted_traces: Vec<_> = if deferred {
+                                    completed_roots
+                                        .iter()
+                                        .flat_map(|root| state.trace_frames_for(Some(root)))
+                                        .collect()
+                                } else {
+                                    traced.clone()
+                                };
+                                renderer.retain_trace_frames(&submitted_traces);
                                 let submitted = match renderer.swap_buffers() {
                                     Ok(submitted) => submitted,
                                     Err(error) => {
@@ -6532,8 +6596,8 @@ fn create_event_handler(
                                         false
                                     }
                                 };
-                                if submitted && !deferred {
-                                    state.retire_trace_frames(&traced);
+                                if submitted {
+                                    state.retire_trace_frames(&submitted_traces);
                                 }
                                 let presented_at = std::time::Instant::now();
                                 if submitted {
@@ -6566,6 +6630,11 @@ fn create_event_handler(
                                 perf_redraws = perf_redraws.saturating_add(u64::from(submitted));
                                 state.needs_redraw = deferred || !submitted;
                                 if deferred && submitted {
+                                    let t = state.start_time.elapsed().as_millis() as u32;
+                                    for root in &completed_roots {
+                                        state.send_frame_callbacks_for(Some(root), t);
+                                    }
+                                    flush_wayland_output(&mut display, &wayland_source);
                                     waiting_for_renderer.insert(window_id);
                                 } else if submitted {
                                     let t = state.start_time.elapsed().as_millis() as u32;
@@ -6622,19 +6691,23 @@ fn create_event_handler(
                     sync_active_container_sessions(&active_container_sessions);
                     next_maintenance = now + maintenance_interval;
                 }
-                match display.dispatch_clients(&mut state) {
-                    Ok(_) => {
-                        state.request_pending_guest_clipboard();
-                        reconcile_pointer_lock(
-                            &mut state,
-                            key_transitions.owner(),
-                            &renderer.window,
-                            &rootless_windows,
-                        );
-                        flush_wayland_output(&mut display, &wayland_source);
+                let wayland_dispatch_pending = match dispatch_wayland_turn(&mut display, &mut state)
+                {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        log::error!("Wayland dispatch cannot continue safely: {error}");
+                        target.exit();
+                        return;
                     }
-                    Err(error) => log::debug!("Wayland dispatch failed: {error}"),
-                }
+                };
+                state.request_pending_guest_clipboard();
+                reconcile_pointer_lock(
+                    &mut state,
+                    key_transitions.owner(),
+                    &renderer.window,
+                    &rootless_windows,
+                );
+                flush_wayland_output(&mut display, &wayland_source);
                 wayland_source.rearm();
                 state.refresh_native_cursor();
                 let now = std::time::Instant::now();
@@ -6672,6 +6745,7 @@ fn create_event_handler(
                     perf_max_redraw_wait_ms = 0.0;
                 }
                 let needs_maintenance = display_worker_parent.is_some()
+                    || state.has_pending_host_clipboard_image()
                     || !state.toplevels.is_empty()
                     || !active_classic_connections.is_empty()
                     || !active_container_sessions.is_empty()
@@ -6762,7 +6836,10 @@ fn create_event_handler(
                         }
                     }
                 }
-                if container_event_signal.finish_turn() {
+                // A yielded backend may hold complete requests in userspace even
+                // after its socket FD was drained. One next-turn continuation is
+                // necessary until it reports no pending work; never idle-poll it.
+                if container_event_signal.finish_turn() || wayland_dispatch_pending {
                     let due = std::time::Instant::now() + std::time::Duration::from_millis(1);
                     next_wakeup = Some(next_wakeup.map_or(due, |next| next.min(due)));
                 }
@@ -6829,11 +6906,6 @@ fn create_event_handler(
                 }
                 menu_bar::set_desktop_background_active(desktop_background.is_active());
                 release_pointer_lock(&mut state, &renderer.window);
-                if let Some(writer) = trace_writer.take() {
-                    std::thread::spawn(move || {
-                        let _ = writer.finish();
-                    });
-                }
                 wayland_source.stop();
                 macos_gestures::uninstall_all_swipe_recognizers();
                 for connection in active_classic_connections.drain(..) {
@@ -6902,6 +6974,15 @@ fn create_event_handler(
                 sync_managed_displays(&managed_displays);
                 if let Some(path) = control_socket_path.as_deref() {
                     control_api::remove_socket(path);
+                }
+                if let Some(mut writer) = trace_writer.take() {
+                    match writer.finish_timeout(std::time::Duration::from_millis(500)) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => log::warn!(
+                            "Latency capture drain timed out; final trace persistence is unconfirmed"
+                        ),
+                        Err(error) => log::warn!("Latency capture could not be finalized: {error}"),
+                    }
                 }
             }
             _ => {}

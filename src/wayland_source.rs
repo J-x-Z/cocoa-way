@@ -421,6 +421,47 @@ mod tests {
     }
 
     #[test]
+    fn bounded_dispatch_continuations_do_not_replenish_readiness_before_native_yield() {
+        let mut display = Display::<()>::new().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        display
+            .handle()
+            .insert_client(server, Arc::new(()))
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let source = watch_display(&display, tx);
+        for id in 2..66 {
+            send_sync(&mut client, id);
+        }
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut dispatched = 0;
+        let mut native_turns = 0;
+        loop {
+            let outcome = display
+                .backend()
+                .dispatch_all_clients_with_budget(&mut (), 4, Duration::from_secs(1), 2)
+                .unwrap();
+            assert!(outcome.dispatched <= 4);
+            dispatched += outcome.dispatched;
+            native_turns += 1;
+            assert!(native_turns <= 65);
+            // Model returning control to AppKit between bounded turns. Even if
+            // the kernel FD remains readable, no proxy wake may replenish here.
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            if !outcome.more_pending {
+                break;
+            }
+        }
+        assert_eq!(dispatched, 64);
+        assert!(native_turns > 1);
+        display.flush_clients().unwrap();
+        source.rearm(); // Only the native turn's AboutToWait acknowledges readiness.
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        send_sync(&mut client, 66);
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
     fn blocked_output_wakes_once_until_dispatch_acknowledges_it() {
         let mut display = Display::<()>::new().unwrap();
         let (mut client, mut server) = UnixStream::pair().unwrap();

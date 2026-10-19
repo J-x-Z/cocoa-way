@@ -37,11 +37,25 @@
 //!   GPUStarted/GPUCompleted use command-buffer API
 //!   times; GPUCompletionCallback/MetalPresentedCallback use callback arrival.
 //!   Neither callback arrival nor GPU completion is display presentation.
-//! - Drop ALL trace clones (including callbacks), then call TraceWriter::finish()
-//!   off the UI thread to drain/flush. No joining or file I/O occurs on trace drop.
-//!   Abrupt process exit can lose buffered records; absence of final stats is
-//!   explicitly reported by the analyzer. Initialization/finish errors are caller
-//!   owned; async file errors are also logged by the worker.
+//! - After shutdown cleanup, call TraceWriter::close() to end capture at recording
+//!   API admission (NOT at an event timestamp or at the last GPU presentation).
+//!   Already-admitted calls finish enqueueing/accounting; later calls return false
+//!   without sampling/copying tags. Idle trace/callback clones need not be dropped.
+//!   Use finish_timeout(&mut self, budget) for bounded caller waiting, or finish()
+//!   ONLY off the UI thread. Both implicitly close. No trace/writer drop joins or
+//!   performs file I/O. Idle close detection can take FLUSH_INTERVAL (250 ms).
+//! - Ok(Some(summary)) from finish_timeout confirms capture drain and Write::flush,
+//!   not fsync/durable storage or completion of GPU callbacks. Ok(None) is timeout,
+//!   NOT success: the worker continues and the handle can be retried. Dropping it
+//!   detaches, so process exit may still truncate the file. Errors likewise leave
+//!   persistence/loss totals unconfirmed. Do not spawn an unobserved finish task.
+//! - Stats with capture_counts_final=true cover ONLY calls admitted before close.
+//!   Late recording calls are excluded and separately sampled, not queued or
+//!   included in dropped/rejected. While ANY producer handle survives, legacy
+//!   final=false and lifetime_loss_totals_known=false keep existing analyzers from
+//!   claiming final lifetime loss totals. Late callbacks may still be pending,
+//!   even if they carry pre-close API timestamps; no summary predicts their count.
+//!   Initialization/finish errors are caller owned and also logged by the worker.
 //!
 //! Times are host CoreAnimation nanoseconds, NOT Unix/Instant/guest time. Source
 //! event time is an opaque tag, never a latency timestamp. Guest/calibration work
@@ -51,7 +65,10 @@ use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU64, AtomicUsize,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
+};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -60,6 +77,7 @@ pub const QUEUE_CAPACITY: usize = 1024;
 pub const MAX_TAG_BYTES: usize = 256;
 pub const HOST_CLOCK: &str = "host_ca";
 const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const CAPTURE_CLOSED: usize = 1 << (usize::BITS - 1);
 
 /// Unique within this process, independent of input serials/windows/timestamps.
 /// File sessions disambiguate process restarts. Exhaustion panics, never wraps.
@@ -192,6 +210,54 @@ struct Event {
 struct Counts {
     dropped: AtomicU64,
     rejected: AtomicU64,
+    late_record_calls: AtomicU64,
+    // One atomic linearizes close against admission; low bits count active calls.
+    admission: AtomicUsize,
+}
+
+impl Counts {
+    fn enter(&self) -> Option<Recording<'_>> {
+        let mut state = self.admission.load(Relaxed);
+        loop {
+            if state & CAPTURE_CLOSED != 0 {
+                self.late_record_calls.fetch_add(1, Relaxed);
+                return None;
+            }
+            assert!(state < CAPTURE_CLOSED - 1, "too many active trace calls");
+            match self
+                .admission
+                .compare_exchange_weak(state, state + 1, Acquire, Relaxed)
+            {
+                Ok(_) => return Some(Recording(self)),
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.admission.fetch_or(CAPTURE_CLOSED, AcqRel);
+    }
+
+    fn closed_and_idle(&self) -> bool {
+        self.admission.load(Acquire) == CAPTURE_CLOSED
+    }
+}
+
+struct Recording<'a>(&'a Counts);
+
+impl Drop for Recording<'_> {
+    fn drop(&mut self) {
+        // Publish enqueue AND counter updates before the worker freezes totals.
+        self.0.admission.fetch_sub(1, Release);
+    }
+}
+
+struct CloseOnWorkerExit(Arc<Counts>);
+
+impl Drop for CloseOnWorkerExit {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 #[derive(Clone)]
@@ -205,15 +271,101 @@ pub struct LatencyTrace {
     inner: Option<Enabled>,
 }
 
-/// Separately owned so dropping a trace on the main thread never waits for I/O.
-pub struct TraceWriter(JoinHandle<io::Result<()>>);
+/// Returned only after all admitted calls are accounted for, drained and flushed.
+/// Counts exclude post-close recording calls and do not measure pending callbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureSummary {
+    pub dropped: u64,
+    pub rejected: u64,
+    /// Snapshot of recording API calls refused after close, not number of events
+    /// or callbacks. A fan-out call counts once; callbacks that never record do not.
+    pub late_record_calls_observed: u64,
+    /// True only if all producer handles were gone when the drained queue was
+    /// observed. False is conservative and never upgrades after returning.
+    pub lifetime_loss_totals_known: bool,
+}
+
+/// Separately owned; dropping this handle always detaches, never joins or flushes.
+pub struct TraceWriter {
+    counts: Arc<Counts>,
+    _worker: JoinHandle<()>,
+    completion: Receiver<io::Result<CaptureSummary>>,
+    summary: Option<CaptureSummary>,
+}
 
 impl TraceWriter {
-    /// Wait for draining. All LatencyTrace clones must already have been dropped.
-    pub fn finish(self) -> io::Result<()> {
-        self.0
+    fn spawn(
+        counts: Arc<Counts>,
+        write: impl FnOnce() -> io::Result<CaptureSummary> + Send + 'static,
+    ) -> io::Result<Self> {
+        let (tx, completion) = mpsc::sync_channel(1);
+        let worker_counts = Arc::clone(&counts);
+        let worker = thread::Builder::new()
+            .name("latency-trace".into())
+            .spawn(move || {
+                let close_on_exit = CloseOnWorkerExit(worker_counts);
+                let result = write();
+                // Also close on sink failure (or via Drop during a panic).
+                drop(close_on_exit);
+                if let Err(error) = &result {
+                    log::warn!("latency trace writer failed: {error}");
+                }
+                let _ = tx.send(result);
+            })?;
+        Ok(Self {
+            counts,
+            _worker: worker,
+            completion,
+            summary: None,
+        })
+    }
+
+    /// Idempotent, non-waiting admission cutoff. No clock sampling, I/O or join.
+    /// Calls already admitted can enqueue after this returns; new calls cannot.
+    pub fn close(&self) {
+        self.counts.close();
+    }
+
+    /// Close and wait at most `timeout` on the completion channel, NEVER a join.
+    /// None means persistence is unconfirmed; retry with this handle if desired.
+    /// A blocked sink/admitted producer is not cancelled by timeout. Success is
+    /// cached; later calls return the same endpoint summary, not fresh late counts.
+    pub fn finish_timeout(&mut self, timeout: Duration) -> io::Result<Option<CaptureSummary>> {
+        self.close();
+        if let Some(summary) = self.summary {
+            return Ok(Some(summary));
+        }
+        match self.completion.recv_timeout(timeout) {
+            Ok(result) => {
+                let summary = result?;
+                self.summary = Some(summary);
+                Ok(Some(summary))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                "latency writer exited without a completion result",
+            )),
+        }
+    }
+
+    /// Close, drain, flush and join. Unbounded: ONLY use off the UI thread.
+    /// Held idle trace clones do not prevent completion. Returns capture-only
+    /// counts, NOT proof that pending callbacks have run or lifetime losses froze.
+    #[cfg(test)]
+    pub fn finish(self) -> io::Result<CaptureSummary> {
+        self.close();
+        let result = match self.summary {
+            Some(summary) => Ok(summary),
+            None => self.completion.recv().unwrap_or_else(|_| {
+                Err(io::Error::other(
+                    "latency writer exited without a completion result",
+                ))
+            }),
+        };
+        self._worker
             .join()
-            .map_err(|_| io::Error::other("latency writer panicked"))?
+            .map_err(|_| io::Error::other("latency writer panicked"))?;
+        result
     }
 }
 
@@ -226,28 +378,24 @@ impl LatencyTrace {
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let counts = Arc::new(Counts::default());
         let worker_counts = Arc::clone(&counts);
-        let worker = thread::Builder::new()
-            .name("latency-trace".into())
-            .spawn(move || {
-                let result = write_trace(path, rx, worker_counts);
-                if let Err(error) = &result {
-                    log::warn!("latency trace writer failed: {error}");
-                }
-                result
-            })?;
+        let writer = TraceWriter::spawn(Arc::clone(&counts), move || {
+            write_trace(path, rx, worker_counts)
+        })?;
         Ok((
             Self {
                 inner: Some(Enabled { tx, counts }),
             },
-            Some(TraceWriter(worker)),
+            Some(writer),
         ))
     }
 
+    /// Configuration only; after capture close recording still returns false.
     pub fn enabled(&self) -> bool {
         self.inner.is_some()
     }
 
-    /// Full/disconnected queue losses. Invalid times/tags are counted separately.
+    /// Full/disconnected queue losses within capture. Invalid times/tags and
+    /// post-close calls are separate; this is NOT a lifetime callback-loss total.
     pub fn dropped_count(&self) -> u64 {
         self.inner
             .as_ref()
@@ -259,11 +407,14 @@ impl LatencyTrace {
         let Some(inner) = &self.inner else {
             return false;
         };
+        let Some(_recording) = inner.counts.enter() else {
+            return false;
+        };
         if stage.requires_reported_time() {
             inner.counts.rejected.fetch_add(1, Relaxed);
             return false;
         }
-        self.record_at_ns(stage, now_ns(), tags)
+        Self::enqueue(inner, stage, now_ns(), tags)
     }
 
     /// Caller-supplied timestamp MUST be in HOST_CLOCK, not source-event/guest time.
@@ -271,6 +422,14 @@ impl LatencyTrace {
         let Some(inner) = &self.inner else {
             return false;
         };
+        let Some(_recording) = inner.counts.enter() else {
+            return false;
+        };
+        Self::enqueue(inner, stage, timestamp_ns, tags)
+    }
+
+    // Caller holds Recording across validation, allocation, enqueue and losses.
+    fn enqueue(inner: &Enabled, stage: Stage, timestamp_ns: u64, tags: Tags<'_>) -> bool {
         let values = [
             tags.correlation_id,
             tags.source_event_serial,
@@ -314,12 +473,16 @@ impl LatencyTrace {
         frames: &[u64],
         window: u64,
     ) -> usize {
-        if !self.enabled() {
+        let Some(inner) = &self.inner else {
             return 0;
-        }
+        };
+        let Some(_recording) = inner.counts.enter() else {
+            return 0;
+        };
         let mut queued = 0;
         for &id in frames {
-            queued += usize::from(self.record_at_ns(
+            queued += usize::from(Self::enqueue(
+                inner,
                 stage,
                 timestamp_ns,
                 Tags {
@@ -339,6 +502,9 @@ impl LatencyTrace {
         let Some(inner) = &self.inner else {
             return false;
         };
+        let Some(_recording) = inner.counts.enter() else {
+            return false;
+        };
         let start = media_time_ns(started).filter(|ns| *ns > 0);
         let end = media_time_ns(completed).filter(|ns| *ns > 0);
         if start
@@ -349,7 +515,7 @@ impl LatencyTrace {
             return false;
         }
         let record_time = |stage, time| match time {
-            Some(ns) => self.record_at_ns(stage, ns, tags),
+            Some(ns) => Self::enqueue(inner, stage, ns, tags),
             None => {
                 inner.counts.rejected.fetch_add(1, Relaxed);
                 false
@@ -366,8 +532,11 @@ impl LatencyTrace {
         let Some(inner) = &self.inner else {
             return false;
         };
+        let Some(_recording) = inner.counts.enter() else {
+            return false;
+        };
         match media_time_ns(seconds).filter(|ns| *ns > 0) {
-            Some(ns) => self.record_at_ns(Stage::MetalPresented, ns, tags),
+            Some(ns) => Self::enqueue(inner, Stage::MetalPresented, ns, tags),
             None => {
                 inner.counts.rejected.fetch_add(1, Relaxed);
                 false
@@ -400,14 +569,25 @@ fn write_trace(
     path: std::ffi::OsString,
     rx: Receiver<Event>,
     counts: Arc<Counts>,
-) -> io::Result<()> {
+) -> io::Result<CaptureSummary> {
     let session = format!("{}-{}-{}", std::process::id(), now_ns(), next_id());
     let mut out = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
+    write_trace_to(&mut out, &session, rx, &counts)
+}
+
+fn write_trace_to(
+    out: &mut impl Write,
+    session: &str,
+    rx: Receiver<Event>,
+    counts: &Counts,
+) -> io::Result<CaptureSummary> {
     json_line(
-        &mut out,
+        out,
         &serde_json::json!({
             "schema": 1, "kind": "session", "session_id": session,
             "clock": HOST_CLOCK, "queue_capacity": QUEUE_CAPACITY,
+            "capture_endpoint": "recording_api_admission_not_event_timestamp",
+            "late_callbacks": "post_close_recording_calls_excluded_from_capture",
         }),
     )?;
     #[derive(Serialize)]
@@ -420,36 +600,59 @@ fn write_trace(
     }
     let mut last_flush = Instant::now();
     loop {
-        let final_stats = match rx.recv_timeout(FLUSH_INTERVAL) {
-            Ok(event) => {
-                json_line(
-                    &mut out,
-                    &Row {
-                        schema: 1,
-                        kind: "event",
-                        session_id: &session,
-                        event: &event,
-                    },
-                )?;
-                false
+        // Once closed AND quiescent, no producer can enqueue or alter capture
+        // counters again. Channel emptiness alone is insufficient before that.
+        let (event, capture_drained, producers_gone) = if counts.closed_and_idle() {
+            match rx.try_recv() {
+                Ok(event) => (Some(event), false, false),
+                Err(mpsc::TryRecvError::Empty) => (None, true, false),
+                Err(mpsc::TryRecvError::Disconnected) => (None, true, true),
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => false,
-            Err(mpsc::RecvTimeoutError::Disconnected) => true,
+        } else {
+            match rx.recv_timeout(FLUSH_INTERVAL) {
+                Ok(event) => (Some(event), false, false),
+                Err(mpsc::RecvTimeoutError::Timeout) => (None, false, false),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    counts.close();
+                    continue;
+                }
+            }
         };
-        if final_stats || last_flush.elapsed() >= FLUSH_INTERVAL {
+        if let Some(event) = event {
             json_line(
-                &mut out,
+                out,
+                &Row {
+                    schema: 1,
+                    kind: "event",
+                    session_id: session,
+                    event: &event,
+                },
+            )?;
+        }
+        if capture_drained || last_flush.elapsed() >= FLUSH_INTERVAL {
+            let summary = CaptureSummary {
+                dropped: counts.dropped.load(Relaxed),
+                rejected: counts.rejected.load(Relaxed),
+                late_record_calls_observed: counts.late_record_calls.load(Relaxed),
+                lifetime_loss_totals_known: capture_drained && producers_gone,
+            };
+            json_line(
+                out,
                 &serde_json::json!({
                     "schema": 1, "kind": "stats", "session_id": session,
-                    "dropped": counts.dropped.load(Relaxed),
-                    "rejected": counts.rejected.load(Relaxed), "final": final_stats,
+                    "dropped": summary.dropped, "rejected": summary.rejected,
+                    "final": summary.lifetime_loss_totals_known,
+                    "capture_counts_final": capture_drained,
+                    "capture_drained": capture_drained,
+                    "late_record_calls_observed": summary.late_record_calls_observed,
+                    "lifetime_loss_totals_known": summary.lifetime_loss_totals_known,
                 }),
             )?;
             out.flush()?;
+            if capture_drained {
+                return Ok(summary);
+            }
             last_flush = Instant::now();
-        }
-        if final_stats {
-            return Ok(());
         }
     }
 }
@@ -457,6 +660,341 @@ fn write_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Barrier, Mutex};
+
+    const TEST_WAIT: Duration = Duration::from_secs(5);
+
+    #[derive(Clone, Default)]
+    struct MemorySink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for MemorySink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MemorySink {
+        fn rows(&self) -> Vec<serde_json::Value> {
+            let bytes = self.0.lock().unwrap();
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    fn writer_for_test(sink: impl Write + Send + 'static) -> (LatencyTrace, TraceWriter) {
+        let (trace, rx) = LatencyTrace::fast_for_test(8);
+        let counts = Arc::clone(&trace.inner.as_ref().unwrap().counts);
+        let worker_counts = Arc::clone(&counts);
+        let writer = TraceWriter::spawn(counts, move || {
+            let mut sink = sink;
+            write_trace_to(&mut sink, "test-session", rx, &worker_counts)
+        })
+        .unwrap();
+        (trace, writer)
+    }
+
+    #[test]
+    fn close_drains_with_held_clones_and_discloses_late_calls() {
+        let sink = MemorySink::default();
+        let (trace, mut writer) = writer_for_test(sink.clone());
+        let idle_callback = trace.clone();
+        assert!(trace.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        assert!(!trace.presented(0.0, Tags::default()));
+        writer.close();
+        writer.close();
+        // Every public recording entry point refuses admission before validation,
+        // sampling the clock, allocating owned tags, or enqueueing anything.
+        assert!(!idle_callback.record(Stage::Forwarded, Tags::default()));
+        assert!(!idle_callback.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        assert_eq!(
+            idle_callback.record_frame_at_ns(Stage::Forwarded, 1, &[1, 2], 3),
+            0
+        );
+        assert!(!idle_callback.gpu_execution(f64::NAN, f64::NAN, Tags::default()));
+        assert!(!idle_callback.presented(0.0, Tags::default()));
+        let summary = writer.finish_timeout(TEST_WAIT).unwrap().unwrap();
+        assert_eq!(summary.dropped, 0);
+        assert_eq!(summary.rejected, 1);
+        // The worker may have finalized before some/all of the late calls.
+        assert!(summary.late_record_calls_observed <= 5);
+        assert!(!summary.lifetime_loss_totals_known);
+        let rows = sink.rows();
+        assert_eq!(rows.iter().filter(|row| row["kind"] == "event").count(), 1);
+        assert_eq!(
+            rows[0]["capture_endpoint"],
+            "recording_api_admission_not_event_timestamp"
+        );
+        let stats = rows.last().unwrap();
+        assert_eq!(stats["kind"], "stats");
+        assert_eq!(stats["capture_counts_final"], true);
+        assert_eq!(stats["capture_drained"], true);
+        assert_eq!(stats["final"], false);
+        assert_eq!(stats["lifetime_loss_totals_known"], false);
+        assert!(!idle_callback.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        assert_eq!(
+            trace
+                .inner
+                .as_ref()
+                .unwrap()
+                .counts
+                .late_record_calls
+                .load(Relaxed),
+            6
+        );
+        assert_eq!(
+            writer.finish_timeout(Duration::ZERO).unwrap(),
+            Some(summary)
+        );
+        assert_eq!(sink.rows(), rows);
+    }
+
+    #[test]
+    fn disconnected_producers_allow_final_lifetime_counts() {
+        let sink = MemorySink::default();
+        let (trace, writer) = writer_for_test(sink.clone());
+        assert!(trace.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        drop(trace);
+        let summary = writer.finish().unwrap();
+        assert!(summary.lifetime_loss_totals_known);
+        assert_eq!(summary.late_record_calls_observed, 0);
+        assert_eq!(sink.rows().last().unwrap()["final"], true);
+    }
+
+    #[test]
+    fn close_waits_for_admitted_enqueue_and_counter_updates_not_idle_clones() {
+        let sink = MemorySink::default();
+        let (trace, mut writer) = writer_for_test(sink.clone());
+        let inner = trace.inner.as_ref().unwrap();
+        // Deterministically suspend one admitted call across the close boundary.
+        let recording = inner.counts.enter().unwrap();
+        writer.close();
+        assert_eq!(writer.finish_timeout(Duration::ZERO).unwrap(), None);
+        assert!(LatencyTrace::enqueue(
+            inner,
+            Stage::Forwarded,
+            1,
+            Tags::default()
+        ));
+        assert!(!LatencyTrace::enqueue(
+            inner,
+            Stage::MetalPresented,
+            0,
+            Tags::default()
+        ));
+        assert_eq!(writer.finish_timeout(Duration::ZERO).unwrap(), None);
+        drop(recording);
+        let summary = writer.finish_timeout(TEST_WAIT).unwrap().unwrap();
+        assert_eq!(summary.dropped, 0);
+        assert_eq!(summary.rejected, 1);
+        assert_eq!(
+            sink.rows()
+                .iter()
+                .filter(|row| row["kind"] == "event")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_record_and_close_account_for_every_attempt() {
+        let sink = MemorySink::default();
+        let (trace, mut writer) = writer_for_test(sink.clone());
+        assert!(trace.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        let start = Arc::new(Barrier::new(5));
+        let mut producers = Vec::new();
+        for _ in 0..4 {
+            let trace = trace.clone();
+            let start = Arc::clone(&start);
+            producers.push(thread::spawn(move || {
+                start.wait();
+                (0..1000)
+                    .filter(|_| trace.record_at_ns(Stage::Forwarded, 1, Tags::default()))
+                    .count()
+            }));
+        }
+        start.wait();
+        writer.close();
+        let summary = writer.finish_timeout(TEST_WAIT).unwrap().unwrap();
+        let accepted = 1 + producers
+            .into_iter()
+            .map(|p| p.join().unwrap())
+            .sum::<usize>();
+        let late = trace
+            .inner
+            .as_ref()
+            .unwrap()
+            .counts
+            .late_record_calls
+            .load(Relaxed);
+        assert_eq!(accepted as u64 + summary.dropped + late, 4001);
+        assert_eq!(summary.rejected, 0);
+        assert!(summary.late_record_calls_observed <= late);
+        assert!(!summary.lifetime_loss_totals_known);
+        let rows = sink.rows();
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "event").count(),
+            accepted
+        );
+        assert_eq!(rows.last().unwrap()["capture_drained"], true);
+        assert_eq!(rows.last().unwrap()["dropped"], summary.dropped);
+    }
+
+    struct FailingSink {
+        bytes: MemorySink,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.fail_flush {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test write failure",
+                ));
+            }
+            self.bytes.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "test flush failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn sink_write_failure_closes_admission_without_success_or_final_stats() {
+        let bytes = MemorySink::default();
+        let (trace, mut writer) = writer_for_test(FailingSink {
+            bytes: bytes.clone(),
+            fail_flush: false,
+        });
+        // Observe worker failure without calling close/finish first: the worker
+        // itself must close admission, even when no shutdown caller is running.
+        let error = writer
+            .completion
+            .recv_timeout(TEST_WAIT)
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("test write failure"));
+        assert!(!trace.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        assert!(writer.finish_timeout(Duration::ZERO).is_err());
+        assert!(writer.summary.is_none());
+        assert!(bytes.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_panic_closes_admission_and_never_returns_a_success_summary() {
+        let (trace, rx) = LatencyTrace::fast_for_test(1);
+        let counts = Arc::clone(&trace.inner.as_ref().unwrap().counts);
+        let writer = TraceWriter::spawn(counts, move || {
+            drop(rx);
+            panic!("test writer panic");
+        })
+        .unwrap();
+        assert!(matches!(
+            writer.completion.recv_timeout(TEST_WAIT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(!trace.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        assert!(
+            writer
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("panicked")
+        );
+    }
+
+    #[test]
+    fn sink_flush_failure_never_returns_a_success_summary() {
+        let bytes = MemorySink::default();
+        let (trace, mut writer) = writer_for_test(FailingSink {
+            bytes: bytes.clone(),
+            fail_flush: true,
+        });
+        assert!(trace.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        assert_eq!(
+            writer.finish_timeout(TEST_WAIT).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(writer.summary.is_none());
+        assert!(!trace.record_at_ns(Stage::Forwarded, 1, Tags::default()));
+        assert!(bytes.rows().iter().all(|row| row["final"] != true));
+    }
+
+    struct GatedFlush {
+        bytes: MemorySink,
+        entered: Option<mpsc::Sender<()>>,
+        release: Receiver<()>,
+    }
+
+    impl Write for GatedFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(TEST_WAIT)
+                    .map_err(io::Error::other)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn blocked_sink_timeout_is_retryable_and_does_not_join() {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (_trace, mut writer) = writer_for_test(GatedFlush {
+            bytes: MemorySink::default(),
+            entered: Some(entered_tx),
+            release: release_rx,
+        });
+        writer.close();
+        entered.recv_timeout(TEST_WAIT).unwrap();
+        assert_eq!(writer.finish_timeout(Duration::ZERO).unwrap(), None);
+        assert_eq!(
+            writer.finish_timeout(Duration::from_millis(10)).unwrap(),
+            None
+        );
+        assert!(writer.summary.is_none());
+        release.send(()).unwrap();
+        let summary = writer.finish_timeout(TEST_WAIT).unwrap().unwrap();
+        assert_eq!(
+            writer.finish_timeout(Duration::ZERO).unwrap(),
+            Some(summary)
+        );
+        assert_eq!(writer.finish().unwrap(), summary);
+    }
+
+    #[test]
+    fn dropping_writer_detaches_even_while_sink_is_blocked() {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (_trace, writer) = writer_for_test(GatedFlush {
+            bytes: MemorySink::default(),
+            entered: Some(entered_tx),
+            release: release_rx,
+        });
+        writer.close();
+        entered.recv_timeout(TEST_WAIT).unwrap();
+        drop(writer);
+        release.send(()).unwrap();
+    }
 
     #[test]
     fn unforwarded_or_stale_input_is_not_reported_as_protocol_delivery() {

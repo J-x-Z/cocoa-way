@@ -18,6 +18,9 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 use crate::layout::Layout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::clipboard_transfer::{
+    HostClipboardContents, HostImageToken, HostImageWorker, PendingHostImageRequests,
+};
 
 #[path = "native_cursor.rs"]
 mod native_cursor;
@@ -61,7 +64,13 @@ struct HostPasteboardSnapshot {
     change_count: isize,
     text: Option<Arc<str>>,
     image_png: Option<Arc<[u8]>>,
+    image_tiff: Option<Box<[u8]>>,
     image_error: Option<String>,
+}
+
+enum CopiedPasteboardImage {
+    Png(Arc<[u8]>),
+    Tiff(Box<[u8]>),
 }
 
 pub enum ClipboardPayload {
@@ -151,8 +160,9 @@ pub struct AppState {
     pub trace_forwarded: Option<(u64, u32, u32)>,
     trace_frames:
         std::collections::HashMap<smithay::reexports::wayland_server::backend::ObjectId, u64>,
-    host_clipboard_text: Option<Arc<str>>,
-    host_clipboard_image_png: Option<Arc<[u8]>>,
+    host_clipboard: HostClipboardContents,
+    host_clipboard_images: HostImageWorker,
+    pending_host_image_requests: PendingHostImageRequests,
     pending_guest_clipboard_mime: Option<String>,
     guest_clipboard_generation: Arc<AtomicU64>,
     outgoing_clipboard_transfers: Arc<crate::clipboard_transfer::TransferBudget>,
@@ -414,8 +424,9 @@ impl AppState {
             trace_forwarded: None,
             trace_frames: std::collections::HashMap::new(),
             commit_counter: 0,
-            host_clipboard_text: None,
-            host_clipboard_image_png: None,
+            host_clipboard: HostClipboardContents::default(),
+            host_clipboard_images: HostImageWorker::default(),
+            pending_host_image_requests: PendingHostImageRequests::default(),
             pending_guest_clipboard_mime: None,
             guest_clipboard_generation: Arc::new(AtomicU64::new(0)),
             outgoing_clipboard_transfers: Arc::new(
@@ -1061,6 +1072,7 @@ impl AppState {
     }
 
     pub fn poll_host_clipboard(&mut self) {
+        self.poll_host_clipboard_results();
         let now = std::time::Instant::now();
         if now.duration_since(self.last_pasteboard_poll) < std::time::Duration::from_millis(100) {
             return;
@@ -1073,36 +1085,142 @@ impl AppState {
         self.last_pasteboard_poll = std::time::Instant::now();
 
         let Some(snapshot) = pasteboard_snapshot_if_changed(self.pasteboard_change_count) else {
+            self.poll_host_clipboard_results();
             return;
         };
-        self.guest_clipboard_generation
-            .fetch_add(1, Ordering::Relaxed);
+        let generation = self
+            .guest_clipboard_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         self.pending_guest_clipboard_mime = None;
         self.pasteboard_change_count = snapshot.change_count;
-        self.host_clipboard_text = snapshot.text;
-        self.host_clipboard_image_png = snapshot.image_png;
+        self.host_clipboard = HostClipboardContents {
+            text: snapshot.text,
+            image_png: snapshot.image_png,
+        };
+        let token = HostImageToken {
+            generation,
+            change_count: snapshot.change_count,
+        };
+        self.pending_host_image_requests
+            .reset(snapshot.image_tiff.as_ref().map(|_| token));
+        self.host_clipboard_images
+            .replace_pending(snapshot.image_tiff.map(|tiff| (token, tiff)));
 
-        let byte_count = self
-            .host_clipboard_text
-            .as_ref()
-            .map_or(0, |text| text.len())
-            + self
-                .host_clipboard_image_png
-                .as_ref()
-                .map_or(0, |image| image.len());
-        let mime_types = clipboard_mime_types(
-            self.host_clipboard_text.is_some(),
-            self.host_clipboard_image_png.is_some(),
-        );
-        crate::diagnostics::record_clipboard_host_change(
-            byte_count,
-            mime_types.first().map(String::as_str),
-        );
-
+        self.publish_host_clipboard();
         if let Some(error) = snapshot.image_error {
             log::warn!("Clipboard: {error}");
             crate::diagnostics::record_clipboard_host_failure(error);
         }
+        self.poll_host_clipboard_results();
+    }
+
+    /// Parent supplies an EventLoopProxy waker before the first clipboard refresh.
+    pub fn set_host_clipboard_waker(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.host_clipboard_images.set_waker(wake);
+    }
+
+    /// Include this in the existing maintenance work decision, not a new timer.
+    pub fn has_pending_host_clipboard_image(&self) -> bool {
+        self.host_clipboard_images.has_work()
+    }
+
+    /// Cheap completion polling for maintenance or an existing event wake.
+    /// No provider fetching or image conversion takes place here.
+    pub fn poll_host_clipboard_results(&mut self) {
+        if !self.host_clipboard_images.has_work() {
+            return;
+        }
+        let generation = self.guest_clipboard_generation.load(Ordering::Relaxed);
+        let live_count = unsafe { objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() };
+        if let Some(token) = self.pending_host_image_requests.token()
+            && !token.is_current(generation, self.pasteboard_change_count, live_count)
+        {
+            self.pending_host_image_requests.reset(None);
+        }
+        if let Some(completion) = self.host_clipboard_images.poll() {
+            let error = completion.result.as_ref().err().cloned();
+            let token = completion.token;
+            let current = token.is_current(generation, self.pasteboard_change_count, live_count);
+            let fds = self.pending_host_image_requests.take(token);
+            let has_image = completion
+                .result
+                .as_ref()
+                .is_ok_and(|image| image.is_some());
+            let _ = self.host_clipboard.merge_image(
+                completion,
+                generation,
+                self.pasteboard_change_count,
+                live_count,
+            );
+            if current {
+                if has_image {
+                    // PNG was already offered while pending; do not invalidate an
+                    // immediate paste's offer by re-publishing the same MIME list.
+                    self.record_host_clipboard_change();
+                    if let Some(image) = &self.host_clipboard.image_png {
+                        for fd in fds {
+                            self.send_host_clipboard_payload(
+                                fd,
+                                ClipboardPayload::Image(image.clone()),
+                            );
+                        }
+                    }
+                } else {
+                    self.publish_host_clipboard();
+                }
+            }
+            // Publish first: recording a host change clears diagnostics' errors.
+            // Surface failures even when their snapshot has been superseded.
+            if let Some(error) = error {
+                log::warn!("Clipboard: {error}");
+                crate::diagnostics::record_clipboard_host_failure(error);
+            }
+        }
+        if let Some(token) = self.host_clipboard_images.pending_token() {
+            if !token.is_current(generation, self.pasteboard_change_count, live_count) {
+                self.host_clipboard_images.replace_pending(None);
+            } else if let Err(error) = self
+                .host_clipboard_images
+                .start_pending(convert_host_clipboard_tiff)
+            {
+                let error = format!("Failed to start macOS clipboard image conversion: {error}");
+                drop(self.pending_host_image_requests.take(token));
+                self.publish_host_clipboard();
+                log::warn!("Clipboard: {error}");
+                crate::diagnostics::record_clipboard_host_failure(error);
+            }
+        }
+    }
+
+    fn record_host_clipboard_change(&self) -> Vec<String> {
+        let byte_count = self
+            .host_clipboard
+            .text
+            .as_ref()
+            .map_or(0, |text| text.len())
+            + self
+                .host_clipboard
+                .image_png
+                .as_ref()
+                .map_or(0, |image| image.len());
+        let mime_types = clipboard_mime_types(
+            self.host_clipboard.text.is_some(),
+            self.host_clipboard.image_png.is_some()
+                || self.pending_host_image_requests.token().is_some(),
+        );
+        // A pending image has no encoded bytes yet, but is not an empty copy.
+        if byte_count != 0 || self.pending_host_image_requests.token().is_none() {
+            crate::diagnostics::record_clipboard_host_change(
+                byte_count,
+                mime_types.first().map(String::as_str),
+            );
+        }
+        mime_types
+    }
+
+    fn publish_host_clipboard(&mut self) {
+        let mime_types = self.record_host_clipboard_change();
 
         if mime_types.is_empty() {
             log::info!("Clipboard: macOS pasteboard has no supported contents");
@@ -1121,7 +1239,10 @@ impl AppState {
             &self.display_handle,
             &self.seat,
             mime_types,
-            (),
+            HostImageToken {
+                generation: self.guest_clipboard_generation.load(Ordering::Relaxed),
+                change_count: self.pasteboard_change_count,
+            },
         );
     }
 
@@ -1138,21 +1259,23 @@ impl AppState {
         {
             return;
         }
+        self.host_clipboard_images.replace_pending(None);
+        self.pending_host_image_requests.reset(None);
         let byte_count = payload.as_bytes().len();
         match payload {
             ClipboardPayload::Text(text) => {
-                if self.host_clipboard_text.as_deref() == Some(&*text)
-                    && self.host_clipboard_image_png.is_none()
+                if self.host_clipboard.text.as_deref() == Some(&*text)
+                    && self.host_clipboard.image_png.is_none()
                 {
                     return;
                 }
                 self.pasteboard_change_count = write_to_pasteboard(&text);
-                self.host_clipboard_text = Some(text);
-                self.host_clipboard_image_png = None;
+                self.host_clipboard.text = Some(text);
+                self.host_clipboard.image_png = None;
             }
             ClipboardPayload::Image(image) => {
-                if self.host_clipboard_image_png.as_deref() == Some(&*image)
-                    && self.host_clipboard_text.is_none()
+                if self.host_clipboard.image_png.as_deref() == Some(&*image)
+                    && self.host_clipboard.text.is_none()
                 {
                     return;
                 }
@@ -1169,8 +1292,8 @@ impl AppState {
                     }
                     self.pasteboard_change_count = pb.changeCount();
                 }
-                self.host_clipboard_text = None;
-                self.host_clipboard_image_png = Some(image);
+                self.host_clipboard.text = None;
+                self.host_clipboard.image_png = Some(image);
             }
         }
         crate::diagnostics::record_clipboard_guest_install(byte_count);
@@ -1181,11 +1304,31 @@ impl AppState {
             &self.display_handle,
             &self.seat,
             clipboard_mime_types(
-                self.host_clipboard_text.is_some(),
-                self.host_clipboard_image_png.is_some(),
+                self.host_clipboard.text.is_some(),
+                self.host_clipboard.image_png.is_some(),
             ),
-            (),
+            HostImageToken {
+                generation,
+                change_count: self.pasteboard_change_count,
+            },
         );
+    }
+
+    fn send_host_clipboard_payload(&self, fd: std::os::fd::OwnedFd, payload: ClipboardPayload) {
+        if let Err(error) =
+            self.outgoing_clipboard_transfers
+                .spawn(payload.as_bytes().len(), move || {
+                    if let Err(error) = write_clipboard_payload(fd, payload.as_bytes()) {
+                        crate::diagnostics::record_clipboard_host_failure(format!(
+                            "Failed to send macOS clipboard contents to Wayland: {error}"
+                        ));
+                    }
+                })
+        {
+            crate::diagnostics::record_clipboard_host_failure(format!(
+                "Unable to start macOS clipboard transfer: {error}"
+            ));
+        }
     }
 
     /// Read a client selection only after Smithay has committed it to the seat.
@@ -1777,7 +1920,7 @@ impl smithay::reexports::wayland_server::backend::ClientData for ClientState {
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::{SelectionSource, SelectionTarget};
 impl SelectionHandler for AppState {
-    type SelectionUserData = ();
+    type SelectionUserData = HostImageToken;
 
     fn new_selection(
         &mut self,
@@ -1790,6 +1933,8 @@ impl SelectionHandler for AppState {
         }
         self.guest_clipboard_generation
             .fetch_add(1, Ordering::Relaxed);
+        self.host_clipboard_images.replace_pending(None);
+        self.pending_host_image_requests.reset(None);
         let source = match source {
             Some(s) => s,
             None => {
@@ -1816,37 +1961,41 @@ impl SelectionHandler for AppState {
         mime_type: String,
         fd: std::os::unix::io::OwnedFd,
         _seat: smithay::input::Seat<Self>,
-        _user_data: &Self::SelectionUserData,
+        user_data: &Self::SelectionUserData,
     ) {
         if ty != SelectionTarget::Clipboard {
             return;
         }
+        if !user_data.is_current(
+            self.guest_clipboard_generation.load(Ordering::Relaxed),
+            self.pasteboard_change_count,
+            unsafe { objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() },
+        ) {
+            return;
+        }
+        if is_clipboard_image_mime(&mime_type)
+            && self.host_clipboard.image_png.is_none()
+            && self.pending_host_image_requests.token() == Some(*user_data)
+        {
+            if let Err(error) = self.pending_host_image_requests.retain(*user_data, fd) {
+                crate::diagnostics::record_clipboard_host_failure(error.to_string());
+            }
+            return;
+        }
         let payload = if is_clipboard_image_mime(&mime_type) {
-            self.host_clipboard_image_png
+            self.host_clipboard
+                .image_png
                 .clone()
                 .map(ClipboardPayload::Image)
         } else if is_clipboard_text_mime(&mime_type) {
-            self.host_clipboard_text.clone().map(ClipboardPayload::Text)
+            self.host_clipboard.text.clone().map(ClipboardPayload::Text)
         } else {
             return;
         };
         let Some(payload) = payload else {
             return;
         };
-        if let Err(error) =
-            self.outgoing_clipboard_transfers
-                .spawn(payload.as_bytes().len(), move || {
-                    if let Err(error) = write_clipboard_payload(fd, payload.as_bytes()) {
-                        crate::diagnostics::record_clipboard_host_failure(format!(
-                            "Failed to send macOS clipboard contents to Wayland: {error}"
-                        ));
-                    }
-                })
-        {
-            crate::diagnostics::record_clipboard_host_failure(format!(
-                "Unable to start macOS clipboard transfer: {error}"
-            ));
-        }
+        self.send_host_clipboard_payload(fd, payload);
     }
 }
 impl DataDeviceHandler for AppState {
@@ -2399,6 +2548,53 @@ mod role_lifecycle_tests {
             role
         }
 
+        fn ack_configure(&mut self, xdg: u32, events: &[(u32, u16, Vec<u8>)]) {
+            let (_, _, body) = events
+                .iter()
+                .rev()
+                .find(|(object, opcode, _)| *object == xdg && *opcode == 0)
+                .expect("xdg_surface.configure must precede the first commit");
+            self.request(xdg, 4, &[word(body)]); // xdg_surface.ack_configure
+            self.roundtrip();
+        }
+
+        fn configured_toplevel(&mut self) -> (WlSurface, u32) {
+            let (wl, xdg) = self.xdg_surface();
+            let role = self.id();
+            self.request(xdg, 1, &[role]);
+            let events = self.roundtrip();
+            self.ack_configure(xdg, &events);
+            let surface = self
+                .state
+                .toplevels
+                .iter()
+                .find(|toplevel| toplevel.wl_surface().id().protocol_id() == wl)
+                .unwrap()
+                .wl_surface()
+                .clone();
+            (surface, xdg)
+        }
+
+        fn queue_frame_callbacks(&mut self, surface: &WlSurface, count: usize) -> Vec<u32> {
+            let callbacks = (0..count)
+                .map(|_| {
+                    let callback = self.id();
+                    self.request(surface.id().protocol_id(), 3, &[callback]); // wl_surface.frame
+                    callback
+                })
+                .collect();
+            self.request(surface.id().protocol_id(), 6, &[]); // wl_surface.commit
+            callbacks
+        }
+
+        fn pending_frame_ids(&self) -> Vec<u32> {
+            self.state
+                .pending_frame_callbacks
+                .iter()
+                .map(|pending| pending.callback.id().protocol_id())
+                .collect()
+        }
+
         fn seed_scene_state(&mut self, surface: &WlSurface, root: &WlSurface) {
             let callback = self.id();
             self.request(surface.id().protocol_id(), 3, &[callback]); // wl_surface.frame
@@ -2454,6 +2650,130 @@ mod role_lifecycle_tests {
                     .is_none()
             );
         }
+    }
+
+    fn frame_done_events(events: &[(u32, u16, Vec<u8>)], callbacks: &[u32]) -> Vec<(u32, u32)> {
+        events
+            .iter()
+            .filter_map(|(object, opcode, body)| {
+                if *opcode != 0 || !callbacks.contains(object) {
+                    return None;
+                }
+                assert_eq!(body.len(), 4, "wl_callback.done has exactly one timestamp");
+                Some((*object, word(body)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn desktop_ready_root_and_popup_ack_without_retiring_blocked_root() {
+        let mut scene = Scene::new(PresentationMode::Desktop);
+        let (blocked, _) = scene.configured_toplevel();
+        let (ready, ready_xdg) = scene.configured_toplevel();
+        let blocked_root = blocked.id();
+        let ready_root = ready.id();
+
+        let (_, popup_xdg) = scene.xdg_surface();
+        let positioner = scene.id();
+        scene.request(scene.shell, 1, &[positioner]);
+        scene.request(positioner, 1, &[4, 4]);
+        scene.request(positioner, 2, &[0, 0, 4, 4]);
+        let popup_role = scene.id();
+        scene.request(popup_xdg, 2, &[popup_role, ready_xdg, positioner]);
+        let events = scene.roundtrip();
+        scene.ack_configure(popup_xdg, &events);
+        let popup = scene.state.popups[0].wl_surface().clone();
+        assert_eq!(
+            scene.state.root_toplevel_id_for_surface(&popup),
+            Some(ready_root.clone())
+        );
+
+        // Interleave real frame requests and commits; do not seed the callback queue.
+        let a_first = scene.queue_frame_callbacks(&blocked, 1)[0];
+        let b = scene.queue_frame_callbacks(&ready, 2);
+        let popup_first = scene.queue_frame_callbacks(&popup, 1)[0];
+        let a_second = scene.queue_frame_callbacks(&blocked, 1)[0];
+        let popup_second = scene.queue_frame_callbacks(&popup, 1)[0];
+        let mut callbacks = vec![a_first, b[0], b[1], popup_first, a_second, popup_second];
+        let events = scene.roundtrip();
+        assert!(frame_done_events(&events, &callbacks).is_empty());
+        assert_eq!(scene.pending_frame_ids(), callbacks);
+        for pending in &scene.state.pending_frame_callbacks {
+            let root = if pending.source_surface == blocked {
+                &blocked_root
+            } else {
+                &ready_root
+            };
+            assert_eq!(pending.root_surface.as_ref(), Some(root));
+        }
+
+        // Tracing is disabled in this headless harness; seed only the owner-keyed
+        // trace bookkeeping, while callbacks and their ordering come from Wayland.
+        scene.state.trace_frames.insert(blocked_root.clone(), 11);
+        scene.state.trace_frames.insert(ready_root.clone(), 21);
+        let ready_traces = scene.state.trace_frames_for(Some(&ready_root));
+        assert_eq!(ready_traces, [21]);
+        assert_eq!(scene.state.trace_frames_for(Some(&ready_root)), [21]);
+        scene.state.retire_trace_frames(&ready_traces);
+        scene.state.send_frame_callbacks_for(Some(&ready_root), 100);
+        let events = scene.roundtrip();
+        assert_eq!(
+            frame_done_events(&events, &callbacks),
+            [
+                (b[0], 100),
+                (b[1], 100),
+                (popup_first, 100),
+                (popup_second, 100)
+            ]
+        );
+        assert_eq!(scene.pending_frame_ids(), [a_first, a_second]);
+        assert!(
+            scene.state.pending_frame_callbacks.iter().all(|pending| {
+                pending.source_surface == blocked && pending.callback.is_alive()
+            })
+        );
+        assert!(scene.state.trace_frames_for(Some(&ready_root)).is_empty());
+        assert_eq!(scene.state.trace_frames_for(Some(&blocked_root)), [11]);
+        assert_eq!(scene.state.trace_frames.len(), 1);
+
+        // Retrying the ready root cannot re-ack B or drain the blocked owner's queue.
+        scene.state.send_frame_callbacks_for(Some(&ready_root), 101);
+        let events = scene.roundtrip();
+        assert!(frame_done_events(&events, &callbacks).is_empty());
+        assert_eq!(scene.pending_frame_ids(), [a_first, a_second]);
+        assert_eq!(scene.state.trace_frames_for(Some(&blocked_root)), [11]);
+
+        // A newer blocked commit must append, not replace, its older callbacks.
+        let a_latest = scene.queue_frame_callbacks(&blocked, 1)[0];
+        callbacks.push(a_latest);
+        let events = scene.roundtrip();
+        assert!(frame_done_events(&events, &callbacks).is_empty());
+        assert_eq!(scene.pending_frame_ids(), [a_first, a_second, a_latest]);
+        scene.state.trace_frames.insert(blocked_root.clone(), 12);
+        scene.state.retire_trace_frames(&ready_traces); // stale B retirement is harmless to A
+        assert_eq!(scene.state.trace_frames_for(Some(&blocked_root)), [12]);
+
+        let blocked_traces = scene.state.trace_frames_for(Some(&blocked_root));
+        assert_eq!(blocked_traces, [12]);
+        scene.state.retire_trace_frames(&blocked_traces);
+        scene
+            .state
+            .send_frame_callbacks_for(Some(&blocked_root), 200);
+        let events = scene.roundtrip();
+        assert_eq!(
+            frame_done_events(&events, &callbacks),
+            [(a_first, 200), (a_second, 200), (a_latest, 200)]
+        );
+        assert!(scene.state.pending_frame_callbacks.is_empty());
+        assert!(scene.state.trace_frames_for(None).is_empty());
+
+        scene
+            .state
+            .send_frame_callbacks_for(Some(&blocked_root), 201);
+        scene.state.send_frame_callbacks_for(Some(&ready_root), 201);
+        scene.state.send_frame_callbacks_for(None, 201);
+        let events = scene.roundtrip();
+        assert!(frame_done_events(&events, &callbacks).is_empty());
     }
 
     #[test]
@@ -2796,6 +3116,140 @@ mod clipboard_tests {
     }
 
     #[test]
+    fn image_bounds_reject_zero_overflow_and_decompression_bombs() {
+        use super::{
+            MAX_CLIPBOARD_IMAGE_PIXELS, MAX_CLIPBOARD_IMAGE_SOURCE_BYTES,
+            validate_clipboard_image_dimensions, validate_clipboard_source_size,
+        };
+        assert!(validate_clipboard_source_size(MAX_CLIPBOARD_IMAGE_SOURCE_BYTES).is_ok());
+        assert!(validate_clipboard_source_size(MAX_CLIPBOARD_IMAGE_SOURCE_BYTES + 1).is_err());
+        assert!(validate_clipboard_source_size(usize::MAX).is_err());
+        assert!(
+            validate_clipboard_image_dimensions(MAX_CLIPBOARD_IMAGE_PIXELS as isize, 1).is_ok()
+        );
+        for (width, height) in [(0, 1), (1, 0), (-1, 1), (isize::MAX, 3), (65536, 65536)] {
+            assert!(validate_clipboard_image_dimensions(width, height).is_err());
+        }
+        assert!(shared_png_bytes(sample_png(0, 1)).is_err());
+        assert!(shared_png_bytes(sample_png(65536, 65536)).is_err());
+    }
+
+    fn sample_tiff(width: u32, height: u32, little: bool) -> Vec<u8> {
+        let u16_bytes = |value: u16| {
+            if little {
+                value.to_le_bytes()
+            } else {
+                value.to_be_bytes()
+            }
+        };
+        let u32_bytes = |value: u32| {
+            if little {
+                value.to_le_bytes()
+            } else {
+                value.to_be_bytes()
+            }
+        };
+        let mut bytes = if little {
+            b"II\x2a\0".to_vec()
+        } else {
+            b"MM\0\x2a".to_vec()
+        };
+        bytes.extend_from_slice(&u32_bytes(8));
+        bytes.extend_from_slice(&u16_bytes(4));
+        for (tag, kind, value) in [(256, 4, width), (257, 4, height), (258, 3, 8), (277, 3, 4)] {
+            bytes.extend_from_slice(&u16_bytes(tag));
+            bytes.extend_from_slice(&u16_bytes(kind));
+            bytes.extend_from_slice(&u32_bytes(1));
+            if kind == 3 {
+                bytes.extend_from_slice(&u16_bytes(value as u16));
+                bytes.extend_from_slice(&[0; 2]);
+            } else {
+                bytes.extend_from_slice(&u32_bytes(value));
+            }
+        }
+        bytes.extend_from_slice(&u32_bytes(0));
+        bytes
+    }
+
+    #[test]
+    fn tiff_preflight_bounds_both_byte_orders_before_decoding() {
+        for little in [true, false] {
+            assert!(super::validate_clipboard_tiff(&sample_tiff(6016, 3384, little)).is_ok());
+            assert!(super::validate_clipboard_tiff(&sample_tiff(8192, 4096, little)).is_ok());
+            assert!(super::validate_clipboard_tiff(&sample_tiff(8193, 4096, little)).is_err());
+            assert!(super::validate_clipboard_tiff(&sample_tiff(0, 1, little)).is_err());
+        }
+    }
+
+    #[test]
+    fn tiff_preflight_rejects_malformed_offsets_frames_and_channel_depths() {
+        let original = sample_tiff(1, 1, true);
+        for end in 0..original.len() {
+            assert!(super::validate_clipboard_tiff(&original[..end]).is_err());
+        }
+        let mut malformed = original.clone();
+        malformed[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(super::validate_clipboard_tiff(&malformed).is_err());
+        let mut multiframe = original.clone();
+        multiframe[58..62].copy_from_slice(&8u32.to_le_bytes());
+        assert!(
+            super::validate_clipboard_tiff(&multiframe)
+                .unwrap_err()
+                .contains("multi-image")
+        );
+        let mut deep = original.clone();
+        deep[42..44].copy_from_slice(&32u16.to_le_bytes());
+        assert!(
+            super::validate_clipboard_tiff(&deep)
+                .unwrap_err()
+                .contains("16-bit")
+        );
+        let mut channels = original;
+        channels[54..56].copy_from_slice(&5u16.to_le_bytes());
+        assert!(
+            super::validate_clipboard_tiff(&channels)
+                .unwrap_err()
+                .contains("4-channel")
+        );
+        assert!(super::validate_clipboard_tiff(b"II\x2b\0\x08\0\0\0").is_err());
+    }
+
+    #[test]
+    fn tiff_preflight_checks_external_channel_metadata_without_decoding() {
+        let mut tiff = sample_tiff(6016, 3384, true);
+        tiff[38..42].copy_from_slice(&4u32.to_le_bytes());
+        tiff[42..46].copy_from_slice(&62u32.to_le_bytes());
+        for _ in 0..4 {
+            tiff.extend_from_slice(&8u16.to_le_bytes());
+        }
+        assert!(super::validate_clipboard_tiff(&tiff).is_ok());
+        assert!(super::validate_clipboard_tiff(&tiff[..tiff.len() - 1]).is_err());
+        tiff[42..46].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(super::validate_clipboard_tiff(&tiff).is_err());
+    }
+
+    #[test]
+    fn appkit_tiff_round_trip_runs_off_thread_without_accessing_the_pasteboard() {
+        use objc2_app_kit::{NSBitmapImageRep, NSTIFFFileType};
+        use objc2_foundation::{NSData, NSDictionary};
+
+        let tiff = objc2::rc::autoreleasepool(|_| unsafe {
+            let png = NSData::with_bytes(include_bytes!("../assets/icon.png"));
+            let image = NSBitmapImageRep::imageRepWithData(&png).unwrap();
+            let tiff = image
+                .representationUsingType_properties(NSTIFFFileType, &NSDictionary::new())
+                .unwrap();
+            tiff.bytes().to_vec().into_boxed_slice()
+        });
+        let png = std::thread::spawn(move || super::convert_host_clipboard_tiff(tiff))
+            .join()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(super::shared_png_bytes(png.to_vec()).unwrap().is_some());
+    }
+
+    #[test]
     fn chooses_the_exact_mime_offered_by_the_client() {
         let offered = vec![
             "image/png".to_string(),
@@ -2954,35 +3408,56 @@ fn pasteboard_snapshot_if_changed(previous_change_count: isize) -> Option<HostPa
         let text = pb
             .stringForType(objc2_app_kit::NSPasteboardTypeString)
             .map(|text| Arc::<str>::from(text.to_string()));
-        let (image_png, image_error) = match pasteboard_png(&pb) {
-            Ok(image) => (image, None),
-            Err(error) => (None, Some(error)),
+        let (image_png, image_tiff, image_error) = match copy_pasteboard_image(&pb) {
+            Ok(Some(CopiedPasteboardImage::Png(image))) => (Some(image), None, None),
+            Ok(Some(CopiedPasteboardImage::Tiff(image))) => (None, Some(image), None),
+            Ok(None) => (None, None, None),
+            Err(error) => (None, None, Some(error)),
         };
+        // Provider fetching may block, and the owner may change while it does.
+        // Never publish text and image fetched across different host snapshots.
+        if pb.changeCount() != change_count {
+            return None;
+        }
         Some(HostPasteboardSnapshot {
             change_count,
             text,
             image_png,
+            image_tiff,
             image_error,
         })
     }
 }
 
-fn pasteboard_png(pb: &objc2_app_kit::NSPasteboard) -> Result<Option<Arc<[u8]>>, String> {
-    use objc2_app_kit::{
-        NSBitmapImageRep, NSPNGFileType, NSPasteboardTypePNG, NSPasteboardTypeTIFF,
-    };
-    use objc2_foundation::NSDictionary;
-
+fn copy_pasteboard_image(
+    pb: &objc2_app_kit::NSPasteboard,
+) -> Result<Option<CopiedPasteboardImage>, String> {
+    use objc2_app_kit::{NSPasteboardTypePNG, NSPasteboardTypeTIFF};
     unsafe {
         if let Some(data) = pb.dataForType(NSPasteboardTypePNG) {
-            return shared_png_data(&data);
+            return shared_png_data(&data).map(|image| image.map(CopiedPasteboardImage::Png));
         }
-
         let Some(tiff) = pb.dataForType(NSPasteboardTypeTIFF) else {
             return Ok(None);
         };
-        validate_clipboard_source_size(tiff.len())?;
-        let image = NSBitmapImageRep::imageRepWithData(&tiff)
+        let bytes = tiff.bytes();
+        validate_clipboard_source_size(bytes.len())?;
+        // Copy before leaving the event thread; even retained NSData may have a
+        // mutable provider backing. Size is checked before allocating our copy.
+        Ok(Some(CopiedPasteboardImage::Tiff(bytes.into())))
+    }
+}
+
+fn convert_host_clipboard_tiff(tiff: Box<[u8]>) -> crate::clipboard_transfer::HostImageResult {
+    use objc2_app_kit::{NSBitmapImageRep, NSPNGFileType};
+    use objc2_foundation::{NSData, NSDictionary};
+
+    validate_clipboard_source_size(tiff.len())?;
+    // Reject dimension/depth bombs before asking AppKit to allocate a bitmap.
+    validate_clipboard_tiff(&tiff)?;
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let data = NSData::with_bytes(&tiff);
+        let image = NSBitmapImageRep::imageRepWithData(&data)
             .ok_or_else(|| "macOS clipboard TIFF image could not be decoded".to_string())?;
         validate_clipboard_image_dimensions(image.pixelsWide(), image.pixelsHigh())?;
         let properties = NSDictionary::new();
@@ -2991,18 +3466,132 @@ fn pasteboard_png(pb: &objc2_app_kit::NSPasteboard) -> Result<Option<Arc<[u8]>>,
             .ok_or_else(|| {
                 "macOS clipboard TIFF image could not be converted to PNG".to_string()
             })?;
-        shared_png_data(&png)
+        let image = shared_png_data(&png)?
+            .ok_or_else(|| "macOS clipboard TIFF conversion produced an empty PNG".to_string())?;
+        Ok(Some(image))
+    })
+}
+
+fn validate_clipboard_tiff(bytes: &[u8]) -> Result<(), String> {
+    let malformed = || "macOS clipboard TIFF has malformed or unsupported metadata".to_string();
+    let little = match bytes.get(..4) {
+        Some(b"II\x2a\0") => true,
+        Some(b"MM\0\x2a") => false,
+        _ => return Err(malformed()), // BigTIFF and other formats are not admitted.
+    };
+    let u16_at = |offset: usize| -> Option<u16> {
+        let value = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+        Some(if little {
+            u16::from_le_bytes(value)
+        } else {
+            u16::from_be_bytes(value)
+        })
+    };
+    let u32_at = |offset: usize| -> Option<u32> {
+        let value = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+        Some(if little {
+            u32::from_le_bytes(value)
+        } else {
+            u32::from_be_bytes(value)
+        })
+    };
+    let ifd = u32_at(4).ok_or_else(malformed)? as usize;
+    if ifd < 8 {
+        return Err(malformed());
     }
+    let count = u16_at(ifd).ok_or_else(malformed)? as usize;
+    let start = ifd.checked_add(2).ok_or_else(malformed)?;
+    let end = start
+        .checked_add(count.checked_mul(12).ok_or_else(malformed)?)
+        .ok_or_else(malformed)?;
+    if u32_at(end).ok_or_else(malformed)? != 0 {
+        return Err("macOS clipboard multi-image TIFF is not supported".into());
+    }
+    let mut width = None;
+    let mut height = None;
+    let mut samples = None;
+    let mut depths = None;
+    for entry in (start..end).step_by(12) {
+        let tag = u16_at(entry).ok_or_else(malformed)?;
+        if tag == 330 {
+            return Err("macOS clipboard TIFF sub-images are not supported".into());
+        }
+        if !matches!(tag, 256 | 257 | 258 | 277) {
+            continue;
+        }
+        let size = match u16_at(entry + 2).ok_or_else(malformed)? {
+            3 => 2,
+            4 => 4,
+            _ => return Err(malformed()),
+        };
+        let length = u32_at(entry + 4).ok_or_else(malformed)? as usize;
+        if length == 0 || length > 4 || (tag != 258 && length != 1) {
+            return Err(malformed());
+        }
+        let offset = if length * size <= 4 {
+            entry + 8
+        } else {
+            u32_at(entry + 8).ok_or_else(malformed)? as usize
+        };
+        let mut values = Vec::with_capacity(length);
+        for index in 0..length {
+            let offset = offset.checked_add(index * size).ok_or_else(malformed)?;
+            let value = if size == 2 {
+                u16_at(offset).map(u32::from)
+            } else {
+                u32_at(offset)
+            };
+            values.push(value.ok_or_else(malformed)?);
+        }
+        match tag {
+            256 => {
+                if width.replace(values[0]).is_some() {
+                    return Err(malformed());
+                }
+            }
+            257 => {
+                if height.replace(values[0]).is_some() {
+                    return Err(malformed());
+                }
+            }
+            258 => {
+                if depths.replace(values).is_some() {
+                    return Err(malformed());
+                }
+            }
+            277 => {
+                if samples.replace(values[0]).is_some() {
+                    return Err(malformed());
+                }
+            }
+            _ => {}
+        }
+    }
+    let samples = samples.unwrap_or(1);
+    if samples == 0
+        || samples > 4
+        || depths.as_ref().is_some_and(|depths| {
+            (depths.len() != 1 && depths.len() != samples as usize)
+                || depths.iter().any(|bits| *bits == 0 || *bits > 16)
+        })
+    {
+        return Err("macOS clipboard TIFF exceeds the 4-channel, 16-bit decode limit".into());
+    }
+    validate_clipboard_image_dimensions(
+        width.ok_or_else(malformed)? as isize,
+        height.ok_or_else(malformed)? as isize,
+    )
 }
 
 fn shared_png_data(data: &objc2_foundation::NSData) -> Result<Option<Arc<[u8]>>, String> {
-    if data.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+    let bytes = data.bytes();
+    if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
         return Err(format!(
             "macOS clipboard image is larger than the 64 MiB transfer limit ({} MiB)",
-            data.len().div_ceil(1024 * 1024)
+            bytes.len().div_ceil(1024 * 1024)
         ));
     }
-    shared_png_bytes(data.bytes().to_vec())
+    shared_png_bytes(bytes.to_vec())
 }
 
 fn shared_png_bytes(bytes: Vec<u8>) -> Result<Option<Arc<[u8]>>, String> {

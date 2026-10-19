@@ -11,6 +11,21 @@ pub enum KeyTransition {
     Released,
 }
 
+/// Only explicit paste presses need a fresh host snapshot on the input path.
+/// Ordinary typing and releases must never realize an image pasteboard provider.
+pub fn requests_clipboard_refresh(
+    evdev_key: u32,
+    transition: KeyTransition,
+    repeat: bool,
+    ctrl: bool,
+    logo: bool,
+    shift: bool,
+) -> bool {
+    transition == KeyTransition::Pressed
+        && !repeat
+        && ((evdev_key == 47 && (ctrl || logo)) || (evdev_key == 110 && shift))
+}
+
 /// Tracks accepted physical key transitions for one native window at a time.
 #[derive(Debug)]
 pub struct KeyTransitionReducer<Owner = u64> {
@@ -126,6 +141,20 @@ impl PointerLockEligibility {
 #[cfg(test)]
 mod tests {
     use super::{KeyTransition, KeyTransitionReducer, PointerLockEligibility, resume_focus};
+
+    #[test]
+    fn clipboard_refresh_is_reserved_for_paste_not_ordinary_key_transitions() {
+        use super::requests_clipboard_refresh as refresh;
+        assert!(refresh(47, Pressed, false, true, false, false));
+        assert!(refresh(47, Pressed, false, true, false, true));
+        assert!(refresh(47, Pressed, false, false, true, false));
+        assert!(refresh(110, Pressed, false, false, false, true));
+        assert!(!refresh(47, Released, false, true, false, true));
+        assert!(!refresh(47, Pressed, true, true, false, true));
+        assert!(!refresh(47, Pressed, false, false, false, false));
+        assert!(!refresh(30, Pressed, false, true, false, true));
+        assert!(!refresh(110, Pressed, false, false, false, false));
+    }
 
     #[test]
     fn held_modifier_can_be_released_after_its_surface_loses_focus() {

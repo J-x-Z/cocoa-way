@@ -15,8 +15,8 @@ use winit::window::Window;
 #[path = "texture_lifetime.rs"]
 mod texture_lifetime;
 use texture_lifetime::{
-    BudgetError, BudgetWake, FrameGate, FrameLifetime, TextureBudget, TextureReservation,
-    TextureVersions, UpdateError,
+    BudgetError, BudgetWake, FrameGate, FrameLifetime, PrepareError, TextureBudget,
+    TextureReservation, TextureVersions, UpdateError,
 };
 
 #[path = "render_geometry.rs"]
@@ -116,6 +116,18 @@ struct TextureResource {
     reservation: Arc<TextureReservation>,
 }
 
+/// Short-lived admission, consumed synchronously before any other cache mutation.
+/// Newly allocated storage remains charged even if the SHM snapshot fails.
+pub(crate) struct PixelPreflight {
+    owner: Weak<TextureCache>,
+    surface_id: ObjectId,
+    frame: std::sync::Weak<FrameLifetime>,
+    width: i32,
+    height: i32,
+    damage: Option<BufferDamage>,
+    resource: Option<TextureResource>,
+}
+
 // Slots cover size changes too; a busy old-sized resource cannot be replaced.
 struct CachedTexture {
     textures: TextureVersions<TextureResource>,
@@ -140,7 +152,14 @@ fn new_texture_cache() -> Rc<TextureCache> {
     cache
 }
 
-fn prune_idle_texture_versions() {
+#[derive(Default)]
+struct TextureReclamation {
+    removed: bool,
+    pending: bool,
+}
+
+fn prune_idle_texture_versions(reclaim_spares: bool) -> TextureReclamation {
+    let mut reclamation = TextureReclamation::default();
     TEXTURE_CACHES.with(|caches| {
         caches.borrow_mut().retain(|cache| {
             let Some(cache) = cache.upgrade() else {
@@ -148,12 +167,24 @@ fn prune_idle_texture_versions() {
             };
             if let Ok(mut entries) = cache.try_borrow_mut() {
                 for entry in entries.values_mut() {
-                    entry.textures.prune_idle();
+                    if reclaim_spares {
+                        reclamation.removed |= entry.textures.prune_idle() != 0;
+                        reclamation.pending |= entry.textures.has_alternates();
+                    } else {
+                        let size = entry
+                            .textures
+                            .current()
+                            .map(|texture| (texture.width, texture.height));
+                        entry.textures.retain_idle_spare(|texture| {
+                            Some((texture.width, texture.height)) == size
+                        });
+                    }
                 }
             }
             true
         });
     });
+    reclamation
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +378,12 @@ impl MetalRenderer {
         self.trace_frames.borrow_mut().clear();
     }
 
+    /// Keep only correlations belonging to owners actually submitted this frame.
+    /// Their ComposeStarted events were already emitted by `begin_trace_frame`.
+    pub fn retain_trace_frames(&self, submitted_ids: &[u64]) {
+        retain_submitted_trace_frames(&mut self.trace_frames.borrow_mut(), submitted_ids);
+    }
+
     pub fn set_scale_factor(&mut self, scale: f64) {
         unsafe {
             let () = objc2::msg_send![&self.layer, setContentsScale: scale];
@@ -369,7 +406,7 @@ impl MetalRenderer {
 
     /// Begin a frame: set clear colour, acquire drawable, start the render pass.
     pub fn clear(&self, r: f32, g: f32, b: f32, a: f32) -> bool {
-        prune_idle_texture_versions();
+        prune_idle_texture_versions(false);
         let mut frame_slot = self.frame.borrow_mut();
         // Drop any leftover frame state from a previous incomplete frame.
         *frame_slot = None;
@@ -634,6 +671,7 @@ impl MetalRenderer {
 
     /// Draw a new buffer snapshot; cache-only draws must use `draw_from_cache`.
     /// `Deferred` must not be counted as rendered or discard the caller's latest commit.
+    #[cfg(test)]
     pub fn draw_pixels(
         &self,
         surface_id: ObjectId,
@@ -648,15 +686,200 @@ impl MetalRenderer {
         alpha: TextureAlpha,
         damage: &[BufferDamage],
     ) -> PixelDrawResult {
-        if geometry.width <= 0 || geometry.height <= 0 {
+        if geometry.width <= 0
+            || geometry.height <= 0
+            || !valid_pixel_range(tex_w, tex_h, bytes_per_row, pixels.len())
+        {
+            return PixelDrawResult::Rejected;
+        }
+        let prepared = match self.preflight_pixels(&surface_id, tex_w, tex_h, damage) {
+            Ok(prepared) => prepared,
+            Err(result) => return result,
+        };
+        self.draw_prepared_pixels(
+            prepared,
+            surface_id,
+            buffer_id,
+            x,
+            y,
+            geometry,
+            tex_w,
+            tex_h,
+            bytes_per_row,
+            pixels,
+            alpha,
+        )
+    }
+
+    /// Admit storage before calling the existing SIGBUS-guarded SHM snapshotter.
+    /// No pixel pointer is needed here, and no extra host snapshot is retained.
+    pub(crate) fn preflight_pixels(
+        &self,
+        surface_id: &ObjectId,
+        tex_w: i32,
+        tex_h: i32,
+        damage: &[BufferDamage],
+    ) -> Result<PixelPreflight, PixelDrawResult> {
+        if tex_w <= 0 || tex_h <= 0 {
+            return Err(PixelDrawResult::Rejected);
+        }
+        let frame = self
+            .frame
+            .borrow()
+            .as_ref()
+            .map(|frame| Arc::downgrade(&frame.lifetime))
+            .ok_or(PixelDrawResult::Deferred)?;
+        let damage = coalesce_damage(damage, tex_w, tex_h);
+        let prepared = |resource| PixelPreflight {
+            owner: Rc::downgrade(&self.texture_cache),
+            surface_id: surface_id.clone(),
+            frame: frame.clone(),
+            width: tex_w,
+            height: tex_h,
+            damage,
+            resource,
+        };
+        let compatible =
+            |texture: &TextureResource| texture.width == tex_w && texture.height == tex_h;
+        // At most one retry. The sweep also covers idle spares in OTHER renderer
+        // caches, without borrowing them or invoking window code under a budget lock.
+        for attempt in 0..2 {
+            let mut cache = self.texture_cache.borrow_mut();
+            let mut retry_in_place = false;
+            let allocation = if let Some(entry) = cache.get_mut(surface_id) {
+                if entry.textures.current().is_some_and(compatible) && damage.is_none() {
+                    return Ok(prepared(None));
+                }
+                entry.textures.retain_idle_spare(compatible);
+                retry_in_place = entry.textures.current_busy()
+                    || entry
+                        .textures
+                        .current()
+                        .is_some_and(|texture| texture.reservation.has_readers());
+                entry.textures.prepare_matching(compatible, |idle| {
+                    self.allocate_texture(tex_w, tex_h, idle.map(|texture| &texture.reservation))
+                })
+            } else {
+                self.allocate_texture(tex_w, tex_h, None)
+                    .map(Some)
+                    .map_err(PrepareError::Allocation)
+            };
+            // A pressure sweep must be able to reclaim this cache too.
+            drop(cache);
+            let denial = match allocation {
+                Ok(resource) => return Ok(prepared(resource)),
+                Err(PrepareError::Busy) => {
+                    self.frame_gate.defer_redraw();
+                    return Err(PixelDrawResult::Deferred);
+                }
+                Err(PrepareError::Allocation(Some(BudgetError::Pressure))) if attempt == 0 => {
+                    prune_idle_texture_versions(true);
+                    continue;
+                }
+                Err(PrepareError::Allocation(denial)) => denial,
+            };
+            // Completion may race the failed reservation and the pressure sweep.
+            // Observe alternates as well as reader counts: a just-idled alternate
+            // can still own the charge even after its last reader has disappeared.
+            let reclamation = if denial == Some(BudgetError::Pressure) {
+                prune_idle_texture_versions(true)
+            } else {
+                TextureReclamation::default()
+            };
+            let result = texture_preflight_result(
+                denial,
+                retry_in_place,
+                denial == Some(BudgetError::Pressure)
+                    && self.texture_budget.has_reclaimable_readers(),
+                &reclamation,
+            );
+            if result == PixelDrawResult::Rejected || !self.allocation_warning.replace(true) {
+                log::warn!(
+                    "Metal texture admission {result:?} ({tex_w}x{tex_h}, {denial:?}); process limit=256MiB/4096 allocations, renderer base=64MiB plus one oversized frame/1024 allocations"
+                );
+            }
+            if result == PixelDrawResult::Deferred {
+                if reclamation.removed {
+                    // The last completion may already have run. Schedule this
+                    // bounded retry ourselves rather than waiting for another one.
+                    self.request_redraw();
+                } else if retry_in_place {
+                    self.frame_gate.defer_until_idle();
+                } else {
+                    self.texture_budget.defer(&self.budget_wake);
+                }
+            }
+            return Err(result);
+        }
+        unreachable!("bounded allocation retry returns on its second attempt")
+    }
+
+    fn allocate_texture(
+        &self,
+        width: i32,
+        height: i32,
+        idle: Option<&Arc<TextureReservation>>,
+    ) -> Result<TextureResource, Option<BudgetError>> {
+        let desc = unsafe { MTLTextureDescriptor::new() };
+        desc.setTextureType(MTLTextureType::MTLTextureType2D);
+        desc.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        unsafe {
+            desc.setWidth(width as usize);
+            desc.setHeight(height as usize);
+        }
+        desc.setUsage(MTLTextureUsage::ShaderRead);
+        let layout = self.device.heapTextureSizeAndAlignWithDescriptor(&desc);
+        let bytes = texture_reservation_bytes(layout, width, height).ok_or(None)?;
+        let reservation = self
+            .texture_budget
+            .try_reserve_replacing(bytes, &self.budget_wake, idle)
+            .map_err(Some)?;
+        let texture = self.device.newTextureWithDescriptor(&desc).ok_or(None)?;
+        if texture.allocatedSize() > reservation.bytes {
+            return Err(None);
+        }
+        Ok(TextureResource {
+            texture,
+            width,
+            height,
+            reservation,
+        })
+    }
+
+    /// `prepared` must come from this renderer, for this surface and upload, with
+    /// no intervening cache mutation. Snapshot failure simply drops the token.
+    pub(crate) fn draw_prepared_pixels(
+        &self,
+        prepared: PixelPreflight,
+        surface_id: ObjectId,
+        buffer_id: ObjectId,
+        x: i32,
+        y: i32,
+        geometry: DrawGeometry,
+        tex_w: i32,
+        tex_h: i32,
+        bytes_per_row: usize,
+        pixels: &[u8],
+        alpha: TextureAlpha,
+    ) -> PixelDrawResult {
+        if geometry.width <= 0
+            || geometry.height <= 0
+            || prepared.surface_id != surface_id
+            || !prepared.owner.ptr_eq(&Rc::downgrade(&self.texture_cache))
+        {
             return PixelDrawResult::Rejected;
         }
         let frame_ref = self.frame.borrow();
         let Some(frame) = frame_ref.as_ref() else {
             return PixelDrawResult::Deferred;
         };
+        if !frame.lifetime.accepts_preflight(&prepared.frame) {
+            self.frame_gate.defer_redraw();
+            return PixelDrawResult::Deferred;
+        }
 
         let texture = self.get_or_create_texture(
+            prepared,
             surface_id,
             buffer_id,
             tex_w,
@@ -664,7 +887,6 @@ impl MetalRenderer {
             bytes_per_row,
             pixels,
             alpha,
-            damage,
             &frame.lifetime,
         );
         let texture = match texture {
@@ -742,6 +964,7 @@ impl MetalRenderer {
 
     fn get_or_create_texture(
         &self,
+        prepared: PixelPreflight,
         surface_id: ObjectId,
         buffer_id: ObjectId,
         tex_w: i32,
@@ -749,20 +972,12 @@ impl MetalRenderer {
         bytes_per_row: usize,
         pixels: &[u8],
         alpha: TextureAlpha,
-        damage: &[BufferDamage],
         frame: &Arc<FrameLifetime>,
     ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, PixelDrawResult> {
         let mut cache = self.texture_cache.borrow_mut();
 
-        let row_bytes = (tex_w.max(0) as usize).checked_mul(4);
-        let required = (tex_h.max(0) as usize)
-            .checked_sub(1)
-            .and_then(|rows| rows.checked_mul(bytes_per_row))
-            .and_then(|prefix| prefix.checked_add(row_bytes?));
-        if tex_w <= 0
-            || tex_h <= 0
-            || row_bytes.is_none_or(|row_bytes| bytes_per_row < row_bytes)
-            || required.is_none_or(|required| pixels.len() < required)
+        if (prepared.width, prepared.height) != (tex_w, tex_h)
+            || !valid_pixel_range(tex_w, tex_h, bytes_per_row, pixels.len())
         {
             return Err(PixelDrawResult::Rejected);
         }
@@ -778,92 +993,59 @@ impl MetalRenderer {
             .textures
             .current()
             .is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
-        let damage = coalesce_damage(damage, tex_w, tex_h);
+        let damage = prepared.damage;
         if !same_size || damage.is_some() {
-            // Discard only idle alternates before applying the one-frame share.
-            entry.textures.prune_idle();
-            let retry_in_place = entry.textures.current_busy()
-                || entry
-                    .textures
-                    .current()
-                    .is_some_and(|texture| texture.reservation.has_readers());
             let previous = entry
                 .textures
                 .current()
                 .map(|texture| texture.reservation.clone());
-            let mut allocation_deferred = false;
-            let mut allocation_denial = None;
-            let result = entry.textures.update(|idle, is_current| {
-                let same_size =
-                    idle.is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
-                // Idle alternate slots may contain an older image (or old dimensions).
-                let upload = texture_upload_damage(is_current, same_size, damage, tex_w, tex_h)?;
-                let byte_offset = (upload.y as usize)
-                    .checked_mul(bytes_per_row)?
-                    .checked_add((upload.x as usize).checked_mul(4)?)?;
-                let region = MTLRegion {
-                    origin: MTLOrigin {
-                        x: upload.x as usize,
-                        y: upload.y as usize,
-                        z: 0,
-                    },
-                    size: MTLSize {
-                        width: upload.width as usize,
-                        height: upload.height as usize,
-                        depth: 1,
-                    },
-                };
-                let (texture, reservation) = if same_size {
-                    let idle = idle.unwrap();
-                    (idle.texture.clone(), idle.reservation.clone())
-                } else {
-                    let desc = unsafe { MTLTextureDescriptor::new() };
-                    desc.setTextureType(MTLTextureType::MTLTextureType2D);
-                    desc.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-                    unsafe {
-                        desc.setWidth(tex_w as usize);
-                        desc.setHeight(tex_h as usize);
-                    }
-                    desc.setUsage(MTLTextureUsage::ShaderRead);
-                    // Reserve Metal's aligned storage estimate BEFORE allocation, not
-                    // just width*height*4. Count old/in-flight versions across windows.
-                    let layout = self.device.heapTextureSizeAndAlignWithDescriptor(&desc);
-                    let bytes = texture_reservation_bytes(layout, tex_w, tex_h)?;
-                    allocation_deferred = true;
-                    let reservation = match self.texture_budget.try_reserve_replacing(
-                        bytes,
-                        &self.budget_wake,
-                        idle.map(|texture| &texture.reservation),
-                    ) {
-                        Ok(reservation) => reservation,
-                        Err(error) => {
-                            allocation_denial = Some(error);
-                            return None;
-                        }
+            let result = entry.textures.update_matching(
+                |texture| texture.width == tex_w && texture.height == tex_h,
+                |idle, is_current| {
+                    let same_size = idle
+                        .is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
+                    // Idle alternates contain an older image (or old dimensions).
+                    let upload =
+                        texture_upload_damage(is_current, same_size, damage, tex_w, tex_h)?;
+                    let byte_offset = (upload.y as usize)
+                        .checked_mul(bytes_per_row)?
+                        .checked_add((upload.x as usize).checked_mul(4)?)?;
+                    let region = MTLRegion {
+                        origin: MTLOrigin {
+                            x: upload.x as usize,
+                            y: upload.y as usize,
+                            z: 0,
+                        },
+                        size: MTLSize {
+                            width: upload.width as usize,
+                            height: upload.height as usize,
+                            depth: 1,
+                        },
                     };
-                    let texture = self.device.newTextureWithDescriptor(&desc)?;
-                    if texture.allocatedSize() > reservation.bytes {
-                        return None;
+                    let (texture, reservation) = if same_size {
+                        let idle = idle.unwrap();
+                        (idle.texture.clone(), idle.reservation.clone())
+                    } else {
+                        let resource = prepared.resource?;
+                        (resource.texture, resource.reservation)
+                    };
+                    // Excludes ALL encoded/submitted GPU readers of this storage.
+                    unsafe {
+                        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                            region,
+                            0,
+                            NonNull::new_unchecked(pixels.as_ptr().add(byte_offset) as *mut _),
+                            bytes_per_row,
+                        );
                     }
-                    allocation_deferred = false;
-                    (texture, reservation)
-                };
-                // The ownership model excludes ALL encoded/submitted GPU readers here.
-                unsafe {
-                    texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                        region,
-                        0,
-                        NonNull::new_unchecked(pixels.as_ptr().add(byte_offset) as *mut _),
-                        bytes_per_row,
-                    );
-                }
-                Some(TextureResource {
-                    texture,
-                    width: tex_w,
-                    height: tex_h,
-                    reservation,
-                })
-            });
+                    Some(TextureResource {
+                        texture,
+                        width: tex_w,
+                        height: tex_h,
+                        reservation,
+                    })
+                },
+            );
             if let Err(error) = result {
                 if entry.textures.current().is_none() {
                     cache.remove(&surface_id);
@@ -872,29 +1054,6 @@ impl MetalRenderer {
                     UpdateError::Busy => {
                         self.frame_gate.defer_redraw();
                         PixelDrawResult::Deferred
-                    }
-                    UpdateError::Rejected if allocation_deferred => {
-                        let result = texture_admission_result(
-                            allocation_denial,
-                            retry_in_place,
-                            allocation_denial == Some(BudgetError::Pressure)
-                                && self.texture_budget.has_reclaimable_readers(),
-                        );
-                        if result == PixelDrawResult::Rejected
-                            || !self.allocation_warning.replace(true)
-                        {
-                            log::warn!(
-                                "Metal texture admission {result:?} ({tex_w}x{tex_h}, {allocation_denial:?}); process limit=256MiB/4096 allocations, renderer base=64MiB plus one oversized frame/1024 allocations"
-                            );
-                        }
-                        if result == PixelDrawResult::Deferred {
-                            if retry_in_place {
-                                self.frame_gate.defer_until_idle();
-                            } else {
-                                self.texture_budget.defer(&self.budget_wake);
-                            }
-                        }
-                        result
                     }
                     UpdateError::Rejected => PixelDrawResult::Rejected,
                 });
@@ -906,9 +1065,11 @@ impl MetalRenderer {
             {
                 previous.set_retired(true);
             }
-            // Pair retirement with pruning: if completion raced retirement, either
-            // this pass reclaims the slot or that completion requests one redraw.
-            entry.textures.prune_idle();
+            // Pair retirement with trimming: a completion racing retirement is
+            // either seen here or requests maintenance. Keep just one compatible spare.
+            entry
+                .textures
+                .retain_idle_spare(|texture| texture.width == tex_w && texture.height == tex_h);
         }
         entry.buffer_id = buffer_id;
         entry.alpha = alpha;
@@ -919,6 +1080,22 @@ impl MetalRenderer {
         frame.retain_reservation(&entry.textures.current().unwrap().reservation);
         Ok(entry.textures.current().unwrap().texture.clone())
     }
+}
+
+fn retain_submitted_trace_frames(frames: &mut Vec<u64>, submitted_ids: &[u64]) {
+    frames.retain(|id| submitted_ids.contains(id));
+}
+
+fn valid_pixel_range(width: i32, height: i32, bytes_per_row: usize, len: usize) -> bool {
+    let row_bytes = (width.max(0) as usize).checked_mul(4);
+    let required = (height.max(0) as usize)
+        .checked_sub(1)
+        .and_then(|rows| rows.checked_mul(bytes_per_row))
+        .and_then(|prefix| prefix.checked_add(row_bytes?));
+    width > 0
+        && height > 0
+        && row_bytes.is_some_and(|row_bytes| bytes_per_row >= row_bytes)
+        && required.is_some_and(|required| len >= required)
 }
 
 fn texture_admission_result(
@@ -933,6 +1110,19 @@ fn texture_admission_result(
         PixelDrawResult::Deferred
     } else {
         PixelDrawResult::Rejected
+    }
+}
+
+fn texture_preflight_result(
+    error: Option<BudgetError>,
+    retry_in_place: bool,
+    reclaimable_readers: bool,
+    reclamation: &TextureReclamation,
+) -> PixelDrawResult {
+    if error == Some(BudgetError::Pressure) && (reclamation.removed || reclamation.pending) {
+        PixelDrawResult::Deferred
+    } else {
+        texture_admission_result(error, retry_in_place, reclaimable_readers)
     }
 }
 
@@ -1006,6 +1196,56 @@ mod headless_tests;
 #[cfg(test)]
 mod tests {
     use super::{BufferDamage, TextureAlpha, coalesce_damage, texture_upload_damage};
+
+    #[test]
+    fn retaining_submitted_trace_ids_only_filters_existing_correlations_in_order() {
+        let mut frames = vec![11, 22, 33, 44];
+        super::retain_submitted_trace_frames(&mut frames, &[44, 22, 22, 99]);
+        assert_eq!(frames, [22, 44]);
+        super::retain_submitted_trace_frames(&mut frames, &[22, 44]);
+        assert_eq!(frames, [22, 44]); // Idempotent, no new correlations or start events.
+        super::retain_submitted_trace_frames(&mut frames, &[]);
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn upload_range_validation_remains_checked_before_any_cpu_write() {
+        use super::valid_pixel_range;
+        assert!(valid_pixel_range(2, 2, 16, 24));
+        assert!(!valid_pixel_range(2, 2, 16, 23));
+        assert!(!valid_pixel_range(2, 2, 7, 24));
+        assert!(!valid_pixel_range(0, 2, 16, 24));
+        assert!(!valid_pixel_range(2, 0, 16, 24));
+        assert!(!valid_pixel_range(-1, 2, 16, 24));
+        assert!(!valid_pixel_range(2, 3, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn preflight_defers_just_idled_charges_even_without_reclaimable_readers() {
+        use super::{BudgetError, PixelDrawResult, TextureReclamation, texture_preflight_result};
+        for (removed, pending) in [(true, false), (false, true), (true, true)] {
+            let reclamation = TextureReclamation { removed, pending };
+            assert_eq!(
+                texture_preflight_result(Some(BudgetError::Pressure), false, false, &reclamation),
+                PixelDrawResult::Deferred
+            );
+            for error in [None, Some(BudgetError::TooLarge)] {
+                assert_eq!(
+                    texture_preflight_result(error, true, true, &reclamation),
+                    PixelDrawResult::Rejected
+                );
+            }
+        }
+        assert_eq!(
+            texture_preflight_result(
+                Some(BudgetError::Pressure),
+                false,
+                false,
+                &TextureReclamation::default(),
+            ),
+            PixelDrawResult::Rejected // No future work: do not defer forever.
+        );
+    }
 
     #[test]
     fn alternate_or_resized_slots_require_full_upload_even_with_empty_damage() {

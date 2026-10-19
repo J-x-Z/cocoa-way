@@ -550,40 +550,55 @@ fn render_surface_tree(
                 Some(BufferAssignment::NewBuffer(buffer)) => {
                     let buffer_scale = current.buffer_scale.max(1);
                     let buffer_id = buffer.id();
-                    let result = crate::render::with_buffer_pixels(
+                    // Read immutable protocol metadata only. Do not touch client
+                    // pixels or invoke Metal while Smithay's SIGBUS guard is active.
+                    let preflight = smithay::wayland::shm::with_buffer_contents(
                         &buffer,
-                        |width, height, bytes_per_row, pixels, alpha| {
-                            let buffer_damage = buffer_damage_rects(
-                                &damage,
-                                width,
-                                height,
-                                buffer_scale,
-                                current.buffer_transform,
-                                mapping.viewport.src.is_some() || mapping.viewport.dst.is_some(),
-                            );
-                            let Some(geometry) = mapping.geometry((width, height), scale) else {
-                                log::warn!(
-                                    "Invalid committed surface/viewport geometry for {surface_id:?}"
-                                );
-                                return PixelDrawResult::Rejected;
-                            };
-                            renderer.draw_pixels(
-                                surface_id.clone(),
-                                buffer_id,
-                                x,
-                                y,
-                                geometry,
-                                width,
-                                height,
-                                bytes_per_row,
-                                pixels,
-                                alpha,
-                                &buffer_damage,
-                            )
-                        },
+                        |_, _, data| data,
                     )
-                    // Snapshot preparation failures are terminal for this commit.
-                    .unwrap_or(PixelDrawResult::Rejected);
+                    .map_err(|_| PixelDrawResult::Rejected)
+                    .and_then(|data| {
+                        let (width, height) = (data.width, data.height);
+                        let buffer_damage = buffer_damage_rects(
+                            &damage,
+                            width,
+                            height,
+                            buffer_scale,
+                            current.buffer_transform,
+                            mapping.viewport.src.is_some() || mapping.viewport.dst.is_some(),
+                        );
+                        let Some(geometry) = mapping.geometry((width, height), scale) else {
+                            log::warn!(
+                                "Invalid committed surface/viewport geometry for {surface_id:?}"
+                            );
+                            return Err(PixelDrawResult::Rejected);
+                        };
+                        renderer
+                            .preflight_pixels(&surface_id, width, height, &buffer_damage)
+                            .map(|prepared| (prepared, geometry))
+                    });
+                    let result = upload_after_preflight(preflight, |(prepared, geometry)| {
+                        // Keep all validation, owned copying, swizzling, and
+                        // SIGBUS handling in the existing snapshotter unchanged.
+                        crate::render::with_buffer_pixels(
+                            &buffer,
+                            |width, height, bytes_per_row, pixels, alpha| {
+                                renderer.draw_prepared_pixels(
+                                    prepared,
+                                    surface_id.clone(),
+                                    buffer_id,
+                                    x,
+                                    y,
+                                    geometry,
+                                    width,
+                                    height,
+                                    bytes_per_row,
+                                    pixels,
+                                    alpha,
+                                )
+                            },
+                        )
+                    });
                     rendered += finish_buffer_upload(
                         current,
                         buffer,
@@ -604,6 +619,20 @@ fn render_surface_tree(
         |_, _, _| true,
     );
     rendered
+}
+
+/// Do not enter the snapshotter (including its scratch checkout/allocation) when
+/// admission already knows this commit must wait or be rejected.
+fn upload_after_preflight<T>(
+    preflight: Result<T, crate::metal_renderer::PixelDrawResult>,
+    snapshot: impl FnOnce(T) -> Option<crate::metal_renderer::PixelDrawResult>,
+) -> crate::metal_renderer::PixelDrawResult {
+    match preflight {
+        Ok(prepared) => snapshot(prepared)
+            // Snapshot preparation failures are terminal for this commit.
+            .unwrap_or(crate::metal_renderer::PixelDrawResult::Rejected),
+        Err(result) => result,
+    }
 }
 
 fn finish_buffer_upload(
@@ -806,6 +835,70 @@ mod tests {
         os::unix::net::UnixStream,
         sync::Arc,
     };
+
+    #[test]
+    fn deferred_or_rejected_preflight_never_enters_the_snapshotter() {
+        for result in [PixelDrawResult::Deferred, PixelDrawResult::Rejected] {
+            for _ in 0..100 {
+                assert_eq!(
+                    super::upload_after_preflight::<()>(Err(result), |_| {
+                        panic!("denied admission must not allocate scratch, copy, or swizzle SHM")
+                    }),
+                    result
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_snapshot_runs_once_and_failure_drops_its_preflight_storage() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Storage(Rc<Cell<usize>>);
+        impl Drop for Storage {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        for snapshot_result in [
+            None,
+            Some(PixelDrawResult::Drawn),
+            Some(PixelDrawResult::Deferred),
+        ] {
+            let drops = Rc::new(Cell::new(0));
+            let copies = Cell::new(0);
+            let result = super::upload_after_preflight(Ok(Storage(drops.clone())), |storage| {
+                assert_eq!(drops.get(), 0); // Admission stays alive across the copy.
+                copies.set(copies.get() + 1);
+                drop(storage);
+                snapshot_result
+            });
+            assert_eq!(copies.get(), 1);
+            assert_eq!(drops.get(), 1);
+            assert_eq!(result, snapshot_result.unwrap_or(PixelDrawResult::Rejected));
+        }
+    }
+
+    #[test]
+    fn snapshot_unwind_releases_preflight_storage() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Storage(Rc<Cell<usize>>);
+        impl Drop for Storage {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        let storage = Storage(drops.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::upload_after_preflight(Ok(storage), |_storage| panic!("snapshot failed"))
+        }));
+        assert!(result.is_err());
+        assert_eq!(drops.get(), 1);
+    }
 
     #[derive(Default)]
     struct TestClient(CompositorClientState);
