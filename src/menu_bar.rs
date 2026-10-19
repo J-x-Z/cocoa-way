@@ -24,6 +24,7 @@ use objc2_foundation::{MainThreadMarker, NSData, NSString};
 use crate::connections::Connection;
 use crate::container_sessions::ContainerSession;
 use crate::event_loop_signal::Sender;
+use crate::i18n::{tr, tr_format};
 use crate::messages::CompositorMessage;
 
 // ── Global channel sender ─────────────────────────────────────────────────────
@@ -137,16 +138,24 @@ declare_class!(
             open_panel(crate::container_mode::PanelPage::Diagnostics);
         }
 
+        #[method(openSettings:)]
+        fn open_settings(&self, _sender: &AnyObject) {
+            // AppKit delivers menu actions on the main thread.
+            activate_application();
+            crate::container_mode::show_settings();
+        }
+
         #[method(checkEnvironment:)]
         fn check_environment(&self, _sender: &AnyObject) {
             activate_application();
             let mtm = unsafe { MainThreadMarker::new_unchecked() };
             unsafe {
                 let alert = NSAlert::new(mtm);
-                alert.setMessageText(&NSString::from_str("Cocoa-Way Environment"));
+                alert.setMessageText(&NSString::from_str(&tr("Cocoa-Way Environment")));
+                // Keep the diagnostic report's tool names, paths and values verbatim.
                 alert.setInformativeText(&NSString::from_str(&crate::startup::environment_report()));
-                alert.addButtonWithTitle(&NSString::from_str("OK"));
-                alert.addButtonWithTitle(&NSString::from_str("Open Diagnostic Logs"));
+                alert.addButtonWithTitle(&NSString::from_str(&tr("OK")));
+                alert.addButtonWithTitle(&NSString::from_str(&tr("Open Diagnostic Logs")));
                 if alert.runModal() == 1001 {
                     open_diagnostic_logs();
                 }
@@ -260,9 +269,9 @@ unsafe fn show_quick_connect_dialog() {
 
     let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
     let _: () =
-        msg_send![&*alert, setMessageText: &*NSString::from_str("Connect to Remote Machine")];
+        msg_send![&*alert, setMessageText: &*NSString::from_str(&tr("Connect to Remote Machine"))];
     let _: () = msg_send![&*alert, setInformativeText:
-        &*NSString::from_str("Enter the SSH host and Wayland app. Saved entries appear in Connections; passwords are never stored.")];
+        &*NSString::from_str(&tr("Enter the SSH host and Wayland app. Saved entries appear in Connections; passwords are never stored."))];
 
     // Accessory view containing host, password, app, and an optional display slot.
     // NSView origin is bottom-left, so y increases upward.
@@ -291,7 +300,7 @@ unsafe fn show_quick_connect_dialog() {
         initWithFrame: name_frame
     ];
     let _: () = msg_send![&*name_field, setPlaceholderString:
-        &*NSString::from_str("Connection name (defaults to user@host)")];
+        &*NSString::from_str(&tr("Connection name (defaults to user@host)"))];
 
     // SSH target: user@host
     let host_frame = NSRect {
@@ -321,7 +330,7 @@ unsafe fn show_quick_connect_dialog() {
         initWithFrame: pass_frame
     ];
     let _: () = msg_send![&*pass_field, setPlaceholderString:
-        &*NSString::from_str("Password (leave blank to use SSH key)")];
+        &*NSString::from_str(&tr("Password (leave blank to use SSH key)"))];
 
     // Bottom field: app to launch
     let prog_frame = NSRect {
@@ -336,7 +345,7 @@ unsafe fn show_quick_connect_dialog() {
         initWithFrame: prog_frame
     ];
     let _: () = msg_send![&*prog_field, setPlaceholderString:
-        &*NSString::from_str("App to launch (e.g. niri or foot)")];
+        &*NSString::from_str(&tr("App to launch (e.g. niri or foot)"))];
 
     let display_frame = NSRect {
         origin: objc2_foundation::NSPoint { x: 0.0, y: 44.0 },
@@ -350,11 +359,11 @@ unsafe fn show_quick_connect_dialog() {
         initWithFrame: display_frame
     ];
     let _: () = msg_send![&*display_field, setPlaceholderString:
-        &*NSString::from_str("Display slot (blank or default; e.g. display-1)")];
+        &*NSString::from_str(&tr("Display slot (blank or default; e.g. display-1)"))];
 
     let save_button = unsafe {
         NSButton::checkboxWithTitle_target_action(
-            &NSString::from_str("Save this connection for later"),
+            &NSString::from_str(&tr("Save this connection for later")),
             None,
             None,
             mtm,
@@ -374,9 +383,9 @@ unsafe fn show_quick_connect_dialog() {
     let _: () = msg_send![&*alert, setAccessoryView: &*view];
 
     let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-        &*NSString::from_str("Connect")];
+        &*NSString::from_str(&tr("Connect"))];
     let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-        &*NSString::from_str("Cancel")];
+        &*NSString::from_str(&tr("Cancel"))];
 
     // Make the first field the initial responder
     let _: () = msg_send![&*alert, layout];
@@ -446,7 +455,7 @@ unsafe fn show_quick_connect_dialog() {
             }
             send(CompositorMessage::ConnectMachine(conn));
         } else {
-            show_connection_error("Enter a hostname or IP address.", mtm);
+            show_connection_error(&tr("Enter a hostname or IP address."), mtm);
         }
     }
 }
@@ -454,9 +463,9 @@ unsafe fn show_quick_connect_dialog() {
 pub fn show_connection_error(message: &str, mtm: MainThreadMarker) {
     unsafe {
         let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str("Connection Failed"));
+        alert.setMessageText(&NSString::from_str(&tr("Connection Failed")));
         alert.setInformativeText(&NSString::from_str(message));
-        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        alert.addButtonWithTitle(&NSString::from_str(&tr("OK")));
         alert.runModal();
     }
 }
@@ -464,14 +473,19 @@ pub fn show_connection_error(message: &str, mtm: MainThreadMarker) {
 pub fn show_startup_error(message: &str, mtm: MainThreadMarker) {
     unsafe {
         let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str("Cocoa-Way Could Not Start"));
+        alert.setMessageText(&NSString::from_str(&tr("Cocoa-Way Could Not Start")));
         let detail = crate::startup::log_directory().map_or_else(
             || message.to_string(),
-            |path| format!("{message}\n\nDiagnostic logs: {}", path.display()),
+            |path| {
+                tr_format(
+                    "{message}\n\nDiagnostic logs: {path}",
+                    &[("message", message), ("path", &path.display().to_string())],
+                )
+            },
         );
         alert.setInformativeText(&NSString::from_str(&detail));
-        alert.addButtonWithTitle(&NSString::from_str("Quit"));
-        alert.addButtonWithTitle(&NSString::from_str("Open Diagnostic Logs"));
+        alert.addButtonWithTitle(&NSString::from_str(&tr("Quit")));
+        alert.addButtonWithTitle(&NSString::from_str(&tr("Open Diagnostic Logs")));
         if alert.runModal() == 1001 {
             open_diagnostic_logs();
         }
@@ -481,9 +495,9 @@ pub fn show_startup_error(message: &str, mtm: MainThreadMarker) {
 fn show_connection_save_error(message: &str, mtm: MainThreadMarker) {
     unsafe {
         let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str("Could Not Save Connection"));
+        alert.setMessageText(&NSString::from_str(&tr("Could Not Save Connection")));
         alert.setInformativeText(&NSString::from_str(message));
-        alert.addButtonWithTitle(&NSString::from_str("Continue Without Saving"));
+        alert.addButtonWithTitle(&NSString::from_str(&tr("Continue Without Saving")));
         alert.runModal();
     }
 }
@@ -512,6 +526,38 @@ unsafe fn label_item(title: &str, mtm: MainThreadMarker) -> Retained<NSMenuItem>
 
 // ── Public setup ──────────────────────────────────────────────────────────────
 
+/// Rebuild localized menus after a language change without changing preferences.
+pub fn refresh_localized_menu(mtm: MainThreadMarker) {
+    let Some(tx) = sender() else {
+        return;
+    };
+    setup_menu(
+        &crate::connections::load_connections(),
+        &crate::container_sessions::load_sessions(),
+        tx,
+        mtm,
+    );
+}
+
+unsafe fn menu_action_state(menu: &NSMenu, action: objc2::runtime::Sel) -> Option<isize> {
+    unsafe {
+        for index in 0..menu.numberOfItems() {
+            let Some(item) = menu.itemAtIndex(index) else {
+                continue;
+            };
+            if item.action() == Some(action) {
+                return Some(msg_send![&*item, state]);
+            }
+            if let Some(submenu) = item.submenu() {
+                if let Some(state) = menu_action_state(&submenu, action) {
+                    return Some(state);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Build and install the custom NSApplication main menu.
 /// Must be called on the main thread after winit's `applicationDidFinishLaunching`.
 pub fn setup_menu(
@@ -532,15 +578,25 @@ pub fn setup_menu(
         });
 
         let app = NSApplication::sharedApplication(mtm);
+        // Read the current item by selector, not its potentially translated title.
+        let hidpi_state = app
+            .mainMenu()
+            .and_then(|menu| menu_action_state(&menu, sel!(toggleHiDpi:)))
+            .unwrap_or(0);
         install_application_icon(&app, mtm);
         let root = NSMenu::new(mtm);
 
         // ── 1. App menu ("Cocoa-Way") ─────────────────────────────────────────
         let app_item = NSMenuItem::new(mtm);
         let app_menu = NSMenu::new(mtm);
+        let settings = action_item(&tr("Settings..."), sel!(openSettings:), &handler, mtm);
+        settings.setKeyEquivalent(&NSString::from_str(","));
+        settings.setKeyEquivalentModifierMask(NSEventModifierFlags::NSEventModifierFlagCommand);
+        app_menu.addItem(&settings);
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
         let quit = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str("Quit Cocoa-Way"),
+            &NSString::from_str(&tr("Quit Cocoa-Way")),
             Some(sel!(terminate:)),
             &NSString::from_str("q"),
         );
@@ -549,14 +605,16 @@ pub fn setup_menu(
         root.addItem(&app_item);
 
         // ── 2. Connections menu ───────────────────────────────────────────────
-        let conn_item = label_item("Connections", mtm);
-        let conn_menu =
-            NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str("Connections"));
+        let conn_item = label_item(&tr("Connections"), mtm);
+        let conn_menu = NSMenu::initWithTitle(
+            mtm.alloc::<NSMenu>(),
+            &NSString::from_str(&tr("Connections")),
+        );
 
         // "Connect to Machine…" dialog item (always present)
         let quick = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str("Connect to Machine…"),
+            &NSString::from_str(&tr("Connect to Machine…")),
             Some(sel!(quickConnect:)),
             &NSString::from_str("n"),
         );
@@ -566,7 +624,7 @@ pub fn setup_menu(
 
         // Saved connections
         if connections.is_empty() {
-            let ph = label_item("No saved connections — use 'Connect to Machine…'", mtm);
+            let ph = label_item(&tr("No saved connections — use 'Connect to Machine…'"), mtm);
             let _: () = msg_send![&*ph, setEnabled: false];
             conn_menu.addItem(&ph);
         } else {
@@ -585,7 +643,7 @@ pub fn setup_menu(
         conn_menu.addItem(&NSMenuItem::separatorItem(mtm));
         let disconnect = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str("Disconnect Classic Connections"),
+            &NSString::from_str(&tr("Disconnect Classic Connections")),
             Some(sel!(disconnectClassicConnections:)),
             &NSString::from_str(""),
         );
@@ -595,13 +653,13 @@ pub fn setup_menu(
         root.addItem(&conn_item);
 
         // ── 3. Container menu ─────────────────────────────────────────────────
-        let container_item = label_item("Container", mtm);
+        let container_item = label_item(&tr("Container"), mtm);
         let container_menu =
-            NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str("Container"));
+            NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str(&tr("Container")));
 
         let open_container = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str("Open Container Mode…"),
+            &NSString::from_str(&tr("Open Container Mode…")),
             Some(sel!(openContainerMode:)),
             &NSString::from_str(""),
         );
@@ -610,7 +668,7 @@ pub fn setup_menu(
         container_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         if container_sessions.is_empty() {
-            let ph = label_item("No container sessions configured", mtm);
+            let ph = label_item(&tr("No container sessions configured"), mtm);
             let _: () = msg_send![&*ph, setEnabled: false];
             container_menu.addItem(&ph);
         } else {
@@ -633,11 +691,12 @@ pub fn setup_menu(
         root.addItem(&container_item);
 
         // ── 4. View menu ──────────────────────────────────────────────────────
-        let view_item = label_item("View", mtm);
-        let view_menu = NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str("View"));
+        let view_item = label_item(&tr("View"), mtm);
+        let view_menu =
+            NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str(&tr("View")));
         let show_display = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str("Show Default Display"),
+            &NSString::from_str(&tr("Show Default Display")),
             Some(sel!(showDefaultDisplay:)),
             &NSString::from_str("1"),
         );
@@ -646,17 +705,17 @@ pub fn setup_menu(
         view_menu.addItem(&NSMenuItem::separatorItem(mtm));
         let hidpi = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str("HiDPI Display"),
+            &NSString::from_str(&tr("HiDPI Display")),
             Some(sel!(toggleHiDpi:)),
             &NSString::from_str(""),
         );
-        let _: () = msg_send![&*hidpi, setState: 0isize]; // unchecked: Normal 1x is default
+        let _: () = msg_send![&*hidpi, setState: hidpi_state];
         let _: () = msg_send![&*hidpi, setTarget: &*handler];
         view_menu.addItem(&hidpi);
         view_menu.addItem(&NSMenuItem::separatorItem(mtm));
         let desktop_background = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str("Use Desktop Background (Experimental)"),
+            &NSString::from_str(&tr("Use Desktop Background (Experimental)")),
             Some(sel!(toggleDesktopBackground:)),
             &NSString::from_str(""),
         );
@@ -669,7 +728,7 @@ pub fn setup_menu(
         view_menu.addItem(&desktop_background);
         let restore_desktop = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str("Restore Desktop Window"),
+            &NSString::from_str(&tr("Restore Desktop Window")),
             Some(sel!(restoreDesktopWindow:)),
             &NSString::from_str("b"),
         );
@@ -733,8 +792,9 @@ unsafe fn install_status_menu(
         ("Diagnostics...", sel!(openDiagnostics:)),
         ("Check Environment...", sel!(checkEnvironment:)),
         ("Open Diagnostic Logs", sel!(openDiagnosticLogs:)),
+        ("Settings...", sel!(openSettings:)),
     ] {
-        let item = unsafe { action_item(title, action, handler, mtm) };
+        let item = unsafe { action_item(&tr(title), action, handler, mtm) };
         menu.addItem(&item);
     }
     if !connections.is_empty() {
@@ -747,7 +807,7 @@ unsafe fn install_status_menu(
             }
             submenu.addItem(&item);
         }
-        let saved = unsafe { label_item("Saved Connections", mtm) };
+        let saved = unsafe { label_item(&tr("Saved Connections"), mtm) };
         saved.setSubmenu(Some(&submenu));
         menu.addItem(&saved);
     }
@@ -763,7 +823,7 @@ unsafe fn install_status_menu(
             }
             submenu.addItem(&item);
         }
-        let applications = unsafe { label_item("Launch Application", mtm) };
+        let applications = unsafe { label_item(&tr("Launch Application"), mtm) };
         applications.setSubmenu(Some(&submenu));
         menu.addItem(&applications);
     }
@@ -777,7 +837,7 @@ unsafe fn install_status_menu(
         ),
         ("Restore Desktop Window", sel!(restoreDesktopWindow:)),
     ] {
-        let item = unsafe { action_item(title, action, handler, mtm) };
+        let item = unsafe { action_item(&tr(title), action, handler, mtm) };
         if action == sel!(toggleDesktopBackground:) {
             DESKTOP_BACKGROUND_MENU.with(|state| {
                 let mut state = state.borrow_mut();
@@ -790,7 +850,7 @@ unsafe fn install_status_menu(
         menu.addItem(&item);
     }
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let quit = unsafe { action_item("Quit Cocoa-Way", sel!(terminate:), handler, mtm) };
+    let quit = unsafe { action_item(&tr("Quit Cocoa-Way"), sel!(terminate:), handler, mtm) };
     unsafe {
         quit.setTarget(Some(app));
     }
@@ -816,9 +876,9 @@ unsafe fn install_status_menu(
                 } else {
                     button.setTitle(&NSString::from_str("CW"));
                 }
-                button.setToolTip(Some(&NSString::from_str(
+                button.setToolTip(Some(&NSString::from_str(&tr(
                     "Cocoa-Way: applications, connections and diagnostics",
-                )));
+                ))));
             }
             item.setMenu(Some(&menu));
         }

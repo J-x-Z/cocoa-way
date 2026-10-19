@@ -7,7 +7,7 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use smithay::utils::SERIAL_COUNTER;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -24,6 +24,7 @@ mod diagnostics;
 mod display_link;
 mod event_loop_signal;
 mod frame_clock;
+mod i18n;
 mod image_resources;
 mod input_policy;
 mod keymap;
@@ -2603,6 +2604,7 @@ fn main() {
         return;
     }
 
+    i18n::initialize();
     install_display_worker_panic_report();
 
     // Default filter: our code at INFO, smithay/wayland noise at WARN only.

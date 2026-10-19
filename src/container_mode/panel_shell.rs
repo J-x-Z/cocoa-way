@@ -17,7 +17,7 @@ pub(super) fn sidebar(
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) -> ScrollStack {
-    let brand = ui::single_line("Cocoa-Way", TextStyle::Heading, mtm);
+    let brand = ui::single_line(&tr("Cocoa-Way"), TextStyle::Heading, mtm);
     ui::attach(parent, &brand);
     ui::constrain(
         &brand,
@@ -26,7 +26,13 @@ pub(super) fn sidebar(
         18.0,
     );
     ui::constrain(&brand, Attribute::Top, Some((parent, Attribute::Top)), 24.0);
-    let settings = ui::button("Settings...", handler, sel!(openContainerSettings:), 0, mtm);
+    let settings = ui::button(
+        &tr("Settings..."),
+        handler,
+        sel!(openContainerSettings:),
+        0,
+        mtm,
+    );
     ui::attach(parent, &settings);
     ui::constrain(
         &settings,
@@ -98,14 +104,14 @@ pub(super) fn sidebar(
         ),
     ] {
         let group = ui::stack(true, 5.0, mtm);
-        let heading = menu.label(section, TextStyle::Section, mtm);
+        let heading = menu.label(&tr(section), TextStyle::Section, mtm);
         ui::arranged(&group, &heading, true);
         for (nav, title, symbol) in entries {
-            let button = ui::button(title, handler, sel!(selectContainerNav:), nav, mtm);
+            let button = ui::button(&tr(title), handler, sel!(selectContainerNav:), nav, mtm);
             unsafe {
                 button.setBordered(false);
                 let _: () = msg_send![&*button, setAlignment: 0isize];
-                let image: Option<Retained<objc2_app_kit::NSImage>> = msg_send_id![objc2_app_kit::NSImage::class(), imageWithSystemSymbolName: &*NSString::from_str(symbol), accessibilityDescription: &*NSString::from_str(title)];
+                let image: Option<Retained<objc2_app_kit::NSImage>> = msg_send_id![objc2_app_kit::NSImage::class(), imageWithSystemSymbolName: &*NSString::from_str(symbol), accessibilityDescription: &*NSString::from_str(&tr(title))];
                 let _: () = msg_send![&*button, setImage: image.as_deref()];
                 let _: () = msg_send![&*button, setImagePosition: 2isize];
                 if nav == selected_nav {
@@ -113,9 +119,12 @@ pub(super) fn sidebar(
                         msg_send![&*button, setContentTintColor: &*NSColor::controlAccentColor()];
                 }
                 let tooltip = if nav == NAV_SESSIONS {
-                    format!("{session_count} saved applications")
+                    tr_format(
+                        "{count} saved applications",
+                        &[("count", &session_count.to_string())],
+                    )
                 } else {
-                    title.to_string()
+                    tr(title).into_owned()
                 };
                 let _: () = msg_send![&*button, setToolTip: &*NSString::from_str(&tooltip)];
             }
@@ -133,8 +142,16 @@ pub(super) fn summary(mtm: MainThreadMarker) -> Retained<NSStackView> {
     }
     for diagnostic in runtime_diagnostics(&[]) {
         let item = ui::stack(true, 4.0, mtm);
-        let name = ui::single_line(diagnostic.name, TextStyle::Caption, mtm);
-        let value = ui::single_line(&diagnostic.state, TextStyle::Heading, mtm);
+        let name = ui::single_line(&tr(diagnostic.name), TextStyle::Caption, mtm);
+        let state = if diagnostic.name == "Tasks" {
+            tr_format(
+                "{count} active",
+                &[("count", &active_task_count().to_string())],
+            )
+        } else {
+            tr(&diagnostic.state).into_owned()
+        };
+        let value = ui::single_line(&state, TextStyle::Heading, mtm);
         if diagnostic.name == "Display FPS" {
             *SUMMARY_FPS_LABEL.lock().unwrap() = Some(Retained::as_ptr(&value) as usize);
         }
@@ -166,7 +183,7 @@ pub(super) fn populate_header(
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
-    let heading = ui::single_line(nav_title(nav), TextStyle::Title, mtm);
+    let heading = ui::single_line(&tr(nav_title(nav)), TextStyle::Title, mtm);
     let actions = ui::stack(false, 8.0, mtm);
     let primary = match nav {
         NAV_SESSIONS => Some(("New Application", sel!(addContainerSession:))),
@@ -175,7 +192,7 @@ pub(super) fn populate_header(
         _ => None,
     };
     if let Some((title, action)) = primary {
-        let button = ui::button(title, handler, action, 0, mtm);
+        let button = ui::button(&tr(title), handler, action, 0, mtm);
         if matches!(nav, NAV_SESSIONS | NAV_DISPLAYS) {
             unsafe {
                 let _: () = msg_send![&*button, setBezelColor: &*NSColor::controlAccentColor()];
@@ -183,7 +200,7 @@ pub(super) fn populate_header(
         }
         ui::arranged(&actions, &button, false);
     }
-    let reload = ui::button("Reload", handler, sel!(reloadContainerMode:), 0, mtm);
+    let reload = ui::button(&tr("Reload"), handler, sel!(reloadContainerMode:), 0, mtm);
     ui::arranged(&actions, &reload, false);
     let toolbar = ui::toolbar(&heading, &actions, mtm);
     pin_inset(parent, &toolbar, 20.0, 14.0);
@@ -226,7 +243,7 @@ pub(super) fn detail_header(
 ) {
     let host = framed_host(parent, frame, mtm);
     if !application {
-        let heading = ui::single_line("Details", TextStyle::Title, mtm);
+        let heading = ui::single_line(&tr("Details"), TextStyle::Title, mtm);
         ui::attach(&host, &heading);
         ui::constrain(
             &heading,
@@ -257,8 +274,7 @@ pub(super) fn detail_header(
     unsafe {
         let _: () = msg_send![&*tabs, setSegmentCount: 4isize];
         for (index, title) in ["Overview", "Logs", "Terminal", "Files"].iter().enumerate() {
-            let _: () =
-                msg_send![&*tabs, setLabel: &*NSString::from_str(title) forSegment: index as isize];
+            let _: () = msg_send![&*tabs, setLabel: &*NSString::from_str(&tr(title)) forSegment: index as isize];
         }
         let _: () = msg_send![&*tabs, setSelectedSegment: selected_tab.min(3) as isize];
         let _: () = msg_send![&*tabs, setTarget: &*handler];
@@ -266,7 +282,7 @@ pub(super) fn detail_header(
     }
     let actions = ui::stack(false, 8.0, mtm);
     let terminal = ui::button(
-        "New Terminal",
+        &tr("New Terminal"),
         handler,
         sel!(openContainerTerminal:),
         active_index.unwrap_or(0),

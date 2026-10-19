@@ -24,6 +24,7 @@ use crate::application_model::{
 };
 use crate::container_sessions::{self, ContainerSession, ProfileId};
 use crate::event_loop_signal::Sender;
+use crate::i18n::{Language, tr, tr_format};
 use crate::messages::CompositorMessage;
 use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quote};
 
@@ -837,16 +838,17 @@ fn performance_snapshot() -> Option<PerformanceSnapshot> {
 
 fn display_fps_state(snapshot: &PerformanceSnapshot) -> String {
     if snapshot.redraw_fps < 0.05 && snapshot.commits_per_second < 0.05 {
-        "0.0 fps · idle".into()
+        tr("0.0 fps · idle").into_owned()
     } else {
         format!("{:.1} fps", snapshot.redraw_fps)
     }
 }
 
 fn display_fps_text(base: &str, snapshot: Option<&PerformanceSnapshot>) -> String {
+    let base = tr(base);
     snapshot
         .map(|snapshot| format!("{base} · {}", display_fps_state(snapshot)))
-        .unwrap_or_else(|| base.to_string())
+        .unwrap_or_else(|| base.into_owned())
 }
 
 fn register_live_display_fps_label(
@@ -2828,9 +2830,9 @@ unsafe fn export_session_profile(index: usize) {
     unsafe {
         panel.setNameFieldStringValue(&NSString::from_str(&filename));
         let _: () = msg_send![&*panel, setTitle:
-            &*NSString::from_str("Export Application Profile")];
+            &*NSString::from_str(&tr("Export Application Profile"))];
         let _: () = msg_send![&*panel, setMessage:
-            &*NSString::from_str("Export this saved launch configuration without images, volumes, or containers.")];
+            &*NSString::from_str(&tr("Export this saved launch configuration without images, volumes, or containers."))];
     }
     if unsafe { panel.runModal() } != NSModalResponseOK {
         return;
@@ -2863,7 +2865,7 @@ unsafe fn show_raw_session_profile(index: usize) {
         let _: () = msg_send![&*alert, setMessageText:
             &*NSString::from_str(&format!("Raw Configuration: {}", session.name))];
         let _: () = msg_send![&*alert, setInformativeText:
-            &*NSString::from_str("This is the exact TOML block stored for this application profile.")];
+            &*NSString::from_str(&tr("This is the exact TOML block stored for this application profile."))];
     }
     let view: Retained<NSView> =
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 560.0, 300.0)] };
@@ -2878,7 +2880,7 @@ unsafe fn show_raw_session_profile(index: usize) {
     unsafe {
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Close")];
+            &*NSString::from_str(&tr("Close"))];
         let _: () = msg_send![&*alert, layout];
         let _: isize = msg_send![&*alert, runModal];
     }
@@ -2899,9 +2901,9 @@ unsafe fn show_session_resources_dialog(index: usize) {
     let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
     unsafe {
         let _: () =
-            msg_send![&*alert, setMessageText: &*NSString::from_str("Application Resources")];
+            msg_send![&*alert, setMessageText: &*NSString::from_str(&tr("Application Resources"))];
         let _: () = msg_send![&*alert, setInformativeText:
-            &*NSString::from_str("Saved for the next launch. Empty fields use runtime defaults; unrelated runtime arguments are preserved.")];
+            &*NSString::from_str(&tr("Saved for the next launch. Empty fields use runtime defaults; unrelated runtime arguments are preserved."))];
     }
     let view: Retained<NSView> =
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 420.0, 250.0)] };
@@ -2918,7 +2920,7 @@ unsafe fn show_session_resources_dialog(index: usize) {
         let y = 215.0 - row as f64 * 40.0;
         add_label(
             &view,
-            label,
+            &tr(label),
             rect(0.0, y + 5.0, 116.0, 18.0),
             mtm,
             TextStyle::Caption,
@@ -2933,7 +2935,7 @@ unsafe fn show_session_resources_dialog(index: usize) {
     }
     add_label(
         &view,
-        "Rosetta",
+        &tr("Rosetta"),
         rect(0.0, 60.0, 116.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -2941,13 +2943,13 @@ unsafe fn show_session_resources_dialog(index: usize) {
     let rosetta = add_popup(
         &view,
         rect(116.0, 55.0, 304.0, 28.0),
-        &["Off", "On (Apple Container only)"],
+        &[&tr("Off"), &tr("On (Apple Container only)")],
         usize::from(session.runtime_args.iter().any(|arg| arg == "--rosetta")),
         mtm,
     );
     add_label(
         &view,
-        "Rosetta translates x86 CPU instructions; it does not provide GPU acceleration.",
+        &tr("Rosetta translates x86 CPU instructions; it does not provide GPU acceleration."),
         rect(0.0, 0.0, 420.0, 38.0),
         mtm,
         TextStyle::Caption,
@@ -2955,9 +2957,9 @@ unsafe fn show_session_resources_dialog(index: usize) {
     unsafe {
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> =
-            msg_send_id![&*alert, addButtonWithTitle: &*NSString::from_str("Save")];
+            msg_send_id![&*alert, addButtonWithTitle: &*NSString::from_str(&tr("Save"))];
         let _: Retained<NSObject> =
-            msg_send_id![&*alert, addButtonWithTitle: &*NSString::from_str("Cancel")];
+            msg_send_id![&*alert, addButtonWithTitle: &*NSString::from_str(&tr("Cancel"))];
         let _: () = msg_send![&*alert, layout];
     }
     let response: isize = unsafe { msg_send![&*alert, runModal] };
@@ -3148,20 +3150,20 @@ unsafe fn show_session_dialog(
     let is_edit = edit_target.is_some();
     unsafe {
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str(if is_edit { "Edit Application" } else { "New Application" })];
+            &*NSString::from_str(&tr(if is_edit { "Edit Application" } else { "New Application" }))];
         let _: () = msg_send![&*alert, setInformativeText:
-        &*NSString::from_str(if is_edit {
+        &*NSString::from_str(&tr(if is_edit {
             "Update this Container Mode profile. Advanced socket and waypipe fields are preserved."
         } else {
             "Create a Container Mode profile backed by Apple Container, Docker, or OrbStack."
-        })];
+        }))];
     }
 
     let view: Retained<NSView> =
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 420.0, 414.0)] };
     add_label(
         &view,
-        "Name",
+        &tr("Name"),
         rect(0.0, 385.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3169,13 +3171,13 @@ unsafe fn show_session_dialog(
     let name_field = add_text_field(
         &view,
         rect(116.0, 380.0, 304.0, 26.0),
-        "Niri Desktop",
+        &tr("Niri Desktop"),
         &defaults.name,
         mtm,
     );
     add_label(
         &view,
-        "Runtime",
+        &tr("Runtime"),
         rect(0.0, 345.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3183,7 +3185,7 @@ unsafe fn show_session_dialog(
     let runtime_field = add_text_field(
         &view,
         rect(116.0, 340.0, 304.0, 26.0),
-        "container",
+        &tr("container"),
         if defaults.runtime.is_empty() {
             "container"
         } else {
@@ -3193,7 +3195,7 @@ unsafe fn show_session_dialog(
     );
     add_label(
         &view,
-        "Display",
+        &tr("Display"),
         rect(0.0, 305.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3201,7 +3203,7 @@ unsafe fn show_session_dialog(
     let display_field = add_text_field(
         &view,
         rect(116.0, 300.0, 304.0, 26.0),
-        "auto",
+        &tr("auto"),
         if defaults.display.is_empty() {
             "auto"
         } else {
@@ -3211,7 +3213,7 @@ unsafe fn show_session_dialog(
     );
     add_label(
         &view,
-        "Presentation",
+        &tr("Presentation"),
         rect(0.0, 265.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3219,13 +3221,13 @@ unsafe fn show_session_dialog(
     let presentation_popup = add_popup(
         &view,
         rect(116.0, 260.0, 304.0, 28.0),
-        &["Desktop", "Rootless"],
+        &[&tr("Desktop"), &tr("Rootless")],
         usize::from(defaults.presentation.eq_ignore_ascii_case("rootless")),
         mtm,
     );
     add_label(
         &view,
-        "Profile",
+        &tr("Profile"),
         rect(0.0, 225.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3233,7 +3235,7 @@ unsafe fn show_session_dialog(
     let profile_field = add_text_field(
         &view,
         rect(116.0, 220.0, 304.0, 26.0),
-        "niri / single-app / shell",
+        &tr("niri / single-app / shell"),
         if defaults.profile.is_empty() {
             "niri"
         } else {
@@ -3243,7 +3245,7 @@ unsafe fn show_session_dialog(
     );
     add_label(
         &view,
-        "Image / Source",
+        &tr("Image / Source"),
         rect(0.0, 185.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3257,7 +3259,7 @@ unsafe fn show_session_dialog(
     );
     add_label(
         &view,
-        "Command",
+        &tr("Command"),
         rect(0.0, 145.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3265,13 +3267,13 @@ unsafe fn show_session_dialog(
     let command_field = add_text_field(
         &view,
         rect(116.0, 140.0, 304.0, 26.0),
-        "niri",
+        &tr("niri"),
         &defaults.command,
         mtm,
     );
     add_label(
         &view,
-        "Mounts",
+        &tr("Mounts"),
         rect(0.0, 105.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3279,13 +3281,13 @@ unsafe fn show_session_dialog(
     let mounts_field = add_text_field(
         &view,
         rect(116.0, 100.0, 304.0, 26.0),
-        "separate multiple mounts with ;",
+        &tr("separate multiple mounts with ;"),
         &defaults.mounts,
         mtm,
     );
     add_label(
         &view,
-        "Env",
+        &tr("Env"),
         rect(0.0, 65.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3293,13 +3295,13 @@ unsafe fn show_session_dialog(
     let env_field = add_text_field(
         &view,
         rect(116.0, 60.0, 304.0, 26.0),
-        "WAYLAND_DEBUG=1; RUST_LOG=info",
+        &tr("WAYLAND_DEBUG=1; RUST_LOG=info"),
         &defaults.env,
         mtm,
     );
     add_label(
         &view,
-        "Audio",
+        &tr("Audio"),
         rect(0.0, 25.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3307,7 +3309,7 @@ unsafe fn show_session_dialog(
     let audio_popup = add_popup(
         &view,
         rect(116.0, 20.0, 304.0, 28.0),
-        &["Off", "Forward playback (Apple, experimental)"],
+        &[&tr("Off"), &tr("Forward playback (Apple, experimental)")],
         usize::from(defaults.audio),
         mtm,
     );
@@ -3315,9 +3317,9 @@ unsafe fn show_session_dialog(
     unsafe {
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str(if is_edit { "Save" } else { "Create" })];
+            &*NSString::from_str(&tr(if is_edit { "Save" } else { "Create" }))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let _: () = msg_send![&*alert, layout];
     }
 
@@ -3438,16 +3440,16 @@ unsafe fn show_pull_image_dialog() {
     let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
     unsafe {
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Pull an Image")];
+            &*NSString::from_str(&tr("Pull an Image"))];
         let _: () = msg_send![&*alert, setInformativeText:
-            &*NSString::from_str("Choose a registry and destination. Base images still need waypipe and a GUI command before they can open a Cocoa-Way session.")];
+            &*NSString::from_str(&tr("Choose a registry and destination. Base images still need waypipe and a GUI command before they can open a Cocoa-Way session."))];
     }
 
     let view: Retained<NSView> =
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 420.0, 252.0)] };
     add_label(
         &view,
-        "Destination",
+        &tr("Destination"),
         rect(0.0, 222.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3455,13 +3457,13 @@ unsafe fn show_pull_image_dialog() {
     let runtime_popup = add_popup(
         &view,
         rect(116.0, 216.0, 304.0, 28.0),
-        &["Apple Container", "Docker-compatible Context"],
+        &[&tr("Apple Container"), &tr("Docker-compatible Context")],
         0,
         mtm,
     );
     add_label(
         &view,
-        "Registry",
+        &tr("Registry"),
         rect(0.0, 182.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3470,17 +3472,17 @@ unsafe fn show_pull_image_dialog() {
         &view,
         rect(116.0, 176.0, 304.0, 28.0),
         &[
-            "Docker Hub",
-            "GitHub Container Registry",
-            "Quay",
-            "Custom OCI reference",
+            &tr("Docker Hub"),
+            &tr("GitHub Container Registry"),
+            &tr("Quay"),
+            &tr("Custom OCI reference"),
         ],
         0,
         mtm,
     );
     add_label(
         &view,
-        "Reference",
+        &tr("Reference"),
         rect(0.0, 142.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3488,13 +3490,13 @@ unsafe fn show_pull_image_dialog() {
     let image_field = add_text_field(
         &view,
         rect(116.0, 136.0, 304.0, 26.0),
-        "library/ubuntu:24.04",
+        &tr("library/ubuntu:24.04"),
         "library/ubuntu:24.04",
         mtm,
     );
     add_label(
         &view,
-        "Platform",
+        &tr("Platform"),
         rect(0.0, 102.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3502,13 +3504,17 @@ unsafe fn show_pull_image_dialog() {
     let platform_popup = add_popup(
         &view,
         rect(116.0, 96.0, 304.0, 28.0),
-        &["Native architecture", "Linux arm64", "Linux amd64"],
+        &[
+            &tr("Native architecture"),
+            &tr("Linux arm64"),
+            &tr("Linux amd64"),
+        ],
         0,
         mtm,
     );
     add_label(
         &view,
-        "Connection",
+        &tr("Connection"),
         rect(0.0, 62.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3516,13 +3522,13 @@ unsafe fn show_pull_image_dialog() {
     let scheme_popup = add_popup(
         &view,
         rect(116.0, 56.0, 304.0, 28.0),
-        &["Runtime default", "HTTPS", "HTTP (insecure)"],
+        &[&tr("Runtime default"), &tr("HTTPS"), &tr("HTTP (insecure)")],
         0,
         mtm,
     );
     add_label(
         &view,
-        "After pull",
+        &tr("After pull"),
         rect(0.0, 22.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3530,7 +3536,7 @@ unsafe fn show_pull_image_dialog() {
     let after_popup = add_popup(
         &view,
         rect(116.0, 16.0, 304.0, 28.0),
-        &["Keep as a local image", "Create an application"],
+        &[&tr("Keep as a local image"), &tr("Create an application")],
         1,
         mtm,
     );
@@ -3538,9 +3544,9 @@ unsafe fn show_pull_image_dialog() {
     unsafe {
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Pull")];
+            &*NSString::from_str(&tr("Pull"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let _: () = msg_send![&*alert, layout];
     }
 
@@ -3588,16 +3594,16 @@ unsafe fn show_registry_login_dialog() {
     let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
     unsafe {
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Registry Login")];
+            &*NSString::from_str(&tr("Registry Login"))];
         let _: () = msg_send![&*alert, setInformativeText:
-            &*NSString::from_str("Credentials are passed to Apple Container through standard input and are never added to process arguments or Cocoa-Way logs.")];
+            &*NSString::from_str(&tr("Credentials are passed to Apple Container through standard input and are never added to process arguments or Cocoa-Way logs."))];
     }
 
     let view: Retained<NSView> =
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 420.0, 174.0)] };
     add_label(
         &view,
-        "Registry",
+        &tr("Registry"),
         rect(0.0, 144.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3605,13 +3611,13 @@ unsafe fn show_registry_login_dialog() {
     let server_field = add_text_field(
         &view,
         rect(116.0, 138.0, 304.0, 26.0),
-        "ghcr.io",
+        &tr("ghcr.io"),
         "ghcr.io",
         mtm,
     );
     add_label(
         &view,
-        "Username",
+        &tr("Username"),
         rect(0.0, 104.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3619,13 +3625,13 @@ unsafe fn show_registry_login_dialog() {
     let username_field = add_text_field(
         &view,
         rect(116.0, 98.0, 304.0, 26.0),
-        "account name",
+        &tr("account name"),
         "",
         mtm,
     );
     add_label(
         &view,
-        "Token / password",
+        &tr("Token / password"),
         rect(0.0, 64.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3633,12 +3639,12 @@ unsafe fn show_registry_login_dialog() {
     let password_field = add_secure_text_field(
         &view,
         rect(116.0, 58.0, 304.0, 26.0),
-        "personal access token",
+        &tr("personal access token"),
         mtm,
     );
     add_label(
         &view,
-        "Connection",
+        &tr("Connection"),
         rect(0.0, 24.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3646,7 +3652,7 @@ unsafe fn show_registry_login_dialog() {
     let scheme_popup = add_popup(
         &view,
         rect(116.0, 18.0, 304.0, 28.0),
-        &["Runtime default", "HTTPS", "HTTP (insecure)"],
+        &[&tr("Runtime default"), &tr("HTTPS"), &tr("HTTP (insecure)")],
         0,
         mtm,
     );
@@ -3654,9 +3660,9 @@ unsafe fn show_registry_login_dialog() {
     unsafe {
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Login")];
+            &*NSString::from_str(&tr("Login"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let _: () = msg_send![&*alert, layout];
     }
     let response: isize = unsafe { msg_send![&*alert, runModal] };
@@ -3695,9 +3701,9 @@ unsafe fn show_load_image_dialog() {
         panel.setCanChooseDirectories(false);
         panel.setAllowsMultipleSelection(false);
         let _: () = msg_send![&*panel, setTitle:
-            &*NSString::from_str("Load OCI Image Archive")];
+            &*NSString::from_str(&tr("Load OCI Image Archive"))];
         let _: () = msg_send![&*panel, setMessage:
-            &*NSString::from_str("Choose an OCI-compatible image tar archive to load into Apple Container.")];
+            &*NSString::from_str(&tr("Choose an OCI-compatible image tar archive to load into Apple Container."))];
     }
 
     let response = unsafe { panel.runModal() };
@@ -3724,16 +3730,16 @@ unsafe fn show_delete_image_dialog() {
     let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
     unsafe {
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Delete Image")];
+            &*NSString::from_str(&tr("Delete Image"))];
         let _: () = msg_send![&*alert, setInformativeText:
-            &*NSString::from_str("Delete a local image from Apple Container or Docker. Running containers are not stopped by this action.")];
+            &*NSString::from_str(&tr("Delete a local image from Apple Container or Docker. Running containers are not stopped by this action."))];
     }
 
     let view: Retained<NSView> =
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 380.0, 94.0)] };
     add_label(
         &view,
-        "Runtime",
+        &tr("Runtime"),
         rect(0.0, 65.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3741,13 +3747,13 @@ unsafe fn show_delete_image_dialog() {
     let runtime_field = add_text_field(
         &view,
         rect(116.0, 60.0, 264.0, 26.0),
-        "container",
+        &tr("container"),
         "container",
         mtm,
     );
     add_label(
         &view,
-        "Image",
+        &tr("Image"),
         rect(0.0, 25.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3763,9 +3769,9 @@ unsafe fn show_delete_image_dialog() {
     unsafe {
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Delete")];
+            &*NSString::from_str(&tr("Delete"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let _: () = msg_send![&*alert, layout];
     }
 
@@ -3796,16 +3802,16 @@ unsafe fn show_create_volume_dialog() {
     let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
     unsafe {
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Create Volume")];
+            &*NSString::from_str(&tr("Create Volume"))];
         let _: () = msg_send![&*alert, setInformativeText:
-            &*NSString::from_str("Choose the runtime that will own this persistent volume.")];
+            &*NSString::from_str(&tr("Choose the runtime that will own this persistent volume."))];
     }
 
     let view: Retained<NSView> =
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 380.0, 134.0)] };
     add_label(
         &view,
-        "Name",
+        &tr("Name"),
         rect(0.0, 105.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3813,13 +3819,13 @@ unsafe fn show_create_volume_dialog() {
     let volume_field = add_text_field(
         &view,
         rect(116.0, 100.0, 264.0, 26.0),
-        "project-data",
+        &tr("project-data"),
         "",
         mtm,
     );
     add_label(
         &view,
-        "Runtime",
+        &tr("Runtime"),
         rect(0.0, 65.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -3827,20 +3833,20 @@ unsafe fn show_create_volume_dialog() {
     let runtime_popup = add_popup(
         &view,
         rect(116.0, 60.0, 264.0, 26.0),
-        &["Apple Container", "Docker-compatible Context"],
+        &[&tr("Apple Container"), &tr("Docker-compatible Context")],
         0,
         mtm,
     );
     add_label(
         &view,
-        "Type",
+        &tr("Type"),
         rect(0.0, 25.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     add_label(
         &view,
-        "Managed volume",
+        &tr("Managed volume"),
         rect(116.0, 22.0, 264.0, 20.0),
         mtm,
         TextStyle::Body,
@@ -3849,9 +3855,9 @@ unsafe fn show_create_volume_dialog() {
     unsafe {
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Create")];
+            &*NSString::from_str(&tr("Create"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let _: () = msg_send![&*alert, layout];
     }
 
@@ -3926,9 +3932,9 @@ fn confirm_delete_session(name: &str) -> bool {
         let _: () = msg_send![&*alert, setInformativeText:
             &*NSString::from_str(&message)];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Delete")];
+            &*NSString::from_str(&tr("Delete"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let response: isize = msg_send![&*alert, runModal];
         response == 1000
     }
@@ -3948,9 +3954,9 @@ fn confirm_delete_resource(kind: &str, runtime: &str, name: &str) -> bool {
         let _: () = msg_send![&*alert, setInformativeText:
             &*NSString::from_str(&message)];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Delete")];
+            &*NSString::from_str(&tr("Delete"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let response: isize = msg_send![&*alert, runModal];
         response == 1000
     }
@@ -4036,7 +4042,7 @@ fn confirm_image_removal(action: &ImageDeleteAction, remove_tag: bool) -> bool {
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
             &*NSString::from_str(action_title)];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let response: isize = msg_send![&*alert, runModal];
         response == 1000
     }
@@ -4089,9 +4095,9 @@ fn confirm_volume_removal(action: &VolumeDeleteAction) -> bool {
         let _: () = msg_send![&*alert, setInformativeText:
             &*NSString::from_str(&details.join("\n\n"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Delete Volume")];
+            &*NSString::from_str(&tr("Delete Volume"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let response: isize = msg_send![&*alert, runModal];
         response == 1000
     }
@@ -4101,7 +4107,7 @@ fn confirm_close_managed_display(slot: &str) -> bool {
     unsafe {
         let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Close Managed Display?")];
+            &*NSString::from_str(&tr("Close Managed Display?"))];
         let message = format!(
             "Closing '{}' disconnects GUI clients attached through copied environment variables, including clients Cocoa-Way cannot track.",
             slot
@@ -4109,9 +4115,9 @@ fn confirm_close_managed_display(slot: &str) -> bool {
         let _: () = msg_send![&*alert, setInformativeText:
             &*NSString::from_str(&message)];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Close Display")];
+            &*NSString::from_str(&tr("Close Display"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let response: isize = msg_send![&*alert, runModal];
         response == 1000
     }
@@ -4155,9 +4161,9 @@ fn confirm_stop_apple_runtime() -> Option<Vec<ProfileId>> {
         );
         let _: () = msg_send![&*alert, setInformativeText: &*NSString::from_str(&detail)];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Stop Instances and Runtime")];
+            &*NSString::from_str(&tr("Stop Instances and Runtime"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let response: isize = msg_send![&*alert, runModal];
         if response == 1000 {
             Some(running.into_iter().map(|(index, _)| index).collect())
@@ -4167,23 +4173,107 @@ fn confirm_stop_apple_runtime() -> Option<Vec<ProfileId>> {
     }
 }
 
+pub fn show_settings() {
+    if MainThreadMarker::new().is_some() {
+        show_container_settings_dialog();
+    }
+}
+
 fn show_container_settings_dialog() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     unsafe {
         let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Cocoa-Way Settings")];
-        let config_path = container_sessions::config_path();
-        let detail = format!(
-            "General\nLocal, open-source control plane.\n\nRuntime\nApple Container is first-class; Docker-compatible contexts are optional providers.\n\nDisplay\nProfiles may use auto, default, or a named managed display.\n\nStorage\nImage and volume operations are checked before destructive actions.\n\nAdvanced\nConfiguration file: {}",
-            config_path.display()
+            &*NSString::from_str(&tr("Cocoa-Way Settings"))];
+        let _: () = msg_send![&*alert, setInformativeText:
+            &*NSString::from_str(&tr("Personalize Cocoa-Way without changing your Linux applications."))];
+        let view: Retained<NSView> = msg_send_id![
+            mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 440.0, 250.0)
+        ];
+        add_label(
+            &view,
+            &tr("Interface language"),
+            rect(0.0, 222.0, 440.0, 22.0),
+            mtm,
+            TextStyle::Heading,
         );
-        let _: () = msg_send![&*alert, setInformativeText: &*NSString::from_str(&detail)];
+        let names = Language::ALL
+            .iter()
+            .map(|language| {
+                if *language == Language::System {
+                    tr("Follow System").into_owned()
+                } else {
+                    language.native_name().to_string()
+                }
+            })
+            .collect::<Vec<_>>();
+        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let selected = Language::ALL
+            .iter()
+            .position(|language| *language == crate::i18n::preference())
+            .unwrap_or(0);
+        let languages = add_popup(&view, rect(0.0, 182.0, 440.0, 30.0), &names, selected, mtm);
+        add_label(
+            &view,
+            &tr(
+                "Language changes apply immediately to Cocoa-Way. Linux application languages and keyboard layouts are not changed.",
+            ),
+            rect(0.0, 124.0, 440.0, 48.0),
+            mtm,
+            TextStyle::Body,
+        );
+        add_label(
+            &view,
+            &tr(
+                "English and Simplified Chinese cover the main interface. Other languages currently translate navigation and common actions; remaining text falls back to English.",
+            ),
+            rect(0.0, 65.0, 440.0, 52.0),
+            mtm,
+            TextStyle::Caption,
+        );
+        let config_path = container_sessions::config_path();
+        add_label(
+            &view,
+            &tr("Configuration file"),
+            rect(0.0, 40.0, 440.0, 18.0),
+            mtm,
+            TextStyle::Caption,
+        );
+        let path = add_label(
+            &view,
+            &config_path.display().to_string(),
+            rect(0.0, 0.0, 440.0, 36.0),
+            mtm,
+            TextStyle::Mono,
+        );
+        path.setSelectable(true);
+        let _: () =
+            msg_send![&*path, setToolTip: &*NSString::from_str(&config_path.display().to_string())];
+        let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Open Configuration File")];
+            &*NSString::from_str(&tr("Apply"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Done")];
+            &*NSString::from_str(&tr("Cancel"))];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str(&tr("Open Configuration File"))];
         let response: isize = msg_send![&*alert, runModal];
         if response == 1000 {
+            if let Some(language) = Language::ALL.get(popup_index(&languages).max(0) as usize) {
+                match crate::i18n::set_preference(*language) {
+                    Ok(()) => {
+                        crate::menu_bar::refresh_localized_menu(mtm);
+                        if let Some(pointer) = *WINDOW.lock().unwrap() {
+                            let window = &*(pointer as *const NSWindow);
+                            window.setTitle(&NSString::from_str(&tr("Cocoa-Way Container Mode")));
+                        }
+                        refresh_window_without_focus();
+                    }
+                    Err(error) => show_error_alert(&error),
+                }
+            }
+        } else if response == 1002 {
             let _ = Command::new("open").arg("-R").arg(config_path).spawn();
         }
     }
@@ -4259,15 +4349,15 @@ unsafe fn show_create_managed_display_dialog() {
     let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
     unsafe {
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Create Managed Display")];
+            &*NSString::from_str(&tr("Create Managed Display"))];
         let _: () = msg_send![&*alert, setInformativeText:
-            &*NSString::from_str("Leave the name empty for automatic numbering. A stable name can be selected by application profiles and run_waypipe.sh connections.")];
+            &*NSString::from_str(&tr("Leave the name empty for automatic numbering. A stable name can be selected by application profiles and run_waypipe.sh connections."))];
     }
     let view: Retained<NSView> =
         unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 380.0, 54.0)] };
     add_label(
         &view,
-        "Display name",
+        &tr("Display name"),
         rect(0.0, 30.0, 110.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -4275,16 +4365,16 @@ unsafe fn show_create_managed_display_dialog() {
     let name_field = add_text_field(
         &view,
         rect(0.0, 0.0, 380.0, 26.0),
-        "Automatic (display-1, display-2, ...)",
+        &tr("Automatic (display-1, display-2, ...)"),
         "",
         mtm,
     );
     unsafe {
         let _: () = msg_send![&*alert, setAccessoryView: &*view];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Create")];
+            &*NSString::from_str(&tr("Create"))];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("Cancel")];
+            &*NSString::from_str(&tr("Cancel"))];
         let _: () = msg_send![&*alert, layout];
     }
     let response: isize = unsafe { msg_send![&*alert, runModal] };
@@ -4323,11 +4413,11 @@ fn show_error_alert(message: &str) {
     unsafe {
         let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Container Mode")];
+            &*NSString::from_str(&tr("Container Mode"))];
         let _: () = msg_send![&*alert, setInformativeText:
             &*NSString::from_str(message)];
         let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-            &*NSString::from_str("OK")];
+            &*NSString::from_str(&tr("OK"))];
         let _: isize = msg_send![&*alert, runModal];
     }
 }
@@ -5444,7 +5534,7 @@ unsafe fn ensure_window(mtm: MainThreadMarker) -> &'static NSWindow {
             false,
         )
     };
-    window.setTitle(&NSString::from_str("Cocoa-Way Container Mode"));
+    window.setTitle(&NSString::from_str(&tr("Cocoa-Way Container Mode")));
     unsafe {
         window.setContentMinSize(NSSize {
             width: PANEL_MIN_WIDTH,
@@ -5908,28 +5998,32 @@ fn add_session_empty_list(
     let center_y = (content_height * 0.52).max(250.0);
     add_label(
         parent,
-        "No Applications",
+        &tr("No Applications"),
         rect(34.0, center_y, width - 68.0, 34.0),
         mtm,
         TextStyle::Title,
     );
     add_label(
         parent,
-        "Restore the bundled Niri desktop profile or create a custom Wayland application profile.",
+        &tr(
+            "Restore the bundled Niri desktop profile or create a custom Wayland application profile.",
+        ),
         rect(34.0, center_y - 42.0, width - 68.0, 42.0),
         mtm,
         TextStyle::Body,
     );
     add_label(
         parent,
-        "Example\nruntime = \"container\"\nimage = \"localhost/cocoa-way-niri:latest\"\nprofile = \"niri\"\ncommand = \"niri\"",
+        &tr(
+            "Example\nruntime = \"container\"\nimage = \"localhost/cocoa-way-niri:latest\"\nprofile = \"niri\"\ncommand = \"niri\"",
+        ),
         rect(34.0, center_y - 142.0, width - 68.0, 90.0),
         mtm,
         TextStyle::Mono,
     );
     let restore = add_button(
         parent,
-        "Restore Example",
+        &tr("Restore Example"),
         rect(34.0, center_y - 190.0, 128.0, 30.0),
         handler,
         sel!(restoreSmokeContainerSession:),
@@ -5937,7 +6031,7 @@ fn add_session_empty_list(
     );
     let add = add_button(
         parent,
-        "Custom...",
+        &tr("Custom..."),
         rect(174.0, center_y - 190.0, 96.0, 30.0),
         handler,
         sel!(addContainerSession:),
@@ -5945,9 +6039,9 @@ fn add_session_empty_list(
     );
     unsafe {
         let _: () = msg_send![&*restore, setToolTip:
-            &*NSString::from_str("Restore the bundled example application profile")];
+            &*NSString::from_str(&tr("Restore the bundled example application profile"))];
         let _: () = msg_send![&*add, setToolTip:
-            &*NSString::from_str("Create a custom Container Mode application")];
+            &*NSString::from_str(&tr("Create a custom Container Mode application"))];
     }
 }
 
@@ -5955,14 +6049,16 @@ fn add_running_empty_list(parent: &NSView, width: f64, content_height: f64, mtm:
     let center_y = (content_height * 0.52).max(250.0);
     add_label(
         parent,
-        "No Running Applications",
+        &tr("No Running Applications"),
         rect(34.0, center_y, width - 68.0, 34.0),
         mtm,
         TextStyle::Title,
     );
     add_label(
         parent,
-        "Launch an application profile to create an instance. Active containers, Waypipe workers, and display attachments will appear here.",
+        &tr(
+            "Launch an application profile to create an instance. Active containers, Waypipe workers, and display attachments will appear here.",
+        ),
         rect(34.0, center_y - 62.0, width - 68.0, 54.0),
         mtm,
         TextStyle::Body,
@@ -5980,14 +6076,16 @@ fn add_config_error_list(
     let center_y = (content_height * 0.52).max(250.0);
     add_label(
         parent,
-        "Config Error",
+        &tr("Config Error"),
         rect(34.0, center_y, width - 68.0, 34.0),
         mtm,
         TextStyle::Title,
     );
     add_label(
         parent,
-        "Container Mode could not parse container-sessions.toml. Fix the file and press Reload.",
+        &tr(
+            "Container Mode could not parse container-sessions.toml. Fix the file and press Reload.",
+        ),
         rect(34.0, center_y - 42.0, width - 68.0, 42.0),
         mtm,
         TextStyle::Body,
@@ -6001,7 +6099,7 @@ fn add_config_error_list(
     );
     let open = add_button(
         parent,
-        "Open Config",
+        &tr("Open Config"),
         rect(34.0, center_y - 176.0, 116.0, 30.0),
         handler,
         sel!(openContainerConfig:),
@@ -6009,7 +6107,7 @@ fn add_config_error_list(
     );
     unsafe {
         let _: () = msg_send![&*open, setToolTip:
-            &*NSString::from_str("Reveal container-sessions.toml in Finder")];
+            &*NSString::from_str(&tr("Reveal container-sessions.toml in Finder"))];
     }
 }
 
@@ -6019,7 +6117,7 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
     let mut y = content_height - 58.0;
     add_label(
         parent,
-        "Performance",
+        &tr("Performance"),
         rect(34.0, y, width - 68.0, 24.0),
         mtm,
         TextStyle::Title,
@@ -6066,7 +6164,9 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
     } else {
         add_label(
             parent,
-            "No performance sample yet. Launch an application or wait for the next render tick.",
+            &tr(
+                "No performance sample yet. Launch an application or wait for the next render tick.",
+            ),
             rect(38.0, y - 8.0, width - 76.0, 36.0),
             mtm,
             TextStyle::Caption,
@@ -6129,7 +6229,7 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
     if !tasks.is_empty() {
         add_label(
             parent,
-            "Operations",
+            &tr("Operations"),
             rect(34.0, y, width - 68.0, 24.0),
             mtm,
             TextStyle::Title,
@@ -6196,7 +6296,7 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
     if activity.is_empty() {
         add_label(
             parent,
-            "No recent activity",
+            &tr("No recent activity"),
             rect(34.0, y, width - 68.0, 24.0),
             mtm,
             TextStyle::Title,
@@ -6206,7 +6306,7 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
 
     add_label(
         parent,
-        "Recent Activity",
+        &tr("Recent Activity"),
         rect(34.0, y, width - 68.0, 24.0),
         mtm,
         TextStyle::Title,
@@ -6241,7 +6341,7 @@ fn add_images_list(
     let mut y = content_height - 58.0;
     add_label(
         parent,
-        "Local Images",
+        &tr("Local Images"),
         rect(34.0, y, width - 68.0, 24.0),
         mtm,
         TextStyle::Title,
@@ -6251,14 +6351,14 @@ fn add_images_list(
     add_card(parent, rect(24.0, y - 140.0, width - 48.0, 170.0), mtm);
     add_label(
         parent,
-        "Sources & images",
+        &tr("Sources & images"),
         rect(38.0, y + 8.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Pull from Docker Hub, GHCR, Quay, or any OCI registry.",
+        &tr("Pull from Docker Hub, GHCR, Quay, or any OCI registry."),
         rect(38.0, y - 28.0, width - 76.0, 30.0),
         mtm,
         TextStyle::Caption,
@@ -6298,7 +6398,7 @@ fn add_images_list(
     );
     let build = add_button(
         parent,
-        "Build Example",
+        &tr("Build Example"),
         rect(38.0, y - 114.0, half, 28.0),
         handler,
         sel!(buildSmokeContainerImage:),
@@ -6318,13 +6418,13 @@ fn add_images_list(
     );
     unsafe {
         let _: () = msg_send![&*build, setToolTip:
-            &*NSString::from_str("Build the bundled example image with Apple Container")];
+            &*NSString::from_str(&tr("Build the bundled example image with Apple Container"))];
         let _: () = msg_send![&*pull, setToolTip:
-            &*NSString::from_str("Choose a registry, platform, destination, and post-pull action")];
+            &*NSString::from_str(&tr("Choose a registry, platform, destination, and post-pull action"))];
         let _: () = msg_send![&*login, setToolTip:
-            &*NSString::from_str("Log in to a private OCI registry through Apple Container")];
+            &*NSString::from_str(&tr("Log in to a private OCI registry through Apple Container"))];
         let _: () = msg_send![&*load, setToolTip:
-            &*NSString::from_str("Load an OCI image tar archive into Apple Container")];
+            &*NSString::from_str(&tr("Load an OCI image tar archive into Apple Container"))];
     }
     y -= 202.0;
 
@@ -6396,7 +6496,7 @@ fn add_images_list(
                 };
                 let create = add_button(
                     parent,
-                    "Create Application",
+                    &tr("Create Application"),
                     rect(38.0, y - 24.0, 142.0, 28.0),
                     handler,
                     sel!(createContainerSessionFromImage:),
@@ -6405,7 +6505,7 @@ fn add_images_list(
                 unsafe {
                     let _: () = msg_send![&*create, setTag: create_index as isize];
                     let _: () = msg_send![&*create, setToolTip:
-                        &*NSString::from_str("Create an application profile from this image")];
+                        &*NSString::from_str(&tr("Create an application profile from this image"))];
                 }
                 let delete_index = {
                     let mut actions = IMAGE_DELETE_ACTIONS.lock().unwrap();
@@ -6434,7 +6534,7 @@ fn add_images_list(
                     let _: () = msg_send![&*more, setAction: sel!(imageMoreAction:)];
                     let _: () = msg_send![&*more, setTag: delete_index as isize];
                     let _: () = msg_send![&*more, setToolTip:
-                        &*NSString::from_str("Remove a tag or delete the underlying image after dependency checks")];
+                        &*NSString::from_str(&tr("Remove a tag or delete the underlying image after dependency checks"))];
                 }
             }
             y -= 86.0;
@@ -6444,7 +6544,7 @@ fn add_images_list(
 
     add_label(
         parent,
-        "Maintenance",
+        &tr("Maintenance"),
         rect(34.0, y, width - 68.0, 20.0),
         mtm,
         TextStyle::Heading,
@@ -6453,21 +6553,21 @@ fn add_images_list(
     add_card(parent, rect(24.0, y - 70.0, width - 48.0, 104.0), mtm);
     add_label(
         parent,
-        "Delete a local image",
+        &tr("Delete a local image"),
         rect(38.0, y + 12.0, width - 76.0, 18.0),
         mtm,
         TextStyle::Body,
     );
     add_label(
         parent,
-        "Destructive image cleanup is separate from creating an application profile.",
+        &tr("Destructive image cleanup is separate from creating an application profile."),
         rect(38.0, y - 10.0, width - 76.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let delete = add_button(
         parent,
-        "Delete Image...",
+        &tr("Delete Image..."),
         rect(38.0, y - 50.0, 120.0, 28.0),
         handler,
         sel!(deleteContainerImage:),
@@ -6475,7 +6575,7 @@ fn add_images_list(
     );
     unsafe {
         let _: () = msg_send![&*delete, setToolTip:
-            &*NSString::from_str("Delete a local image by runtime and reference")];
+            &*NSString::from_str(&tr("Delete a local image by runtime and reference"))];
     }
 }
 
@@ -6493,7 +6593,7 @@ fn add_volumes_list(
     let mut y = content_height - 58.0;
     add_label(
         parent,
-        "Local Volumes",
+        &tr("Local Volumes"),
         rect(34.0, y, width - 68.0, 24.0),
         mtm,
         TextStyle::Title,
@@ -6503,21 +6603,21 @@ fn add_volumes_list(
     add_card(parent, rect(24.0, y - 58.0, width - 48.0, 92.0), mtm);
     add_label(
         parent,
-        "Volume actions",
+        &tr("Volume actions"),
         rect(38.0, y + 10.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Create persistent storage in Apple Container or the active Docker context.",
+        &tr("Create persistent storage in Apple Container or the active Docker context."),
         rect(38.0, y - 16.0, width - 76.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let create = add_button(
         parent,
-        "Create Volume...",
+        &tr("Create Volume..."),
         rect(38.0, y - 52.0, 126.0, 28.0),
         handler,
         sel!(createContainerVolume:),
@@ -6525,7 +6625,7 @@ fn add_volumes_list(
     );
     unsafe {
         let _: () = msg_send![&*create, setToolTip:
-            &*NSString::from_str("Create a named volume in Apple Container or Docker")];
+            &*NSString::from_str(&tr("Create a named volume in Apple Container or Docker"))];
     }
     y -= 126.0;
 
@@ -6552,14 +6652,14 @@ fn add_volumes_list(
                     );
                     add_label(
                         parent,
-                        "Volumes preserve application data between launches.",
+                        &tr("Volumes preserve application data between launches."),
                         rect(38.0, y - 20.0, width - 76.0, 20.0),
                         mtm,
                         TextStyle::Caption,
                     );
                     add_button(
                         parent,
-                        "Create Volume",
+                        &tr("Create Volume"),
                         rect(38.0, y - 62.0, 116.0, 28.0),
                         handler,
                         sel!(createContainerVolume:),
@@ -6655,7 +6755,7 @@ fn add_volumes_list(
                 };
                 let delete = add_button(
                     parent,
-                    "Delete",
+                    &tr("Delete"),
                     rect(width - 116.0, y - 38.0, 78.0, 28.0),
                     handler,
                     sel!(deleteLocalContainerVolume:),
@@ -6687,16 +6787,16 @@ fn add_volumes_list(
 
 fn display_policy_description(session: &ContainerSession) -> String {
     if session.presentation_mode().is_rootless() {
-        return "Independent native windows · Rootless presentation".into();
+        return tr("Independent native windows · Rootless presentation").into_owned();
     }
     let target = session_display_target(session);
     let policy = match target.as_str() {
-        "auto" => "Auto allocation".to_string(),
-        "default" => "Pinned to built-in display".to_string(),
-        "dedicated" => "Dedicated display".to_string(),
-        _ => format!("Named display: {target}"),
+        "auto" => tr("Auto allocation").into_owned(),
+        "default" => tr("Pinned to built-in display").into_owned(),
+        "dedicated" => tr("Dedicated display").into_owned(),
+        _ => tr_format("Named display: {display}", &[("display", &target)]),
     };
-    format!("{policy} · Desktop presentation")
+    tr_format("{policy} · Desktop presentation", &[("policy", &policy)])
 }
 
 fn add_runtime_list(
@@ -6778,7 +6878,7 @@ fn add_runtime_list(
     if selected_nav == NAV_APPLE_CONTAINER && command_path.is_some() {
         let open = add_button(
             parent,
-            "Open Data Root",
+            &tr("Open Data Root"),
             rect(width - 148.0, y - 4.0, 124.0, 28.0),
             handler,
             sel!(openAppleContainerDataRoot:),
@@ -6786,7 +6886,7 @@ fn add_runtime_list(
         );
         unsafe {
             let _: () = msg_send![&*open, setToolTip:
-                &*NSString::from_str("Open Apple Container's local data directory in Finder")];
+                &*NSString::from_str(&tr("Open Apple Container's local data directory in Finder"))];
         }
     }
     y -= 42.0;
@@ -6794,7 +6894,7 @@ fn add_runtime_list(
     if let Some((container, notice)) = selected_container {
         add_label(
             parent,
-            "Selected Container",
+            &tr("Selected Container"),
             rect(34.0, y + 8.0, width - 68.0, 20.0),
             mtm,
             TextStyle::Heading,
@@ -6813,7 +6913,9 @@ fn add_runtime_list(
     } else {
         add_label(
             parent,
-            "Select a container below for inspect, logs, resource stats, and terminal actions.",
+            &tr(
+                "Select a container below for inspect, logs, resource stats, and terminal actions.",
+            ),
             rect(34.0, y - 10.0, width - 68.0, 36.0),
             mtm,
             TextStyle::Caption,
@@ -6861,7 +6963,7 @@ fn add_runtime_list(
         if is_orbstack {
             let open = add_button(
                 parent,
-                "Open OrbStack",
+                &tr("Open OrbStack"),
                 rect(38.0, y - 76.0, 112.0, 28.0),
                 handler,
                 sel!(openOrbStackApp:),
@@ -6869,12 +6971,12 @@ fn add_runtime_list(
             );
             unsafe {
                 let _: () = msg_send![&*open, setToolTip:
-                    &*NSString::from_str("Open OrbStack so its CLI and Docker endpoint become available")];
+                    &*NSString::from_str(&tr("Open OrbStack so its CLI and Docker endpoint become available"))];
             }
         } else if is_apple_container {
             let download = add_button(
                 parent,
-                "Get Apple Container",
+                &tr("Get Apple Container"),
                 rect(38.0, y - 76.0, 154.0, 28.0),
                 handler,
                 sel!(openAppleContainerReleases:),
@@ -6882,7 +6984,7 @@ fn add_runtime_list(
             );
             unsafe {
                 let _: () = msg_send![&*download, setToolTip:
-                    &*NSString::from_str("Open Apple's official latest Apple Container release")];
+                    &*NSString::from_str(&tr("Open Apple's official latest Apple Container release"))];
             }
         }
         return;
@@ -6895,7 +6997,7 @@ fn add_runtime_list(
     add_card(parent, rect(24.0, y - 58.0, width - 48.0, 88.0), mtm);
     add_label(
         parent,
-        "Command",
+        &tr("Command"),
         rect(38.0, y + 8.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
@@ -6917,7 +7019,7 @@ fn add_runtime_list(
         add_card(parent, rect(24.0, y - 192.0, width - 48.0, 222.0), mtm);
         add_label(
             parent,
-            "Compatibility",
+            &tr("Compatibility"),
             rect(38.0, y + 8.0, width - 76.0, 20.0),
             mtm,
             TextStyle::Heading,
@@ -6971,7 +7073,7 @@ fn add_runtime_list(
         add_card(parent, rect(24.0, y - 150.0, width - 48.0, 180.0), mtm);
         add_label(
             parent,
-            "GUI Transport",
+            &tr("GUI Transport"),
             rect(38.0, y + 8.0, width - 76.0, 20.0),
             mtm,
             TextStyle::Heading,
@@ -7023,21 +7125,23 @@ fn add_runtime_list(
             add_card(parent, rect(24.0, y - 96.0, width - 48.0, 126.0), mtm);
             add_label(
                 parent,
-                "OrbStack Provider",
+                &tr("OrbStack Provider"),
                 rect(38.0, y + 8.0, width - 76.0, 20.0),
                 mtm,
                 TextStyle::Heading,
             );
             add_label(
                 parent,
-                "OrbStack is optional. Install or open it to expose Linux machines and its Docker context here.",
+                &tr(
+                    "OrbStack is optional. Install or open it to expose Linux machines and its Docker context here.",
+                ),
                 rect(38.0, y - 42.0, width - 76.0, 42.0),
                 mtm,
                 TextStyle::Caption,
             );
             let open = add_button(
                 parent,
-                "Open OrbStack",
+                &tr("Open OrbStack"),
                 rect(38.0, y - 82.0, 112.0, 28.0),
                 handler,
                 sel!(openOrbStackApp:),
@@ -7045,7 +7149,7 @@ fn add_runtime_list(
             );
             unsafe {
                 let _: () = msg_send![&*open, setToolTip:
-                    &*NSString::from_str("Open OrbStack if it is installed")];
+                    &*NSString::from_str(&tr("Open OrbStack if it is installed"))];
             }
             y -= 144.0;
         }
@@ -7114,21 +7218,21 @@ fn add_apple_container_system_controls(
     add_card(parent, rect(24.0, y - 110.0, width - 48.0, 140.0), mtm);
     add_label(
         parent,
-        "System Controls",
+        &tr("System Controls"),
         rect(38.0, y + 8.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Thin wrappers around Apple Container CLI commands.",
+        &tr("Thin wrappers around Apple Container CLI commands."),
         rect(38.0, y - 24.0, width - 76.0, 24.0),
         mtm,
         TextStyle::Caption,
     );
     let start = add_button(
         parent,
-        "Start System",
+        &tr("Start System"),
         rect(38.0, y - 58.0, 104.0, 28.0),
         handler,
         sel!(startAppleContainerSystem:),
@@ -7136,7 +7240,7 @@ fn add_apple_container_system_controls(
     );
     let stop = add_button(
         parent,
-        "Stop System",
+        &tr("Stop System"),
         rect(152.0, y - 58.0, 104.0, 28.0),
         handler,
         sel!(stopAppleContainerSystem:),
@@ -7144,7 +7248,7 @@ fn add_apple_container_system_controls(
     );
     let status = add_button(
         parent,
-        "Copy Status",
+        &tr("Copy Status"),
         rect(38.0, y - 92.0, 104.0, 28.0),
         handler,
         sel!(copyContainerCommand:),
@@ -7152,7 +7256,7 @@ fn add_apple_container_system_controls(
     );
     let releases = add_button(
         parent,
-        "Latest Release",
+        &tr("Latest Release"),
         rect(152.0, y - 92.0, 104.0, 28.0),
         handler,
         sel!(openAppleContainerReleases:),
@@ -7160,14 +7264,14 @@ fn add_apple_container_system_controls(
     );
     unsafe {
         let _: () = msg_send![&*start, setToolTip:
-            &*NSString::from_str("Run `container system start` asynchronously")];
+            &*NSString::from_str(&tr("Run `container system start` asynchronously"))];
         let _: () = msg_send![&*stop, setToolTip:
-            &*NSString::from_str("Run `container system stop` asynchronously")];
+            &*NSString::from_str(&tr("Run `container system stop` asynchronously"))];
         let _: () = msg_send![&*status, setTag: 0isize];
         let _: () = msg_send![&*status, setToolTip:
-            &*NSString::from_str("Copy `container system status` to the clipboard")];
+            &*NSString::from_str(&tr("Copy `container system status` to the clipboard"))];
         let _: () = msg_send![&*releases, setToolTip:
-            &*NSString::from_str("Open Apple's official latest Apple Container release")];
+            &*NSString::from_str(&tr("Open Apple's official latest Apple Container release"))];
         let transitioning = matches!(
             runtime_status,
             RuntimeStatus::Starting | RuntimeStatus::Stopping
@@ -7202,14 +7306,14 @@ fn add_apple_container_inventory(
     add_card(parent, rect(24.0, y - 294.0, width - 48.0, 324.0), mtm);
     add_label(
         parent,
-        "Containers",
+        &tr("Containers"),
         rect(38.0, y + 8.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Start, stop, or delete local instances without leaving Cocoa-Way.",
+        &tr("Start, stop, or delete local instances without leaving Cocoa-Way."),
         rect(38.0, y - 40.0, width - 76.0, 30.0),
         mtm,
         TextStyle::Caption,
@@ -7313,14 +7417,14 @@ fn add_docker_context_inventory(
     add_card(parent, rect(24.0, y - 158.0, width - 48.0, 188.0), mtm);
     add_label(
         parent,
-        "Docker Context",
+        &tr("Docker Context"),
         rect(38.0, y + 8.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Active Docker-compatible endpoint; OrbStack appears when its context is selected.",
+        &tr("Active Docker-compatible endpoint; OrbStack appears when its context is selected."),
         rect(38.0, y - 38.0, width - 76.0, 32.0),
         mtm,
         TextStyle::Caption,
@@ -7350,7 +7454,7 @@ fn add_docker_context_inventory(
             };
             let use_button = add_button(
                 parent,
-                "Use",
+                &tr("Use"),
                 rect(width - 94.0, line_y - 4.0, 52.0, 24.0),
                 handler,
                 sel!(useDockerContext:),
@@ -7359,7 +7463,7 @@ fn add_docker_context_inventory(
             unsafe {
                 let _: () = msg_send![&*use_button, setTag: action_index as isize];
                 let _: () = msg_send![&*use_button, setToolTip:
-                    &*NSString::from_str("Make this the active Docker context")];
+                    &*NSString::from_str(&tr("Make this the active Docker context"))];
             }
         }
         line_y -= 32.0;
@@ -7377,14 +7481,14 @@ fn add_docker_container_inventory(
     add_card(parent, rect(24.0, y - 262.0, width - 48.0, 292.0), mtm);
     add_label(
         parent,
-        "Containers",
+        &tr("Containers"),
         rect(38.0, y + 8.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Stop running containers or remove stopped containers below.",
+        &tr("Stop running containers or remove stopped containers below."),
         rect(38.0, y - 28.0, width - 76.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -7417,14 +7521,14 @@ fn add_orbstack_machine_inventory(
     );
     add_label(
         parent,
-        "Machines",
+        &tr("Machines"),
         rect(38.0, y + 8.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Manage OrbStack Linux machines independently from Docker-compatible containers.",
+        &tr("Manage OrbStack Linux machines independently from Docker-compatible containers."),
         rect(38.0, y - 38.0, width - 76.0, 32.0),
         mtm,
         TextStyle::Caption,
@@ -7432,7 +7536,7 @@ fn add_orbstack_machine_inventory(
 
     let start = add_button(
         parent,
-        "Start OrbStack",
+        &tr("Start OrbStack"),
         rect(38.0, y - 76.0, 112.0, 28.0),
         handler,
         sel!(startOrbStack:),
@@ -7440,7 +7544,7 @@ fn add_orbstack_machine_inventory(
     );
     let stop = add_button(
         parent,
-        "Stop OrbStack",
+        &tr("Stop OrbStack"),
         rect(160.0, y - 76.0, 112.0, 28.0),
         handler,
         sel!(stopOrbStack:),
@@ -7448,9 +7552,9 @@ fn add_orbstack_machine_inventory(
     );
     unsafe {
         let _: () = msg_send![&*start, setToolTip:
-            &*NSString::from_str("Run `orbctl start` asynchronously")];
+            &*NSString::from_str(&tr("Run `orbctl start` asynchronously"))];
         let _: () = msg_send![&*stop, setToolTip:
-            &*NSString::from_str("Run `orbctl stop` asynchronously")];
+            &*NSString::from_str(&tr("Run `orbctl stop` asynchronously"))];
         let _: () = msg_send![&*start, setEnabled: !running];
         let _: () = msg_send![&*stop, setEnabled: running];
     }
@@ -7526,7 +7630,7 @@ fn add_orbstack_machine_row(
     );
     let shell = add_button(
         parent,
-        "Shell",
+        &tr("Shell"),
         rect(width - 176.0, y - 20.0, 64.0, 26.0),
         handler,
         sel!(openOrbStackMachineTerminal:),
@@ -7534,7 +7638,7 @@ fn add_orbstack_machine_row(
     );
     let delete = add_button(
         parent,
-        "Delete",
+        &tr("Delete"),
         rect(width - 106.0, y - 20.0, 68.0, 26.0),
         handler,
         sel!(deleteOrbStackMachine:),
@@ -7547,9 +7651,9 @@ fn add_orbstack_machine_row(
         let _: () = msg_send![&*primary, setToolTip:
             &*NSString::from_str(if row.running { "Stop this OrbStack machine" } else { "Start this OrbStack machine" })];
         let _: () = msg_send![&*shell, setToolTip:
-            &*NSString::from_str("Open an interactive shell for this machine in macOS Terminal")];
+            &*NSString::from_str(&tr("Open an interactive shell for this machine in macOS Terminal"))];
         let _: () = msg_send![&*delete, setToolTip:
-            &*NSString::from_str("Permanently delete this machine after confirmation")];
+            &*NSString::from_str(&tr("Permanently delete this machine after confirmation"))];
     }
 }
 
@@ -7597,7 +7701,7 @@ fn add_orbstack_docker_inventory(
     add_card(parent, rect(24.0, y - 266.0, width - 48.0, 296.0), mtm);
     add_label(
         parent,
-        "Docker-compatible Containers",
+        &tr("Docker-compatible Containers"),
         rect(38.0, y + 8.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
@@ -7617,7 +7721,7 @@ fn add_orbstack_docker_inventory(
     if !running {
         add_label(
             parent,
-            "Start OrbStack to inspect its Docker-compatible containers.",
+            &tr("Start OrbStack to inspect its Docker-compatible containers."),
             rect(38.0, y - 82.0, width - 76.0, 36.0),
             mtm,
             TextStyle::Body,
@@ -7745,7 +7849,7 @@ fn add_runtime_container_row(
     let action_index = push_runtime_container_action(runtime, name);
     let delete = add_button(
         parent,
-        "Delete",
+        &tr("Delete"),
         rect(width - 108.0, y - 12.0, 74.0, 24.0),
         handler,
         sel!(deleteRuntimeContainer:),
@@ -8636,7 +8740,7 @@ fn add_commands_list(
     let mut y = content_height - 58.0;
     add_label(
         parent,
-        "Useful Commands",
+        &tr("Useful Commands"),
         rect(34.0, y, width - 68.0, 24.0),
         mtm,
         TextStyle::Title,
@@ -8653,7 +8757,7 @@ fn add_commands_list(
         );
         let copy = add_button(
             parent,
-            "Copy",
+            &tr("Copy"),
             rect(width - 86.0, y - 6.0, 62.0, 28.0),
             handler,
             sel!(copyContainerCommand:),
@@ -8662,7 +8766,7 @@ fn add_commands_list(
         unsafe {
             let _: () = msg_send![&*copy, setTag: index as isize];
             let _: () = msg_send![&*copy, setToolTip:
-                &*NSString::from_str("Copy this command to the clipboard")];
+                &*NSString::from_str(&tr("Copy this command to the clipboard"))];
         }
         y -= 62.0;
     }
@@ -9385,14 +9489,14 @@ fn add_detail_panel(
         let content_y = document_height * 0.52;
         add_label(
             &document,
-            "No Selection",
+            &tr("No Selection"),
             rect(content_x, content_y, document_width - 84.0, 42.0),
             mtm,
             TextStyle::Hero,
         );
         add_label(
             &document,
-            detail_empty_message(selected_tab),
+            &tr(detail_empty_message(selected_tab)),
             rect(content_x, content_y - 40.0, document_width - 84.0, 40.0),
             mtm,
             TextStyle::Body,
@@ -9576,10 +9680,12 @@ fn add_session_detail(
     );
     add_label(
         parent,
-        &format!(
-            "{} application backed by {}",
-            runtime_label(&session.runtime),
-            session.image
+        &tr_format(
+            "{runtime} application backed by {image}",
+            &[
+                ("runtime", runtime_label(&session.runtime)),
+                ("image", &session.image),
+            ],
         ),
         rect(content_x, header_y - 28.0, width - 84.0, 20.0),
         mtm,
@@ -9608,7 +9714,7 @@ fn add_session_detail(
     let launch_busy = active.is_some() || session_is_launch_busy(state);
     let check = add_button(
         parent,
-        "Run Health Check",
+        &tr("Run Health Check"),
         primary_frames[0],
         handler,
         sel!(checkContainerSession:),
@@ -9659,7 +9765,7 @@ fn add_session_detail(
     };
     let primary = add_button(
         parent,
-        primary_label,
+        &tr(primary_label),
         primary_frames[1],
         handler,
         primary_selector,
@@ -9681,10 +9787,10 @@ fn add_session_detail(
     unsafe {
         bind_profile_control(&check, index);
         let _: () = msg_send![&*check, setToolTip:
-            &*NSString::from_str("Validate the profile, runtime, image, command, and transport without launching")];
+            &*NSString::from_str(&tr("Validate the profile, runtime, image, command, and transport without launching"))];
         bind_profile_control(&primary, index);
         let _: () = msg_send![&*primary, setToolTip:
-            &*NSString::from_str(primary_tooltip)];
+            &*NSString::from_str(&tr(primary_tooltip))];
         if launch_busy || transport_blocked {
             let _: () = msg_send![&*primary, setEnabled: false];
         }
@@ -9702,7 +9808,7 @@ fn add_session_detail(
 
     let edit = add_button(
         parent,
-        "Edit Profile",
+        &tr("Edit Profile"),
         secondary_frames[0],
         handler,
         sel!(editContainerSession:),
@@ -9712,12 +9818,12 @@ fn add_session_detail(
         parent,
         secondary_frames[1],
         &[
-            "More…",
-            "Duplicate Profile",
-            "Export Profile",
-            "View Raw Configuration",
-            "Delete Profile",
-            "Resources & Platform...",
+            &tr("More…"),
+            &tr("Duplicate Profile"),
+            &tr("Export Profile"),
+            &tr("View Raw Configuration"),
+            &tr("Delete Profile"),
+            &tr("Resources & Platform..."),
         ],
         0,
         mtm,
@@ -9725,7 +9831,7 @@ fn add_session_detail(
     unsafe {
         bind_profile_control(&edit, index);
         let _: () = msg_send![&*edit, setToolTip:
-            &*NSString::from_str("Edit this saved application profile. Running instances are not changed until their next launch.")];
+            &*NSString::from_str(&tr("Edit this saved application profile. Running instances are not changed until their next launch."))];
         let _: () = msg_send![&*more, setTarget: handler];
         let _: () = msg_send![&*more, setAction:
             sel!(applicationProfileMoreAction:)];
@@ -9741,7 +9847,7 @@ fn add_session_detail(
     let presentation = add_popup(
         parent,
         secondary_frames[2],
-        &["Desktop compositor", "Rootless Wayland apps"],
+        &[&tr("Desktop compositor"), &tr("Rootless Wayland apps")],
         usize::from(session.presentation_mode().is_rootless()),
         mtm,
     );
@@ -9751,7 +9857,7 @@ fn add_session_detail(
             sel!(changeContainerSessionPresentation:)];
         bind_profile_control(&presentation, index);
         let _: () = msg_send![&*presentation, setToolTip:
-            &*NSString::from_str("Use desktop for a compositor such as niri/Hyprland, or rootless for native Wayland applications such as foot")];
+            &*NSString::from_str(&tr("Use desktop for a compositor such as niri/Hyprland, or rootless for native Wayland applications such as foot"))];
         if active.is_some() {
             let _: () = msg_send![&*presentation, setEnabled: false];
         }
@@ -9855,7 +9961,7 @@ fn add_session_info(
         cursor = add_full_check_card(
             parent,
             index,
-            "Health Check Warnings",
+            &tr("Health Check Warnings"),
             &check.detail,
             x,
             cursor,
@@ -9938,9 +10044,9 @@ fn add_session_info(
             ("Status".to_string(), "No running instances".into()),
             (
                 "Next launch".to_string(),
-                format!(
-                    "Uses the {} display policy",
-                    session_display_target(session)
+                tr_format(
+                    "Uses the {display} display policy",
+                    &[("display", &session_display_target(session))],
                 ),
             ),
         ]
@@ -10010,7 +10116,7 @@ fn add_session_info(
             diagnostics_bottom = add_full_check_card(
                 parent,
                 index,
-                "Last Health Check",
+                &tr("Last Health Check"),
                 &check.detail,
                 x,
                 diagnostics_bottom - 18.0,
@@ -10026,7 +10132,7 @@ fn add_session_info(
     let diagnostics_buttons_y = actions_y + 12.0;
     let logs = add_button(
         parent,
-        "View Logs",
+        &tr("View Logs"),
         rect(x + width - 242.0, diagnostics_buttons_y, 96.0, 28.0),
         handler,
         sel!(selectContainerTab:),
@@ -10034,7 +10140,7 @@ fn add_session_info(
     );
     let raw = add_button(
         parent,
-        "Raw Config",
+        &tr("Raw Config"),
         rect(x + width - 136.0, diagnostics_buttons_y, 112.0, 28.0),
         handler,
         sel!(viewRawContainerSession:),
@@ -10157,7 +10263,7 @@ fn add_full_check_card(
     add_detail_card(parent, x, bottom, width, height, mtm);
     add_label(
         parent,
-        title,
+        &tr(title),
         rect(x + 22.0, top - 38.0, text_width, 22.0),
         mtm,
         TextStyle::Heading,
@@ -10173,7 +10279,7 @@ fn add_full_check_card(
     }
     let check = add_button(
         parent,
-        "Run Health Check",
+        &tr("Run Health Check"),
         rect(x + 22.0, bottom + 16.0, 128.0, 28.0),
         handler,
         sel!(checkContainerSession:),
@@ -10181,7 +10287,7 @@ fn add_full_check_card(
     );
     let logs = add_button(
         parent,
-        "View Logs",
+        &tr("View Logs"),
         rect(x + 160.0, bottom + 16.0, 96.0, 28.0),
         handler,
         sel!(selectContainerTab:),
@@ -10213,7 +10319,7 @@ fn add_labeled_rows_card(
     add_detail_card(parent, x, card_y, width, card_height, mtm);
     add_label(
         parent,
-        title,
+        &tr(title),
         rect(x + 22.0, top - 38.0, width - 44.0, 22.0),
         mtm,
         TextStyle::Heading,
@@ -10242,7 +10348,7 @@ fn add_runtime_arguments_card(
     add_detail_card(parent, x, y, width, height, mtm);
     add_label(
         parent,
-        "Runtime Arguments",
+        &tr("Runtime Arguments"),
         rect(x + 22.0, top - 38.0, width - 44.0, 22.0),
         mtm,
         TextStyle::Heading,
@@ -10295,6 +10401,16 @@ fn format_runtime_arguments(arguments: &[String]) -> String {
 }
 
 fn format_count(count: usize, noun: &str) -> String {
+    let template = match (noun, count == 1) {
+        ("mount", true) => Some("1 mount"),
+        ("mount", false) => Some("{count} mounts"),
+        ("variable", true) => Some("1 variable"),
+        ("variable", false) => Some("{count} variables"),
+        _ => None,
+    };
+    if let Some(template) = template {
+        return tr_format(template, &[("count", &count.to_string())]);
+    }
     format!("{} {}{}", count, noun, if count == 1 { "" } else { "s" })
 }
 
@@ -10302,13 +10418,16 @@ fn elapsed_time_label(started_at_unix_ms: u128) -> String {
     let elapsed_ms = now_unix_ms().saturating_sub(started_at_unix_ms);
     let seconds = elapsed_ms / 1_000;
     if seconds < 60 {
-        format!("{}s ago", seconds)
+        tr_format("{count}s ago", &[("count", &seconds.to_string())])
     } else if seconds < 3_600 {
-        format!("{}m ago", seconds / 60)
+        tr_format("{count}m ago", &[("count", &(seconds / 60).to_string())])
     } else if seconds < 86_400 {
-        format!("{}h ago", seconds / 3_600)
+        tr_format("{count}h ago", &[("count", &(seconds / 3_600).to_string())])
     } else {
-        format!("{}d ago", seconds / 86_400)
+        tr_format(
+            "{count}d ago",
+            &[("count", &(seconds / 86_400).to_string())],
+        )
     }
 }
 
@@ -10326,14 +10445,14 @@ fn add_application_task_card(
     add_detail_card(parent, x, y, width, height, mtm);
     add_label(
         parent,
-        &task.operation,
+        &tr(&task.operation),
         rect(x + 22.0, y + height - 36.0, width - 148.0, 22.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        task.status.label(),
+        &tr(task.status.label()),
         rect(x + width - 118.0, y + height - 34.0, 96.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -10360,14 +10479,14 @@ fn add_application_task_card(
         };
         add_label(
             parent,
-            status,
+            &tr(status),
             rect(x + 22.0, row_y, 88.0, 18.0),
             mtm,
             TextStyle::Caption,
         );
         add_label(
             parent,
-            &step.name,
+            &tr(&step.name),
             rect(x + 116.0, row_y - 1.0, width - 138.0, 20.0),
             mtm,
             TextStyle::Body,
@@ -10378,7 +10497,7 @@ fn add_application_task_card(
     if failed {
         let view_error = add_button(
             parent,
-            "View Details",
+            &tr("View Details"),
             rect(x + 22.0, y + 10.0, 104.0, 28.0),
             handler,
             sel!(selectContainerTab:),
@@ -10387,7 +10506,7 @@ fn add_application_task_card(
         unsafe {
             let _: () = msg_send![&*view_error, setTag: 1isize];
             let _: () = msg_send![&*view_error, setToolTip:
-                &*NSString::from_str("Open captured launch logs for this failure")];
+                &*NSString::from_str(&tr("Open captured launch logs for this failure"))];
         }
     }
 }
@@ -10440,7 +10559,7 @@ fn add_application_error_card(
     }
     let retry = add_button(
         parent,
-        "Retry Check",
+        &tr("Retry Check"),
         frames[0],
         handler,
         sel!(checkContainerSession:),
@@ -10448,7 +10567,7 @@ fn add_application_error_card(
     );
     let view_error = add_button(
         parent,
-        "View Details",
+        &tr("View Details"),
         frames[1],
         handler,
         sel!(selectContainerTab:),
@@ -10456,7 +10575,7 @@ fn add_application_error_card(
     );
     let copy_diagnostics = add_button(
         parent,
-        "Copy Diagnostics",
+        &tr("Copy Diagnostics"),
         frames[2],
         handler,
         sel!(copyApplicationDiagnostics:),
@@ -10467,7 +10586,7 @@ fn add_application_error_card(
         let _: () = msg_send![&*view_error, setTag: 1isize];
         bind_profile_control(&copy_diagnostics, index);
         let _: () = msg_send![&*copy_diagnostics, setToolTip:
-            &*NSString::from_str("Copy profile, state, display, and recent logs")];
+            &*NSString::from_str(&tr("Copy profile, state, display, and recent logs"))];
     }
 }
 
@@ -10489,9 +10608,11 @@ fn add_session_detail_row(
     width: f64,
     mtm: MainThreadMarker,
 ) {
+    let value = localized_detail_value(key, value);
+    let value = value.as_ref();
     add_label(
         parent,
-        key,
+        &tr(key),
         rect(x, y, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -10521,6 +10642,24 @@ fn add_session_detail_row(
             let _: () = msg_send![&*label, setToolTip: &*NSString::from_str(value)];
         }
     }
+}
+
+fn localized_detail_value<'a>(key: &str, value: &'a str) -> std::borrow::Cow<'a, str> {
+    // Translate semantic UI states only. A command, image or user-chosen name
+    // may itself equal an English message key and must retain its spelling.
+    if detail_value_is_ui_state(key, value) {
+        tr(value)
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
+fn detail_value_is_ui_state(key: &str, value: &str) -> bool {
+    matches!(
+        key,
+        "Profile status" | "Instance status" | "Status" | "Health" | "Presentation" | "Failed step"
+    ) || (matches!(key, "CPU" | "Memory" | "Shared memory") && value == "Runtime default")
+        || (key == "Audio" && matches!(value, "Off" | "48 kHz stereo playback"))
 }
 
 fn is_missing_image_state(state: &SessionState) -> bool {
@@ -10604,7 +10743,7 @@ fn add_missing_image_card(
     if local_image && is_smoke_image_reference(&session.image) {
         let build = add_button(
             parent,
-            "Build",
+            &tr("Build"),
             rect(button_x, y + 6.0, 78.0, 28.0),
             handler,
             sel!(buildSmokeContainerSessionImage:),
@@ -10613,13 +10752,13 @@ fn add_missing_image_card(
         unsafe {
             bind_profile_control(&build, index);
             let _: () = msg_send![&*build, setToolTip:
-                &*NSString::from_str("Build the bundled example image with Apple Container")];
+                &*NSString::from_str(&tr("Build the bundled example image with Apple Container"))];
         }
         button_x += 88.0;
     } else if !local_image {
         let pull = add_button(
             parent,
-            "Pull Image",
+            &tr("Pull Image"),
             rect(button_x, y + 6.0, 96.0, 28.0),
             handler,
             sel!(pullContainerSessionImage:),
@@ -10628,13 +10767,13 @@ fn add_missing_image_card(
         unsafe {
             bind_profile_control(&pull, index);
             let _: () = msg_send![&*pull, setToolTip:
-                &*NSString::from_str("Pull the application image with Apple Container")];
+                &*NSString::from_str(&tr("Pull the application image with Apple Container"))];
         }
         button_x += 106.0;
     }
     let load = add_button(
         parent,
-        "Load OCI",
+        &tr("Load OCI"),
         rect(button_x, y + 6.0, 88.0, 28.0),
         handler,
         sel!(loadContainerSessionImage:),
@@ -10643,12 +10782,12 @@ fn add_missing_image_card(
     unsafe {
         bind_profile_control(&load, index);
         let _: () = msg_send![&*load, setToolTip:
-            &*NSString::from_str("Load an OCI archive into Apple Container")];
+            &*NSString::from_str(&tr("Load an OCI archive into Apple Container"))];
     }
     if local_image && is_smoke_image_reference(&session.image) {
         let build = add_button(
             parent,
-            "Copy Build Cmd",
+            &tr("Copy Build Cmd"),
             rect(button_x + 98.0, y + 6.0, 128.0, 28.0),
             handler,
             sel!(copySmokeImageBuildCommand:),
@@ -10656,7 +10795,7 @@ fn add_missing_image_card(
         );
         unsafe {
             let _: () = msg_send![&*build, setToolTip:
-                &*NSString::from_str("Copy an Apple Container build command for the bundled example image")];
+                &*NSString::from_str(&tr("Copy an Apple Container build command for the bundled example image"))];
         }
     }
 }
@@ -10672,21 +10811,21 @@ fn add_apple_container_stopped_card(
     add_detail_card(parent, x, y, width, 96.0, mtm);
     add_label(
         parent,
-        "Apple Container is stopped",
+        &tr("Apple Container is stopped"),
         rect(x + 22.0, y + 60.0, width - 44.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Start the Apple Container system, then run Check again.",
+        &tr("Start the Apple Container system, then run Check again."),
         rect(x + 22.0, y + 36.0, width - 44.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let start = add_button(
         parent,
-        "Start System",
+        &tr("Start System"),
         rect(x + 22.0, y + 6.0, 112.0, 28.0),
         handler,
         sel!(startAppleContainerSystem:),
@@ -10694,7 +10833,7 @@ fn add_apple_container_stopped_card(
     );
     unsafe {
         let _: () = msg_send![&*start, setToolTip:
-            &*NSString::from_str("Run `container system start`")];
+            &*NSString::from_str(&tr("Run `container system start`"))];
     }
 }
 
@@ -10734,7 +10873,10 @@ fn add_display_note_card(
             )
         } else {
             (
-                format!("Dedicated display: {}", active.instance.display_slot),
+                tr_format(
+                    "Dedicated display: {display}",
+                    &[("display", &active.instance.display_slot)],
+                ),
                 "This session owns an independent Metal window and Wayland socket.".to_string(),
                 "Stopping the session also closes and cleans up its display worker.".to_string(),
             )
@@ -10753,7 +10895,7 @@ fn add_display_note_card(
         )
     } else {
         (
-            format!("Dedicated display: {}", requested),
+            tr_format("Dedicated display: {display}", &[("display", &requested)]),
             "This profile launches in an independent Cocoa-Way display window.".to_string(),
             "The named display is recreated on launch and cleaned up on stop.".to_string(),
         )
@@ -10771,14 +10913,14 @@ fn add_display_note_card(
     }
     add_label(
         parent,
-        &detail,
+        &tr(&detail),
         rect(x + 22.0, y + 36.0, width - 44.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     add_label(
         parent,
-        &behavior,
+        &tr(&behavior),
         rect(x + 22.0, y + 18.0, width - 44.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -10810,14 +10952,16 @@ fn add_session_logs(
     add_detail_card(parent, x, y, width, 292.0, mtm);
     add_label(
         parent,
-        "Launch Logs",
+        &tr("Launch Logs"),
         rect(x + 22.0, y + 244.0, width - 44.0, 24.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Live stdout/stderr from the container runtime and waypipe client is captured for this app session.",
+        &tr(
+            "Live stdout/stderr from the container runtime and waypipe client is captured for this app session.",
+        ),
         rect(x + 22.0, y + 200.0, width - 44.0, 40.0),
         mtm,
         TextStyle::Body,
@@ -10865,14 +11009,16 @@ fn add_session_terminal(
     add_detail_card(parent, x, y, width, 226.0, mtm);
     add_label(
         parent,
-        "Terminal Bridge",
+        &tr("Terminal Bridge"),
         rect(x + 22.0, y + 178.0, width - 44.0, 24.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Open a macOS Terminal shell inside the running GUI container. Launch the session first, then attach here.",
+        &tr(
+            "Open a macOS Terminal shell inside the running GUI container. Launch the session first, then attach here.",
+        ),
         rect(x + 22.0, y + 142.0, width - 44.0, 34.0),
         mtm,
         TextStyle::Body,
@@ -10897,7 +11043,7 @@ fn add_session_terminal(
     );
     let button = add_button(
         parent,
-        "Open Shell",
+        &tr("Open Shell"),
         rect(x + 22.0, y + 24.0, 116.0, 30.0),
         handler,
         sel!(openContainerTerminal:),
@@ -10906,11 +11052,11 @@ fn add_session_terminal(
     unsafe {
         bind_profile_control(&button, index);
         let _: () = msg_send![&*button, setToolTip:
-            &*NSString::from_str("Open macOS Terminal and attach to this running GUI container")];
+            &*NSString::from_str(&tr("Open macOS Terminal and attach to this running GUI container"))];
         if active_session(index).is_none() {
             let _: () = msg_send![&*button, setEnabled: false];
             let _: () = msg_send![&*button, setToolTip:
-                &*NSString::from_str("Launch this application before opening a shell")];
+                &*NSString::from_str(&tr("Launch this application before opening a shell"))];
         }
     }
 }
@@ -10926,7 +11072,7 @@ fn add_session_files(
     add_detail_card(parent, x, y, width, 178.0, mtm);
     add_label(
         parent,
-        "Shared Files",
+        &tr("Shared Files"),
         rect(x + 22.0, y + 130.0, width - 44.0, 24.0),
         mtm,
         TextStyle::Heading,
@@ -10934,7 +11080,9 @@ fn add_session_files(
     if session.mounts.is_empty() {
         add_label(
             parent,
-            "Declare mounts in container-sessions.toml to share project folders with this application.",
+            &tr(
+                "Declare mounts in container-sessions.toml to share project folders with this application.",
+            ),
             rect(x + 22.0, y + 94.0, width - 44.0, 34.0),
             mtm,
             TextStyle::Body,
@@ -10949,7 +11097,7 @@ fn add_session_files(
     } else {
         add_label(
             parent,
-            "Mounted folders are passed to the container runtime at launch.",
+            &tr("Mounted folders are passed to the container runtime at launch."),
             rect(x + 22.0, y + 98.0, width - 44.0, 28.0),
             mtm,
             TextStyle::Body,
@@ -10978,21 +11126,21 @@ fn add_apple_container_transport_card(
     add_detail_card(parent, x, y, width, 116.0, mtm);
     add_label(
         parent,
-        "GUI relay unavailable",
+        &tr("GUI relay unavailable"),
         rect(x + 22.0, y + 78.0, width - 44.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
     add_label(
         parent,
-        "Apple Container GUI launch needs Transport V2 or the stdio compatibility relay.",
+        &tr("Apple Container GUI launch needs Transport V2 or the stdio compatibility relay."),
         rect(x + 22.0, y + 42.0, width - 44.0, 34.0),
         mtm,
         TextStyle::Caption,
     );
     add_label(
         parent,
-        "Run Check, then inspect Logs if Launch cannot start the relay.",
+        &tr("Run Check, then inspect Logs if Launch cannot start the relay."),
         rect(x + 22.0, y + 18.0, width - 44.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -11044,7 +11192,7 @@ fn add_image_detail(
     };
     let create = add_button(
         parent,
-        "Create Application",
+        &tr("Create Application"),
         rect(content_x, header_y - 72.0, 142.0, 30.0),
         handler,
         sel!(createContainerSessionFromImage:),
@@ -11065,12 +11213,12 @@ fn add_image_detail(
     unsafe {
         let _: () = msg_send![&*create, setTag: create_index as isize];
         let _: () = msg_send![&*create, setToolTip:
-            &*NSString::from_str("Create an application profile from this image")];
+            &*NSString::from_str(&tr("Create an application profile from this image"))];
         let _: () = msg_send![&*more, setTarget: handler];
         let _: () = msg_send![&*more, setAction: sel!(imageMoreAction:)];
         let _: () = msg_send![&*more, setTag: delete_index as isize];
         let _: () = msg_send![&*more, setToolTip:
-            &*NSString::from_str("Remove a tag or delete the underlying image after dependency checks")];
+            &*NSString::from_str(&tr("Remove a tag or delete the underlying image after dependency checks"))];
     }
 
     let (repository, tag) = split_image_reference(&image.reference);
@@ -11150,7 +11298,7 @@ fn add_image_detail(
     add_detail_card(parent, content_x, inspect_y, width - 84.0, 158.0, mtm);
     add_label(
         parent,
-        "Inspect Preview",
+        &tr("Inspect Preview"),
         rect(content_x + 22.0, inspect_y + 118.0, width - 128.0, 20.0),
         mtm,
         TextStyle::Heading,
@@ -11209,7 +11357,7 @@ fn add_volume_detail(
     let metadata = volume_inspect_metadata(&volume.runtime_key, &volume.name, &volume.label);
     let delete = add_button(
         parent,
-        "Delete Volume",
+        &tr("Delete Volume"),
         rect(content_x, header_y - 72.0, 124.0, 30.0),
         handler,
         sel!(deleteLocalContainerVolume:),
@@ -11273,7 +11421,7 @@ fn add_volume_detail(
     add_detail_card(parent, content_x, inspect_y, width - 84.0, 158.0, mtm);
     add_label(
         parent,
-        "Inspect Preview",
+        &tr("Inspect Preview"),
         rect(content_x + 22.0, inspect_y + 118.0, width - 128.0, 20.0),
         mtm,
         TextStyle::Heading,
@@ -11503,7 +11651,7 @@ fn add_runtime_container_detail(
     );
     let restart = add_button(
         parent,
-        "Restart",
+        &tr("Restart"),
         layout.actions[1],
         handler,
         sel!(restartRuntimeContainer:),
@@ -11511,7 +11659,7 @@ fn add_runtime_container_detail(
     );
     let terminal = add_button(
         parent,
-        "Terminal",
+        &tr("Terminal"),
         layout.actions[2],
         handler,
         sel!(openRuntimeContainerTerminal:),
@@ -11519,7 +11667,7 @@ fn add_runtime_container_detail(
     );
     let refresh = add_button(
         parent,
-        "Refresh Details",
+        &tr("Refresh Details"),
         layout.actions[3],
         handler,
         sel!(refreshRuntimeContainerDetails:),
@@ -11527,7 +11675,7 @@ fn add_runtime_container_detail(
     );
     let delete = add_button(
         parent,
-        "Delete",
+        &tr("Delete"),
         layout.actions[4],
         handler,
         sel!(deleteRuntimeContainer:),
@@ -11535,7 +11683,7 @@ fn add_runtime_container_detail(
     );
     let close = add_button(
         parent,
-        "Hide Details",
+        &tr("Hide Details"),
         layout.actions[5],
         handler,
         sel!(closeRuntimeContainerDetails:),
@@ -11548,11 +11696,11 @@ fn add_runtime_container_detail(
         let _: () = msg_send![&*primary, setToolTip:
             &*NSString::from_str(if container.running { "Stop this container" } else { "Start this container" })];
         let _: () = msg_send![&*restart, setToolTip:
-            &*NSString::from_str("Restart this container and refresh its details")];
+            &*NSString::from_str(&tr("Restart this container and refresh its details"))];
         let _: () = msg_send![&*terminal, setToolTip:
-            &*NSString::from_str("Open an interactive shell in macOS Terminal")];
+            &*NSString::from_str(&tr("Open an interactive shell in macOS Terminal"))];
         let _: () = msg_send![&*refresh, setToolTip:
-            &*NSString::from_str("Reload inspect, resource, and recent log output")];
+            &*NSString::from_str(&tr("Reload inspect, resource, and recent log output"))];
         let _: () = msg_send![&*delete, setToolTip:
             &*NSString::from_str(if container.running { "Stop this container before deleting it" } else { "Delete this container after confirmation" })];
         for (button, enabled) in [&primary, &restart, &terminal, &refresh, &delete, &close]
@@ -11673,14 +11821,14 @@ fn add_section_detail(
     let content_y = y + height * 0.52;
     add_label(
         parent,
-        title,
+        &tr(title),
         rect(content_x, content_y, width - 84.0, 42.0),
         mtm,
         TextStyle::Hero,
     );
     add_label(
         parent,
-        detail,
+        &tr(detail),
         rect(content_x, content_y - 48.0, width - 84.0, 42.0),
         mtm,
         TextStyle::Body,
@@ -11739,7 +11887,7 @@ fn add_placeholder_list(
     );
     add_label(
         parent,
-        "No local resources are available for this section.",
+        &tr("No local resources are available for this section."),
         rect(34.0, center_y - 44.0, width - 68.0, 54.0),
         mtm,
         TextStyle::Body,
@@ -11883,7 +12031,7 @@ unsafe fn add_session_row(
     );
     let status = add_label(
         parent,
-        state_label,
+        &tr(state_label),
         rect(card_w - 132.0, y + 138.0, 112.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -11898,7 +12046,7 @@ unsafe fn add_session_row(
         &format!(
             "{} · {}",
             session_display_command(session),
-            session_presentation_summary(session)
+            tr(session_presentation_summary(session))
         ),
         rect(32.0, y + 112.0, card_w - 52.0, 20.0),
         mtm,
@@ -11920,11 +12068,11 @@ unsafe fn add_session_row(
     );
     add_label(
         parent,
-        if process_active {
+        &tr(if process_active {
             "1 active instance"
         } else {
             "No running instances"
-        },
+        }),
         rect(32.0, y + 46.0, card_w - 52.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -11989,7 +12137,7 @@ unsafe fn add_session_row(
     };
     let primary = add_button(
         parent,
-        primary_label,
+        &tr(primary_label),
         rect(32.0, y + 14.0, 82.0, 28.0),
         handler,
         primary_selector,
@@ -11998,7 +12146,7 @@ unsafe fn add_session_row(
     unsafe {
         bind_profile_control(&primary, index);
         let _: () = msg_send![&*primary, setToolTip:
-            &*NSString::from_str(primary_tooltip)];
+            &*NSString::from_str(&tr(primary_tooltip))];
         if !process_active && (launch_busy || transport_blocked) {
             let _: () = msg_send![&*primary, setEnabled: false];
         }
@@ -12044,12 +12192,12 @@ unsafe fn add_session_row(
         parent,
         rect(card_w - 58.0, y + 14.0, 46.0, 28.0),
         &[
-            "…",
-            "Duplicate Profile",
-            "Export Profile",
-            "View Raw Configuration",
-            "Delete Profile",
-            "Resources & Platform...",
+            &tr("…"),
+            &tr("Duplicate Profile"),
+            &tr("Export Profile"),
+            &tr("View Raw Configuration"),
+            &tr("Delete Profile"),
+            &tr("Resources & Platform..."),
         ],
         0,
         mtm,
@@ -12059,7 +12207,7 @@ unsafe fn add_session_row(
         let _: () = msg_send![&*more, setAction: sel!(applicationProfileMoreAction:)];
         bind_profile_control(&more, index);
         let _: () = msg_send![&*more, setToolTip:
-            &*NSString::from_str("More profile actions")];
+            &*NSString::from_str(&tr("More profile actions"))];
     }
 }
 
@@ -12342,7 +12490,7 @@ fn add_button(
 ) -> Retained<NSButton> {
     unsafe {
         let button = NSButton::buttonWithTitle_target_action(
-            &NSString::from_str(title),
+            &NSString::from_str(&tr(title)),
             Some(&*handler),
             Some(action),
             mtm,
@@ -12422,7 +12570,7 @@ fn add_hit_button(
 ) {
     unsafe {
         let button = NSButton::buttonWithTitle_target_action(
-            &NSString::from_str(""),
+            &NSString::from_str(&tr("")),
             Some(&*handler),
             Some(action),
             mtm,
@@ -12460,7 +12608,7 @@ fn add_profile_card(
     unsafe {
         let card = NSBox::initWithFrame(mtm.alloc::<NSBox>(), frame);
         card.setBoxType(NSBoxType::NSBoxCustom);
-        card.setTitle(&NSString::from_str(""));
+        card.setTitle(&NSString::from_str(&tr("")));
         card.setTransparent(false);
         card.setCornerRadius(12.0);
         card.setBorderWidth(1.5);
@@ -12486,7 +12634,7 @@ fn add_runtime_accent(parent: &NSView, nav: usize, frame: NSRect, mtm: MainThrea
     unsafe {
         let accent = NSBox::initWithFrame(mtm.alloc::<NSBox>(), frame);
         accent.setBoxType(NSBoxType::NSBoxCustom);
-        accent.setTitle(&NSString::from_str(""));
+        accent.setTitle(&NSString::from_str(&tr("")));
         accent.setTransparent(false);
         accent.setCornerRadius(frame.size.width / 2.0);
         accent.setBorderWidth(0.0);
@@ -12771,6 +12919,43 @@ mod runtime_container_detail_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn localization_only_interprets_semantic_detail_values() {
+        for key in [
+            "Image",
+            "Command",
+            "Container",
+            "Display",
+            "Instance",
+            "Runtime Arguments",
+        ] {
+            for value in [
+                "Applications",
+                "Running",
+                "Desktop",
+                "Runtime default",
+                "Off",
+            ] {
+                assert!(!detail_value_is_ui_state(key, value), "{key}: {value}");
+                assert_eq!(localized_detail_value(key, value), value);
+            }
+        }
+        for key in [
+            "Profile status",
+            "Instance status",
+            "Status",
+            "Health",
+            "Presentation",
+            "Failed step",
+        ] {
+            assert!(detail_value_is_ui_state(key, "Running"));
+        }
+        assert!(detail_value_is_ui_state("CPU", "Runtime default"));
+        assert!(!detail_value_is_ui_state("CPU", "4"));
+        assert!(detail_value_is_ui_state("Audio", "Off"));
+        assert!(!detail_value_is_ui_state("Audio", "custom sink"));
+    }
 
     #[test]
     fn diagnostic_views_mask_profile_and_inspect_secrets_without_rewriting_configuration() {

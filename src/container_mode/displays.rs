@@ -91,7 +91,7 @@ pub(super) fn toggle_details(index: usize) {
             } else {
                 "Connection details"
             };
-            let _: () = msg_send![&*toggle.button, setTitle: &*NSString::from_str(title)];
+            let _: () = msg_send![&*toggle.button, setTitle: &*NSString::from_str(&tr(title))];
         }
     });
     relayout();
@@ -246,8 +246,8 @@ pub(super) fn install(
 
 fn section(content: &mut ScrollStack, title: &str, detail: &str, mtm: MainThreadMarker) {
     let section = ui::stack(true, 5.0, mtm);
-    let title = content.label(title, TextStyle::Heading, mtm);
-    let detail = content.label(detail, TextStyle::Caption, mtm);
+    let title = content.label(&tr(title), TextStyle::Heading, mtm);
+    let detail = content.label(&tr(detail), TextStyle::Caption, mtm);
     ui::arranged(&section, &title, true);
     ui::arranged(&section, &detail, true);
     ui::arranged(&content.body, &section, true);
@@ -280,7 +280,7 @@ fn add_card(content: &ScrollStack, body: &NSStackView, mtm: MainThreadMarker) {
 }
 
 fn badge(body: &NSStackView, status: DisplayStatus, mtm: MainThreadMarker) {
-    let label = ui::single_line(status.label(), TextStyle::Caption, mtm);
+    let label = ui::single_line(&tr(status.label()), TextStyle::Caption, mtm);
     let color = unsafe {
         match status {
             DisplayStatus::Attached => NSColor::systemBlueColor(),
@@ -344,7 +344,7 @@ fn populate(
         ("Application configuration needs attention", config_error),
     ] {
         if let Some(error) = error {
-            let body = card_body(content, title, error, "exclamationmark.triangle", mtm);
+            let body = card_body(content, &tr(title), error, "exclamationmark.triangle", mtm);
             badge(&body, DisplayStatus::Failed, mtm);
             add_card(content, &body, mtm);
         }
@@ -361,8 +361,10 @@ fn populate(
         .count();
     let built_in = card_body(
         content,
-        "Built-in display",
-        "The shared Cocoa-Way desktop window. Other auto sessions receive independent displays when this one is occupied.",
+        &tr("Built-in display"),
+        &tr(
+            "The shared Cocoa-Way desktop window. Other auto sessions receive independent displays when this one is occupied.",
+        ),
         "desktopcomputer",
         mtm,
     );
@@ -381,7 +383,7 @@ fn populate(
         let body = card_body(
             content,
             &slot,
-            "Starting an independent Wayland window...",
+            &tr("Starting an independent Wayland window..."),
             "display",
             mtm,
         );
@@ -410,9 +412,9 @@ fn populate(
         let body = card_body(
             content,
             &display.slot,
-            &format!(
-                "{attached} managed application attachment{}",
-                if attached == 1 { "" } else { "s" }
+            &tr_format(
+                "{count} managed application attachments",
+                &[("count", &attached.to_string())],
             ),
             "display",
             mtm,
@@ -425,21 +427,21 @@ fn populate(
             mtm,
         );
         let focus = ui::button(
-            "Focus Window",
+            &tr("Focus Window"),
             handler,
             sel!(focusManagedDisplay:),
             action_index,
             mtm,
         );
         let copy = ui::button(
-            "Copy Connection",
+            &tr("Copy Connection"),
             handler,
             sel!(copyManagedDisplayCommand:),
             action_index,
             mtm,
         );
         let close = ui::button(
-            "Close Display",
+            &tr("Close Display"),
             handler,
             sel!(closeManagedDisplay:),
             action_index,
@@ -449,18 +451,27 @@ fn populate(
             let _: () = msg_send![&*focus, setEnabled: !is_closing];
             let _: () = msg_send![&*copy, setEnabled: !is_closing];
             let _: () = msg_send![&*close, setEnabled: !is_closing && attached == 0];
-            let _: () = msg_send![&*copy, setToolTip: &*NSString::from_str("Copy the run_waypipe.sh command prefix for this display")];
+            let _: () = msg_send![&*copy, setToolTip: &*NSString::from_str(&tr("Copy the run_waypipe.sh command prefix for this display"))];
             let _: () = msg_send![&*close, setToolTip: &*NSString::from_str(if attached > 0 { "Stop managed attachments before closing this display" } else { "Close this display, including any external script clients" })];
         }
         actions(content, &body, &[focus, copy, close], mtm);
         let detail_body = ui::stack(true, 6.0, mtm);
         let socket = content.label(
-            &format!("Socket\n{}/{}", display.runtime_dir, display.display),
+            &tr_format(
+                "Socket\n{path}",
+                &[(
+                    "path",
+                    &format!("{}/{}", display.runtime_dir, display.display),
+                )],
+            ),
             TextStyle::Mono,
             mtm,
         );
         let process = content.label(
-            &format!("Display process {}", display.pid),
+            &tr_format(
+                "Display process {pid}",
+                &[("pid", &display.pid.to_string())],
+            ),
             TextStyle::Caption,
             mtm,
         );
@@ -468,11 +479,11 @@ fn populate(
         ui::arranged(&detail_body, &process, true);
         let open = OPEN_DETAILS.with(|open| open.borrow().contains(&display.slot));
         let toggle = ui::button(
-            if open {
+            &tr(if open {
                 "Hide connection details"
             } else {
                 "Connection details"
-            },
+            }),
             handler,
             sel!(toggleDisplayConnectionDetails:),
             details.len(),
@@ -501,8 +512,10 @@ fn populate(
     if active.is_empty() {
         let body = card_body(
             content,
-            "No managed applications connected",
-            "Launch an application from Applications, or use Copy Connection on a named display for an external client.",
+            &tr("No managed applications connected"),
+            &tr(
+                "Launch an application from Applications, or use Copy Connection on a named display for an external client.",
+            ),
             "rectangle.on.rectangle",
             mtm,
         );
@@ -517,9 +530,12 @@ fn populate(
         let body = card_body(
             content,
             name,
-            &format!(
-                "Instance #{} on {}",
-                active.instance.id, active.instance.display_slot
+            &tr_format(
+                "Instance #{id} on {display}",
+                &[
+                    ("id", &active.instance.id.to_string()),
+                    ("display", &active.instance.display_slot),
+                ],
             ),
             "app",
             mtm,
@@ -531,7 +547,7 @@ fn populate(
             mtm,
         );
         let release = ui::button(
-            "Stop and Release",
+            &tr("Stop and Release"),
             handler,
             sel!(releaseDisplayAttachment:),
             0,
@@ -539,7 +555,7 @@ fn populate(
         );
         unsafe {
             let _: () = msg_send![&*release, setIdentifier: &*NSString::from_str(&active.profile_id.to_string())];
-            let _: () = msg_send![&*release, setToolTip: &*NSString::from_str("Stop this managed application and release its display")];
+            let _: () = msg_send![&*release, setToolTip: &*NSString::from_str(&tr("Stop this managed application and release its display"))];
         }
         actions(content, &body, &[release], mtm);
         add_card(content, &body, mtm);
@@ -553,8 +569,8 @@ fn populate(
     if sessions.is_empty() {
         let body = card_body(
             content,
-            "No application policies",
-            "Create an application profile to choose its display policy.",
+            &tr("No application policies"),
+            &tr("Create an application profile to choose its display policy."),
             "app.dashed",
             mtm,
         );

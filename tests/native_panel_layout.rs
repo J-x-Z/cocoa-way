@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[path = "../src/i18n.rs"]
+#[allow(unused_imports)] // This standalone harness does not run nested #[test] items.
+mod i18n;
 #[path = "../src/container_mode/native_layout.rs"]
 mod native_layout;
 
@@ -50,8 +53,20 @@ fn main() {
     let mut labels = Vec::new();
     for index in 0..20 {
         let body = ui::stack(true, 12.0, mtm);
-        let title = page.label(&format!("Application {index}: a long name that must wrap instead of colliding with the next row"), TextStyle::Heading, mtm);
-        let detail = page.label("A saved display policy with a long explanation. It must remain readable at narrow and wide logical widths without truncation or overlapping another card.", TextStyle::Body, mtm);
+        let title_text = if index % 2 == 0 {
+            format!(
+                "Application {index}: a long name that must wrap instead of colliding with the next row"
+            )
+        } else {
+            format!("应用 {index}：用于检查中文长名称与中英混排的显示窗口，不应与下一行重叠")
+        };
+        let title = page.label(&title_text, TextStyle::Heading, mtm);
+        let detail_text = if index % 2 == 0 {
+            "A saved display policy with a long explanation. It must remain readable at narrow and wide logical widths without truncation or overlapping another card."
+        } else {
+            "已保存的显示策略仅在应用启动时生效，不会预先占用窗口。自动分配和独立原生窗口都必须在窄窗口与宽窗口中完整换行，不能超出卡片边界。"
+        };
+        let detail = page.label(detail_text, TextStyle::Body, mtm);
         let socket = page.label(
             &format!(
                 "/a/very/long/socket/path/{}/wayland-1",
@@ -69,19 +84,24 @@ fn main() {
             ui::arranged(&body, label, true);
         }
         labels.extend([title, detail, socket]);
-        if index == 0 {
-            let buttons: Vec<Retained<NSButton>> =
+        if index < i18n::Language::ALL.len() - 1 {
+            let language = i18n::Language::ALL[index + 1];
+            let action_titles = if index < 2 {
                 ["Focus Window", "Copy Connection", "Close Display"]
-                    .iter()
-                    .map(|title| unsafe {
-                        NSButton::buttonWithTitle_target_action(
-                            &NSString::from_str(title),
-                            None,
-                            None,
-                            mtm,
-                        )
-                    })
-                    .collect();
+            } else {
+                ["Launch", "Settings...", "Delete"]
+            };
+            let buttons: Vec<Retained<NSButton>> = action_titles
+                .iter()
+                .map(|title| unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        &NSString::from_str(&i18n::tr_for(language, title)),
+                        None,
+                        None,
+                        mtm,
+                    )
+                })
+                .collect();
             let actions = ResponsiveActions::new(&buttons, mtm);
             ui::arranged(&body, &actions.stack, true);
             page.actions.push(actions);
