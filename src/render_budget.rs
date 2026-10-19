@@ -191,6 +191,20 @@ impl TextureBudget {
             state.waiters.push(Arc::downgrade(wake));
         }
     }
+
+    fn wake_waiters(&self) {
+        let waiters = std::mem::take(&mut self.state.lock().unwrap().waiters);
+        Self::notify_waiters(waiters);
+    }
+
+    fn notify_waiters(waiters: Vec<Weak<BudgetWake>>) {
+        // Never call window code under the global budget or frame reader lock.
+        for wake in waiters.into_iter().filter_map(|wake| wake.upgrade()) {
+            if wake.waiting.swap(false, Ordering::AcqRel) {
+                (wake.notify)();
+            }
+        }
+    }
 }
 
 pub(crate) struct TextureReservation {
@@ -229,6 +243,31 @@ impl TextureReservation {
         let previous = self.readers.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
     }
+
+    /// Call after publishing frame completion, outside its reader lock. Cached
+    /// retired storage is now reclaimable even though its charge has not dropped.
+    pub(crate) fn notify_reclaimable(reservations: &[Arc<Self>]) -> bool {
+        let mut reclaim = false;
+        let mut budgets: Vec<&Arc<TextureBudget>> = Vec::new();
+        for reservation in reservations {
+            if reservation.is_retired() {
+                reclaim = true;
+                if !reservation.has_readers()
+                    && !budgets
+                        .iter()
+                        .any(|budget| Arc::ptr_eq(budget, &reservation.budget))
+                {
+                    budgets.push(&reservation.budget);
+                }
+            }
+        }
+        // One notification per budget/completion batch, even if a callback
+        // rearms admission while several textures became reclaimable together.
+        for budget in budgets {
+            budget.wake_waiters();
+        }
+        reclaim
+    }
 }
 
 impl Drop for TextureReservation {
@@ -249,12 +288,7 @@ impl Drop for TextureReservation {
             }
             std::mem::take(&mut state.waiters)
         };
-        // Never call window code under the global budget lock.
-        for wake in waiters.into_iter().filter_map(|wake| wake.upgrade()) {
-            if wake.waiting.swap(false, Ordering::AcqRel) {
-                (wake.notify)();
-            }
-        }
+        TextureBudget::notify_waiters(waiters);
     }
 }
 

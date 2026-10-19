@@ -19,6 +19,20 @@ mod probe_marker;
 mod render;
 
 #[test]
+fn rejected_uploads_wire_frame_trace_discard_before_cached_fallback() {
+    let source = include_str!("../src/presentation.rs");
+    let (_, render) = source.split_once("fn render_surface_tree(").unwrap();
+    let (render, finish) = render.split_once("fn finish_buffer_upload(").unwrap();
+    let (_, call) = render
+        .split_once("rendered += finish_buffer_upload(")
+        .unwrap();
+    assert!(call.contains("|| renderer.discard_trace_frame(),"));
+    let (_, rejected) = finish.split_once("PixelDrawResult::Rejected => {").unwrap();
+    let (rejected, _) = rejected.split_once("fn buffer_damage_rects(").unwrap();
+    assert!(rejected.find("discard_trace();").unwrap() < rejected.find("draw_cached()").unwrap());
+}
+
+#[test]
 fn commit_trace_captures_arrival_before_marker_decode() {
     // Keep the isolated harness independent of AppState and the in-flight UI edits.
     let state = include_str!("../src/state.rs");

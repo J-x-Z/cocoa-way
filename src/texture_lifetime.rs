@@ -117,9 +117,7 @@ impl FrameLifetime {
         self.completed.store(true, Ordering::Release);
         // Publish completion BEFORE checking retirement: if retirement races us,
         // either its pruning sees an idle slot or this check requests maintenance.
-        let reclaim = reservations
-            .iter()
-            .any(|reservation| reservation.is_retired());
+        let reclaim = TextureReservation::notify_reclaimable(&reservations);
         drop(reservations); // Budget callbacks run outside the frame's reader lock.
         self.gate.release() || reclaim
     }
@@ -655,6 +653,190 @@ mod tests {
     fn read_accounted(versions: &mut TextureVersions<AccountedPixels>, frame: &Arc<FrameLifetime>) {
         versions.mark_read(frame);
         frame.retain_reservation(&versions.current().unwrap().reservation);
+    }
+
+    #[test]
+    fn retired_last_reader_wakes_another_window_before_its_cached_spare_is_dropped() {
+        for order in [[0, 1], [1, 0]] {
+            let budget = TextureBudget::new(8, 2);
+            let owner = BudgetWake::new(|| {});
+            let gate = Arc::new(FrameGate::default());
+            let readers = [gate.begin().unwrap(), gate.begin().unwrap()];
+            let weak_readers = readers.each_ref().map(Arc::downgrade);
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let callback_count = callbacks.clone();
+            let callback_budget = budget.clone();
+            let waiter = BudgetWake::new(move || {
+                for reader in &weak_readers {
+                    if let Some(frame) = reader.upgrade() {
+                        assert!(frame.completed.load(Ordering::Acquire));
+                        assert!(frame.reservations.try_lock().is_ok());
+                    }
+                }
+                // Reenter the budget to prove notification holds neither lock.
+                assert!(!callback_budget.has_reclaimable_readers());
+                callback_count.fetch_add(1, Ordering::Relaxed);
+            });
+            let mut versions = TextureVersions::new();
+            let mut allocations = 0;
+            accounted_upload(&mut versions, &budget, &owner, 4, 1, &mut allocations).unwrap();
+            for reader in &readers {
+                read_accounted(&mut versions, reader);
+            }
+            accounted_upload(&mut versions, &budget, &owner, 4, 2, &mut allocations).unwrap();
+            let spare = Arc::downgrade(&versions.versions[0].resource.reservation);
+            assert!(matches!(
+                budget.try_reserve(4, &waiter),
+                Err(BudgetError::Pressure)
+            ));
+            budget.defer(&waiter);
+            assert_eq!(versions.prune_idle(), 0);
+
+            readers[order[0]].complete();
+            assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+            readers[order[1]].complete();
+            assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+            assert!(!readers[order[1]].complete());
+            // Normal maintenance still retains the spare and its full charge.
+            assert_eq!(versions.retain_idle_spare(|_| true), 0);
+            assert!(spare.upgrade().is_some());
+            assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+
+            // The awakened window's pressure sweep, not the owner's redraw,
+            // reclaims storage and admits its pending upload.
+            assert_eq!(versions.prune_idle(), 1);
+            assert!(spare.upgrade().is_none());
+            let admitted = budget.try_reserve(4, &waiter).unwrap();
+            assert_eq!(*versions.current().unwrap().pixels.lock().unwrap(), [2; 4]);
+            drop(admitted);
+        }
+    }
+
+    #[test]
+    fn retired_completion_coalesces_budget_wakes_and_idle_current_readers_do_not_spin() {
+        let budget = TextureBudget::new(8, 2);
+        let owner = BudgetWake::new(|| {});
+        let resources = [
+            budget.reserve(4, &owner).unwrap(),
+            budget.reserve(4, &owner).unwrap(),
+        ];
+        let gate = Arc::new(FrameGate::default());
+        let frame = gate.begin().unwrap();
+        for reservation in &resources {
+            reservation.set_retired(true);
+            frame.retain_reservation(reservation);
+        }
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback_count = callbacks.clone();
+        let callback_budget = budget.clone();
+        let waiter_slot = Arc::new(std::sync::OnceLock::<Weak<BudgetWake>>::new());
+        let callback_waiter = waiter_slot.clone();
+        let waiter = BudgetWake::new(move || {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+            // A rearmed waiter must not be notified once per retired texture
+            // from the same frame/budget. Only a later change can wake it again.
+            if let Some(waiter) = callback_waiter.get().and_then(Weak::upgrade) {
+                callback_budget.defer(&waiter);
+            }
+        });
+        waiter_slot.set(Arc::downgrade(&waiter)).unwrap();
+        assert!(matches!(
+            budget.try_reserve(1, &waiter),
+            Err(BudgetError::Pressure)
+        ));
+        for _ in 0..8 {
+            budget.defer(&waiter);
+        }
+        frame.complete();
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert!(!frame.complete());
+
+        for reservation in &resources {
+            reservation.set_retired(false);
+        }
+        let idle_redraw = gate.begin().unwrap();
+        idle_redraw.retain_reservation(&resources[0]);
+        assert!(!idle_redraw.complete());
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pressure_reclaims_retired_storage_with_completion_before_or_after_wait_registration() {
+        for completion_first in [false, true] {
+            let budget = TextureBudget::new(8, 2);
+            let owner = BudgetWake::new(|| {});
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let callback_count = callbacks.clone();
+            let waiter = BudgetWake::new(move || {
+                callback_count.fetch_add(1, Ordering::Relaxed);
+            });
+            let gate = Arc::new(FrameGate::default());
+            let frame = gate.begin().unwrap();
+            let mut versions = TextureVersions::new();
+            let mut allocations = 0;
+            accounted_upload(&mut versions, &budget, &owner, 4, 1, &mut allocations).unwrap();
+            read_accounted(&mut versions, &frame);
+            accounted_upload(&mut versions, &budget, &owner, 4, 2, &mut allocations).unwrap();
+
+            if completion_first {
+                frame.complete();
+            }
+            assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+            assert!(matches!(
+                budget.try_reserve(4, &waiter),
+                Err(BudgetError::Pressure)
+            ));
+            assert_eq!(versions.prune_idle(), usize::from(completion_first));
+            if !completion_first {
+                budget.defer(&waiter);
+                frame.complete();
+                assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+                assert_eq!(versions.prune_idle(), 1);
+            }
+            assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+            assert!(budget.try_reserve(4, &waiter).is_ok());
+            assert_eq!(*versions.current().unwrap().pixels.lock().unwrap(), [2; 4]);
+        }
+    }
+
+    #[test]
+    fn completion_racing_cross_window_pressure_is_prunable_or_wakes_the_waiter() {
+        for _ in 0..100 {
+            let budget = TextureBudget::new(8, 2);
+            let owner = BudgetWake::new(|| {});
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let callback_count = callbacks.clone();
+            let waiter = BudgetWake::new(move || {
+                callback_count.fetch_add(1, Ordering::Relaxed);
+            });
+            let gate = Arc::new(FrameGate::default());
+            let frame = gate.begin().unwrap();
+            let mut versions = TextureVersions::new();
+            let mut allocations = 0;
+            accounted_upload(&mut versions, &budget, &owner, 4, 1, &mut allocations).unwrap();
+            read_accounted(&mut versions, &frame);
+            accounted_upload(&mut versions, &budget, &owner, 4, 2, &mut allocations).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let completion_barrier = barrier.clone();
+            let completion = std::thread::spawn(move || {
+                completion_barrier.wait();
+                frame.complete();
+            });
+            barrier.wait();
+            assert!(matches!(
+                budget.try_reserve(4, &waiter),
+                Err(BudgetError::Pressure)
+            ));
+            let removed = versions.prune_idle();
+            if removed == 0 {
+                budget.defer(&waiter);
+            }
+            completion.join().unwrap();
+            assert!(removed != 0 || callbacks.load(Ordering::Relaxed) != 0);
+            versions.prune_idle();
+            assert!(budget.try_reserve(4, &waiter).is_ok());
+            assert_eq!(*versions.current().unwrap().pixels.lock().unwrap(), [2; 4]);
+        }
     }
 
     #[test]

@@ -604,6 +604,7 @@ fn render_surface_tree(
                         buffer,
                         damage,
                         result,
+                        || renderer.discard_trace_frame(),
                         || renderer.draw_from_cache(&surface_id, x, y, scale, mapping),
                         |buffer| buffer.release(),
                     );
@@ -640,6 +641,7 @@ fn finish_buffer_upload(
     buffer: smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
     damage: Vec<smithay::wayland::compositor::Damage>,
     result: crate::metal_renderer::PixelDrawResult,
+    discard_trace: impl FnOnce(),
     draw_cached: impl FnOnce() -> bool,
     release: impl FnOnce(&smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer),
 ) -> usize {
@@ -660,6 +662,9 @@ fn finish_buffer_upload(
             1
         }
         PixelDrawResult::Rejected => {
+            // A fallback is not the rejected commit's image. Drop coverage for
+            // the whole render frame rather than attribute old pixels to it.
+            discard_trace();
             let rendered = usize::from(draw_cached());
             release(&buffer);
             rendered
@@ -1216,6 +1221,7 @@ mod tests {
                 buffer.clone(),
                 damage,
                 PixelDrawResult::Deferred,
+                || panic!("deferred upload discarded frame correlations"),
                 || {
                     cache_draws.set(cache_draws.get() + 1);
                     cached
@@ -1256,6 +1262,7 @@ mod tests {
                 buffer,
                 damage,
                 result,
+                || panic!("non-rejected upload discarded frame correlations"),
                 || {
                     assert_ne!(result, PixelDrawResult::Drawn);
                     true
@@ -1273,21 +1280,39 @@ mod tests {
     }
 
     #[test]
-    fn rejected_upload_releases_once_and_can_draw_the_previous_cache() {
+    fn rejected_upload_discards_frame_correlations_before_fallback_and_releases_once() {
         let display = Display::<()>::new().unwrap();
         for cached in [false, true] {
             let mut current = SurfaceAttributes::default();
+            let callback =
+                smithay::reexports::wayland_server::protocol::wl_callback::WlCallback::from_id(
+                    &display.handle(),
+                    ObjectId::null(),
+                )
+                .unwrap();
+            current.frame_callbacks.push(callback.clone());
+            let correlations = std::cell::RefCell::new(vec![11, 22]);
+            let discards = std::cell::Cell::new(0);
             let releases = std::cell::Cell::new(0);
             let rendered = super::finish_buffer_upload(
                 &mut current,
                 inert_buffer(&display.handle()),
                 original_upload_damage(),
                 PixelDrawResult::Rejected,
-                || cached,
+                || {
+                    correlations.borrow_mut().clear();
+                    discards.set(discards.get() + 1);
+                },
+                || {
+                    assert!(correlations.borrow().is_empty());
+                    cached
+                },
                 |_| releases.set(releases.get() + 1),
             );
             assert_eq!(rendered, usize::from(cached));
+            assert_eq!(discards.get(), 1);
             assert_eq!(releases.get(), 1);
+            assert_eq!(current.frame_callbacks, [callback]);
             assert!(current.buffer.is_none());
             assert!(current.damage.is_empty());
         }
