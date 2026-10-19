@@ -214,7 +214,7 @@ fn activate_application() {
     }
 }
 
-fn open_panel(page: crate::container_mode::PanelPage) {
+pub(crate) fn open_panel(page: crate::container_mode::PanelPage) {
     let Some(tx) = sender() else {
         return;
     };

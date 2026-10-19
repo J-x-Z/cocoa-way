@@ -4306,6 +4306,7 @@ fn create_event_handler(
                 CompositorMessage::StartupDiagnosticsFinished(report) => {
                     container_mode::finish_startup_diagnostics(report);
                 }
+                CompositorMessage::OpenPanel(page) => menu_bar::open_panel(page),
                 CompositorMessage::ShowDefaultDisplay => {
                     if display_worker_slot.is_none() {
                         reveal_first_desktop_client = false;

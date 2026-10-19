@@ -15,7 +15,7 @@ const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 fn main() {
-    let socket = parse_socket_argument().unwrap_or_else(|error| fail(&error));
+    let options = parse_arguments(std::env::args().skip(1)).unwrap_or_else(|error| fail(&error));
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let mut initialized = false;
@@ -24,7 +24,12 @@ fn main() {
         let response = match line {
             Ok(line) if line.trim().is_empty() => None,
             Ok(line) => match serde_json::from_str::<Value>(&line) {
-                Ok(message) => handle_message(&message, &socket, &mut initialized),
+                Ok(message) => handle_message(
+                    &message,
+                    &options.socket,
+                    &mut initialized,
+                    options.allow_control,
+                ),
                 Err(error) => Some(json_rpc_error(
                     Value::Null,
                     -32700,
@@ -52,18 +57,41 @@ fn main() {
     }
 }
 
-fn parse_socket_argument() -> Result<PathBuf, String> {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments.is_empty() {
-        return Ok(control_client::default_socket_path());
-    }
-    if arguments.len() == 2 && arguments[0] == "--socket" {
-        return Ok(PathBuf::from(&arguments[1]));
-    }
-    Err("usage: cocoa-way-mcp [--socket PATH]".into())
+struct Options {
+    socket: PathBuf,
+    allow_control: bool,
 }
 
-fn handle_message(message: &Value, socket: &Path, initialized: &mut bool) -> Option<Value> {
+fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Options, String> {
+    let mut arguments = arguments.into_iter();
+    let mut socket = None;
+    let mut allow_control = false;
+    let usage = "usage: cocoa-way-mcp [--socket PATH] [--allow-control] (read-only by default)";
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--socket" if socket.is_none() => {
+                let path = arguments.next().ok_or(usage)?;
+                if path.is_empty() || path.starts_with("--") {
+                    return Err(usage.into());
+                }
+                socket = Some(PathBuf::from(path));
+            }
+            "--allow-control" if !allow_control => allow_control = true,
+            _ => return Err(usage.into()),
+        }
+    }
+    Ok(Options {
+        socket: socket.unwrap_or_else(control_client::default_socket_path),
+        allow_control,
+    })
+}
+
+fn handle_message(
+    message: &Value,
+    socket: &Path,
+    initialized: &mut bool,
+    allow_control: bool,
+) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(json_rpc_error(Value::Null, -32600, "Invalid Request"));
     };
@@ -90,10 +118,16 @@ fn handle_message(message: &Value, socket: &Path, initialized: &mut bool) -> Opt
     }
 
     match method {
-        "initialize" => Some(json_rpc_success(id, initialize_result(&params))),
+        "initialize" => Some(json_rpc_success(
+            id,
+            initialize_result(&params, allow_control),
+        )),
         "ping" => Some(json_rpc_success(id, json!({}))),
-        "tools/list" if *initialized => Some(json_rpc_success(id, json!({ "tools": tools() }))),
-        "tools/call" if *initialized => match call_tool(&params, socket) {
+        "tools/list" if *initialized => Some(json_rpc_success(
+            id,
+            json!({ "tools": tools(allow_control) }),
+        )),
+        "tools/call" if *initialized => match call_tool(&params, socket, allow_control) {
             Ok(result) => Some(json_rpc_success(id, result)),
             Err(error) => Some(json_rpc_error(id, -32602, error)),
         },
@@ -104,7 +138,7 @@ fn handle_message(message: &Value, socket: &Path, initialized: &mut bool) -> Opt
     }
 }
 
-fn initialize_result(params: &Value) -> Value {
+fn initialize_result(params: &Value, allow_control: bool) -> Value {
     let requested = params
         .get("protocolVersion")
         .and_then(Value::as_str)
@@ -121,14 +155,36 @@ fn initialize_result(params: &Value) -> Value {
             "name": "cocoa-way-mcp",
             "title": "Cocoa-Way Local Control",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Read-only local diagnostics and guided setup for Cocoa-Way applications, connections, and container resources."
+            "description": "Local diagnostics and guided setup, with explicitly opt-in bounded application/display controls."
         },
-        "instructions": "This server is local and read-only. Use its onboarding and template tools to prepare image, application, and connection settings. Review generated commands in Cocoa-Way; launch, stop, and delete remain explicit user actions."
+        "instructions": if allow_control {
+            "Local control was explicitly enabled with --allow-control. Read-only diagnostics and templates remain available. Only the listed panel, profile check/launch/stop, and managed display controls are permitted. Profile actions require persistent 32-lowercase-hex IDs, never names, indices, commands, or config writes. Queue acceptance is not completion or success; inspect status, tasks, running, and displays afterward. No container/image/volume delete, shell execution, or file/network settings APIs are exposed."
+        } else {
+            "This server is local and read-only. Use diagnostics and template tools without saving or launching anything. Mutating tools are neither listed nor callable. Only an explicit server restart with --allow-control enables bounded panel/profile/display controls; tool arguments cannot enable control. Review generated setup in Cocoa-Way. No container/image/volume delete, shell execution, or file/network settings APIs are exposed."
+        }
     })
 }
 
-fn tools() -> Vec<Value> {
-    vec![
+fn tools(allow_control: bool) -> Vec<Value> {
+    let mut catalog = vec![
+        read_only_tool(
+            "cocoa_way_debug_snapshot",
+            "Cocoa-Way cached debug snapshot",
+            "Read a redacted cached snapshot of status, applications, running instances, displays, and features. No subprocess probes or VM startup; cached state may be stale.",
+            empty_schema(),
+        ),
+        read_only_tool(
+            "cocoa_way_performance",
+            "Cocoa-Way performance",
+            "Read host/display performance, cursor paths, resources, and measurement_limits. Sampled CPU-side timings are not end-to-end latency, GPU completion, or proof of physical presentation. No invented percentiles; missing samples are not zero.",
+            empty_schema(),
+        ),
+        read_only_tool(
+            "cocoa_way_clipboard",
+            "Cocoa-Way clipboard metadata",
+            "Read clipboard bridge metadata only, never clipboard contents. Does not start a VM or subprocess.",
+            empty_schema(),
+        ),
         read_only_tool(
             "cocoa_way_onboarding",
             "Cocoa-Way onboarding",
@@ -302,7 +358,101 @@ fn tools() -> Vec<Value> {
                 "additionalProperties": false
             }),
         ),
-    ]
+    ];
+    if allow_control {
+        catalog.extend(control_tools());
+    }
+    for tool in &mut catalog {
+        bound_schema(&mut tool["inputSchema"]);
+    }
+    catalog
+}
+
+const PROFILE_PATTERN: &str = "^[0-9a-f]{32}$";
+const DISPLAY_PATTERN: &str = "^[a-z0-9]+(-[a-z0-9]+)*$";
+
+fn control_tools() -> Vec<Value> {
+    let mut catalog = vec![action_tool(
+        "cocoa_way_open_panel",
+        "Open Cocoa-Way panel",
+        "Queue opening an applications, displays, or diagnostics panel. Queue acceptance is not completion or success.",
+        json!({"type": "object", "properties": {
+            "page": {"type": "string", "enum": ["applications", "displays", "diagnostics"], "default": "applications"}
+        }, "additionalProperties": false}),
+    )];
+    for (name, title, description) in [
+        (
+            "cocoa_way_check",
+            "Check Cocoa-Way profile",
+            "Queue a profile readiness check, which may start runtime work. Queue acceptance is not readiness or success.",
+        ),
+        (
+            "cocoa_way_launch",
+            "Launch Cocoa-Way profile",
+            "Queue launching an existing profile; may start a VM/application. Queue acceptance is not launch success.",
+        ),
+        (
+            "cocoa_way_stop",
+            "Stop Cocoa-Way profile",
+            "Queue stopping a profile's active instances; unsaved application work may be lost. Queue acceptance is not stop success.",
+        ),
+    ] {
+        catalog.push(action_tool(name, title, description, json!({
+            "type": "object", "properties": {
+                "profile_id": {"type": "string", "minLength": 32, "maxLength": 32,
+                    "pattern": PROFILE_PATTERN, "description": "Persistent profile ID from cocoa_way_applications; names and indices are forbidden."}
+            }, "required": ["profile_id"], "additionalProperties": false
+        })));
+    }
+    for (name, title, description, required) in [
+        (
+            "cocoa_way_display_create",
+            "Create Cocoa-Way display",
+            "Queue creating a managed display, automatically named if name is omitted. Queue acceptance is not creation success.",
+            false,
+        ),
+        (
+            "cocoa_way_display_close",
+            "Close Cocoa-Way display",
+            "Queue closing a named managed display; may disrupt attached applications. Queue acceptance is not closure success.",
+            true,
+        ),
+    ] {
+        let mut schema = json!({"type": "object", "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": DISPLAY_PATTERN,
+                "description": "Canonical lowercase alphanumeric slot with single internal hyphens; auto, default, dedicated are forbidden."}
+        }, "additionalProperties": false});
+        if required {
+            schema["required"] = json!(["name"]);
+        }
+        catalog.push(action_tool(name, title, description, schema));
+    }
+    catalog
+}
+
+fn action_tool(name: &str, title: &str, description: &str, schema: Value) -> Value {
+    let mut tool = read_only_tool(name, title, description, schema);
+    tool["annotations"]["readOnlyHint"] = json!(false);
+    tool["annotations"]["idempotentHint"] = json!(false);
+    tool["annotations"]["openWorldHint"] = json!(true);
+    tool["annotations"]["destructiveHint"] =
+        json!(matches!(name, "cocoa_way_stop" | "cocoa_way_display_close"));
+    tool
+}
+
+fn bound_schema(schema: &mut Value) {
+    if schema["type"] == "string" && schema.get("maxLength").is_none() {
+        schema["maxLength"] = json!(4096);
+    }
+    if schema["type"] == "array" {
+        schema["maxItems"] = json!(32);
+        bound_schema(&mut schema["items"]);
+    }
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        for property in properties.values_mut() {
+            bound_schema(property);
+        }
+    }
 }
 
 fn read_only_tool(name: &str, title: &str, description: &str, input_schema: Value) -> Value {
@@ -335,7 +485,99 @@ fn diagnostics_schema() -> Value {
     })
 }
 
-fn call_tool(params: &Value, socket: &Path) -> Result<Value, String> {
+fn validate_arguments(value: &Value, schema: &Value, field: &str) -> Result<(), String> {
+    let invalid = || format!("invalid {field}: arguments must match the tool input schema");
+    match schema["type"].as_str() {
+        Some("object") => {
+            let object = value.as_object().ok_or_else(invalid)?;
+            if let Some(required) = schema["required"].as_array() {
+                for key in required.iter().filter_map(Value::as_str) {
+                    if !object.contains_key(key) {
+                        return Err(format!("{field}.{key} is required"));
+                    }
+                }
+            }
+            for (key, value) in object {
+                let property = schema["properties"]
+                    .get(key)
+                    .ok_or_else(|| format!("unknown argument: {field}.{key}"))?;
+                validate_arguments(value, property, key)?;
+            }
+        }
+        Some("string") => {
+            let text = value.as_str().ok_or_else(invalid)?;
+            let length = text.chars().count() as u64;
+            if text.contains('\0')
+                || length < schema["minLength"].as_u64().unwrap_or(0)
+                || length > schema["maxLength"].as_u64().unwrap_or(4096)
+            {
+                return Err(invalid());
+            }
+            match schema["pattern"].as_str() {
+                Some(PROFILE_PATTERN)
+                    if !text
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) =>
+                {
+                    return Err(invalid());
+                }
+                Some(DISPLAY_PATTERN)
+                    if matches!(text, "auto" | "default" | "dedicated")
+                        || !text.split('-').all(|part| {
+                            !part.is_empty()
+                                && part
+                                    .bytes()
+                                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                        }) =>
+                {
+                    return Err(invalid());
+                }
+                _ => {}
+            }
+        }
+        Some("integer") => {
+            let number = value.as_u64().ok_or_else(invalid)?;
+            if number < schema["minimum"].as_u64().unwrap_or(0)
+                || number > schema["maximum"].as_u64().unwrap_or(u64::MAX)
+            {
+                return Err(invalid());
+            }
+        }
+        Some("boolean") if value.is_boolean() => {}
+        Some("array") => {
+            let values = value.as_array().ok_or_else(invalid)?;
+            if values.len() as u64 > schema["maxItems"].as_u64().unwrap_or(32) {
+                return Err(invalid());
+            }
+            for value in values {
+                validate_arguments(value, &schema["items"], field)?;
+            }
+        }
+        _ => return Err(invalid()),
+    }
+    if let Some(choices) = schema["enum"].as_array()
+        && !choices.contains(value)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn call_tool(params: &Value, socket: &Path, allow_control: bool) -> Result<Value, String> {
+    let object = params
+        .as_object()
+        .ok_or("tools/call params must be an object")?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "name" | "arguments" | "_meta"))
+    {
+        return Err("unknown tools/call parameter".into());
+    }
+    if let Some(meta) = object.get("_meta")
+        && !meta.is_object()
+    {
+        return Err("tools/call _meta must be an object".into());
+    }
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -344,6 +586,20 @@ fn call_tool(params: &Value, socket: &Path) -> Result<Value, String> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let tool = tools(allow_control)
+        .into_iter()
+        .find(|tool| tool["name"] == name)
+        .ok_or_else(|| {
+            format!("Unknown or disabled tool: {name}; controls require --allow-control")
+        })?;
+    if serde_json::to_vec(&arguments)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 16 * 1024
+    {
+        return Err("tool arguments exceed the 16 KiB limit".into());
+    }
+    validate_arguments(&arguments, &tool["inputSchema"], "arguments")?;
     if name == "cocoa_way_issue_draft" {
         return issue_draft(&arguments, socket);
     }
@@ -355,6 +611,46 @@ fn call_tool(params: &Value, socket: &Path) -> Result<Value, String> {
         _ => {}
     }
     let (command, session, limit) = match name {
+        "cocoa_way_debug_snapshot" => ("debug-snapshot", None, 100),
+        "cocoa_way_performance" => ("performance", None, 100),
+        "cocoa_way_clipboard" => ("clipboard", None, 100),
+        "cocoa_way_open_panel" => (
+            "open-panel",
+            Some(
+                arguments
+                    .get("page")
+                    .and_then(Value::as_str)
+                    .unwrap_or("applications")
+                    .into(),
+            ),
+            100,
+        ),
+        "cocoa_way_check" | "cocoa_way_launch" | "cocoa_way_stop" => (
+            match name {
+                "cocoa_way_check" => "check",
+                "cocoa_way_launch" => "launch",
+                _ => "stop",
+            },
+            Some(
+                arguments["profile_id"]
+                    .as_str()
+                    .ok_or("profile_id is required")?
+                    .into(),
+            ),
+            100,
+        ),
+        "cocoa_way_display_create" | "cocoa_way_display_close" => (
+            if name == "cocoa_way_display_create" {
+                "display-create"
+            } else {
+                "display-close"
+            },
+            arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            100,
+        ),
         "cocoa_way_status" => ("status", None, 10),
         "cocoa_way_applications" => ("applications", None, 100),
         "cocoa_way_sessions" => ("applications", None, 100),
@@ -633,8 +929,7 @@ fn tool_limit(arguments: &Value) -> usize {
     arguments
         .get("limit")
         .and_then(Value::as_u64)
-        .unwrap_or(100)
-        .clamp(1, 1000) as usize
+        .unwrap_or(100) as usize
 }
 
 fn send_control_tool(socket: &Path, request: &ControlRequest) -> Result<Value, String> {
@@ -752,6 +1047,7 @@ mod tests {
             }),
             Path::new("/tmp/missing.sock"),
             &mut initialized,
+            false,
         )
         .unwrap();
         assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
@@ -760,7 +1056,7 @@ mod tests {
 
     #[test]
     fn tool_catalog_is_read_only() {
-        let catalog = tools();
+        let catalog = tools(false);
         assert!(catalog.iter().all(|tool| {
             tool["annotations"]["readOnlyHint"] == true
                 && tool["annotations"]["destructiveHint"] == false
@@ -792,7 +1088,7 @@ mod tests {
 
     #[test]
     fn issue_draft_is_declared_read_only() {
-        let tool = tools()
+        let tool = tools(false)
             .into_iter()
             .find(|tool| tool["name"] == "cocoa_way_issue_draft")
             .unwrap();
@@ -945,6 +1241,7 @@ mod tests {
             }),
             &path,
             &mut initialized,
+            false,
         )
         .unwrap();
         assert_eq!(response["result"]["isError"], true);
@@ -952,6 +1249,7 @@ mod tests {
             &json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
             &path,
             &mut initialized,
+            false,
         )
         .unwrap();
         assert!(ping["result"].is_object());
@@ -965,8 +1263,13 @@ mod tests {
             &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
             Path::new("/tmp/missing.sock"),
             &mut initialized,
+            false,
         )
         .unwrap();
         assert_eq!(response["error"]["code"], -32002);
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/cocoa_way_mcp/control.rs"]
+mod mcp_control;

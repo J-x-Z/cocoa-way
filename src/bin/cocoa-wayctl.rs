@@ -89,8 +89,10 @@ fn run() -> Result<ControlResponse, String> {
 fn print_help() {
     println!(
         "cocoa-wayctl [--json] [--socket PATH] [--limit N] COMMAND [SESSION]\n\n\
-         Commands:\n  status\n  applications\n  sessions (compatibility alias)\n  running\n  displays\n  images\n  volumes\n  runtimes\n  tasks\n  environment\n  features\n  diagnostics [APPLICATION]\n  logs APPLICATION\n  check APPLICATION\n  launch APPLICATION\n  stop APPLICATION\n  display-create [NAME]\n  display-close NAME\n\n\
-         APPLICATION is a persistent profile ID, an exact profile name, or the zero-based index shown by `applications`. Prefer IDs in automation; indices are only a current view. Display names are normalized to stable lowercase slots."
+         Commands:\n  status\n  debug-snapshot\n  performance\n  clipboard\n  applications\n  sessions (compatibility alias)\n  running\n  displays\n  images\n  volumes\n  runtimes\n  tasks\n  environment\n  features\n  diagnostics [APPLICATION]\n  logs APPLICATION\n  open-panel [applications|displays|diagnostics]\n  check APPLICATION\n  launch APPLICATION\n  stop APPLICATION\n  display-create [NAME]\n  display-close NAME\n\n\
+         debug-snapshot returns redacted cached status, applications, running, displays and features without subprocess probes or VM startup. performance reports sampled status/display performance and cursor paths, not end-to-end latency or proof of physical presentation. clipboard returns metadata only, never clipboard contents. These three read commands take no selector.\n\n\
+         open-panel queues a GUI panel request; its optional page is passed as the selector. Check, launch, stop and display commands also queue actions: acceptance is not completion or success. Inspect status, tasks, running and displays afterward.\n\n\
+         APPLICATION is a persistent profile ID, an exact profile name, or the zero-based index shown by `applications`. Prefer IDs in automation; indices are only a current view. Display names are normalized to stable lowercase slots. MCP is read-only unless explicitly started with --allow-control, and its profile actions accept only persistent 32-lowercase-hex IDs."
     );
 }
 

@@ -27,6 +27,7 @@ pub enum CompositorMessage {
     RootlessMinimize(smithay::reexports::wayland_server::backend::ObjectId),
     RootlessBeginMove(smithay::reexports::wayland_server::backend::ObjectId),
     ShowDefaultDisplay,
+    OpenPanel(crate::container_mode::PanelPage),
     StartupDiagnosticsFinished(crate::startup_diagnostics::Report),
     HideDefaultDisplay,
     DesktopToplevelCreated,

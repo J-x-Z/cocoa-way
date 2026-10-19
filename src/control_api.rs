@@ -226,6 +226,9 @@ fn dispatch(
         "applications" | "sessions" => ControlResponse::success(&command, sessions_snapshot()),
         "running" => ControlResponse::success(&command, active_sessions_json()),
         "displays" => ControlResponse::success(&command, displays_snapshot()),
+        "debug-snapshot" => ControlResponse::success(&command, debug_snapshot(path)),
+        "performance" => ControlResponse::success(&command, performance_snapshot(path)),
+        "clipboard" => ControlResponse::success(&command, json!(diagnostics::clipboard_snapshot())),
         "images" => ControlResponse::success(&command, images_snapshot()),
         "volumes" => ControlResponse::success(&command, volumes_snapshot()),
         "runtimes" => ControlResponse::success(&command, runtimes_snapshot()),
@@ -260,9 +263,10 @@ fn dispatch(
         "display-create" | "display-close" => {
             queue_display_command(&command, request.session.as_deref(), sender)
         }
+        "open-panel" => queue_panel_command(request.session.as_deref(), sender),
         _ => ControlResponse::failure(
             &command,
-            "unsupported command; use status, applications, running, displays, images, volumes, runtimes, tasks, environment, features, diagnostics, logs, check, launch, stop, display-create, or display-close",
+            "unsupported command; use status, applications, running, displays, debug-snapshot, performance, clipboard, images, volumes, runtimes, tasks, environment, features, diagnostics, logs, check, launch, stop, display-create, display-close, or open-panel",
         ),
     }
 }
@@ -343,6 +347,32 @@ fn stop_profile_id(
         return Ok(id);
     }
     resolve(selector).map(|(_, session)| session.id)
+}
+
+fn queue_panel_command(page: Option<&str>, sender: &Sender<CompositorMessage>) -> ControlResponse {
+    let page = page.unwrap_or("applications");
+    let target = match page {
+        "applications" => container_mode::PanelPage::Applications,
+        "displays" => container_mode::PanelPage::Displays,
+        "diagnostics" => container_mode::PanelPage::Diagnostics,
+        _ => {
+            return ControlResponse::failure(
+                "open-panel",
+                "page must be applications, displays, or diagnostics",
+            );
+        }
+    };
+    match queue_message(sender, CompositorMessage::OpenPanel(target)) {
+        Ok(()) => ControlResponse::success(
+            "open-panel",
+            json!({
+                "accepted": true,
+                "page": page,
+                "note": "Panel opening was queued; no application or container is started.",
+            }),
+        ),
+        Err(error) => ControlResponse::failure("open-panel", error),
+    }
 }
 
 fn session_command_message(command: &str, session: &ContainerSession) -> CompositorMessage {
@@ -515,6 +545,39 @@ fn status_snapshot(path: &Path) -> Value {
         "activity": container_mode::control_activity_snapshot(10),
         "tasks": container_mode::control_operation_tasks(20),
     })
+}
+
+fn debug_snapshot(path: &Path) -> Value {
+    // Cached state only: unlike full diagnostics, this never probes a runtime
+    // daemon or starts a subprocess, so it is safe to poll during input testing.
+    redact_value(json!({
+        "generated_at_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis()),
+        "status": status_snapshot(path),
+        "applications": sessions_snapshot(),
+        "displays": displays_snapshot(),
+        "features": feature_matrix_snapshot(),
+        "collection": "cached state and read-only configuration; no runtime subprocesses or network probes",
+        "privacy": "Diagnostic redaction is applied; clipboard contents are never included. Review before sharing.",
+    }))
+}
+
+fn performance_snapshot(path: &Path) -> Value {
+    let status = status_snapshot(path);
+    let displays = displays_snapshot();
+    redact_value(json!({
+        "host": status["performance"],
+        "displays": displays["performance"],
+        "cursor_paths": displays["cursor_paths"],
+        "resources": status["resources"],
+        "measurement_limits": {
+            "input_latency": "Host input to CPU submit is an estimate, not screen presentation or input-to-photon latency.",
+            "guest_clock": "No synchronized Guest receive timestamps are available in this snapshot.",
+            "percentiles": "A snapshot does not establish P50/P95/P99; collect correlated trace samples for a latency distribution.",
+            "freshness": "Per-display and resource entries include their own sampling timestamps. Idle displays may report zero FPS.",
+        },
+    }))
 }
 
 fn sessions_snapshot() -> Value {
@@ -761,7 +824,7 @@ fn feature_matrix_snapshot() -> Value {
         "automation": {
             "control_socket": "local Unix socket",
             "cli": "cocoa-wayctl",
-            "mcp": { "status": "read_only", "destructive_tools": false },
+            "mcp": { "status": "read_only_by_default", "optional_control_flag": "--allow-control", "control": ["open-panel", "check", "launch", "stop", "display-create", "display-close"], "destructive_tools": false },
         },
         "known_limits": [
             "Rootless Xwayland application projection is not available.",
@@ -1001,6 +1064,8 @@ mod tests {
             0
         );
         active_sessions_json();
+        debug_snapshot(Path::new("unused"));
+        performance_snapshot(Path::new("unused"));
         assert!(!path.exists());
         assert_eq!(entries(), before);
 
@@ -1032,6 +1097,53 @@ mod tests {
         assert!(status_snapshot(Path::new("unused"))["configuration_error"].is_string());
         assert!(sessions_snapshot()["error"].is_string());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "[invalid");
+    }
+
+    #[test]
+    fn panel_requests_queue_only_allowlisted_nonmodal_pages() {
+        let (sender, receiver) = crate::event_loop_signal::channel_with_waker(|| {});
+        for page in ["applications", "displays", "diagnostics"] {
+            let response = queue_panel_command(Some(page), &sender);
+            assert!(response.ok);
+            assert_eq!(response.data["accepted"], true);
+            assert_eq!(response.data["page"], page);
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(CompositorMessage::OpenPanel(_))
+            ));
+            sender.message_received();
+            assert!(!sender.finish_turn());
+        }
+        for page in ["settings", "shell", "../Applications", ""] {
+            assert!(!queue_panel_command(Some(page), &sender).ok);
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn performance_debug_snapshots_describe_evidence_limits_without_clipboard_contents() {
+        let performance = performance_snapshot(Path::new("unused"));
+        assert!(
+            performance["measurement_limits"]["input_latency"]
+                .as_str()
+                .unwrap()
+                .contains("not screen presentation")
+        );
+        assert!(
+            performance["measurement_limits"]["percentiles"]
+                .as_str()
+                .unwrap()
+                .contains("does not establish")
+        );
+        let snapshot = debug_snapshot(Path::new("unused"));
+        assert!(
+            snapshot["collection"]
+                .as_str()
+                .unwrap()
+                .contains("no runtime subprocesses")
+        );
+        assert!(snapshot["status"]["clipboard"].get("contents").is_none());
+        assert!(snapshot["status"]["clipboard"].get("text").is_none());
     }
 
     #[test]
@@ -1455,9 +1567,16 @@ mod tests {
     }
 
     #[test]
-    fn feature_matrix_keeps_automation_read_only() {
+    fn feature_matrix_documents_explicit_control_opt_in_without_resource_deletes() {
         let features = feature_matrix_snapshot();
-        assert_eq!(features["automation"]["mcp"]["status"], "read_only");
+        assert_eq!(
+            features["automation"]["mcp"]["status"],
+            "read_only_by_default"
+        );
+        assert_eq!(
+            features["automation"]["mcp"]["optional_control_flag"],
+            "--allow-control"
+        );
         assert_eq!(features["automation"]["mcp"]["destructive_tools"], false);
     }
 
