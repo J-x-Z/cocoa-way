@@ -114,6 +114,16 @@ class AuditTests(unittest.TestCase):
 
 
 class SourceAndProvenanceTests(unittest.TestCase):
+    def test_local_backend_lock_is_explicit_and_version_changes_need_review(self):
+        lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
+        checks.check_lock(lock)
+        backend = next(package for package in lock["package"] if package["name"] == "wayland-backend")
+        self.assertNotIn("source", backend)
+        self.assertEqual(backend["version"], "0.3.11")
+        backend["version"] = "0.3.12"
+        with self.assertRaisesRegex(ValueError, "Re-review"):
+            checks.check_lock(lock)
+
     def test_workflow_references_are_exact_verified_shas(self):
         for path in (ROOT / ".github/workflows").glob("*.yml"):
             checks.check_actions(path.read_text(), POLICY)
@@ -183,6 +193,20 @@ class SourceAndProvenanceTests(unittest.TestCase):
         }
         graph = checks.check_graph(metadata, POLICY, [])
         self.assertNotIn(("other-platform", "1"), graph)
+        backend = {"id": "backend", "name": "wayland-backend", "version": "0.3.11", "source": None,
+                   "manifest_path": str(ROOT / "vendor/wayland-backend/Cargo.toml")}
+        metadata["packages"].append(backend)
+        metadata["resolve"]["nodes"].append({"id": "backend", "dependencies": []})
+        metadata["resolve"]["nodes"][0]["dependencies"].append("backend")
+        self.assertIn(("wayland-backend", "0.3.11"), checks.check_graph(metadata, POLICY, []))
+        backend["version"] = "0.3.12"
+        with self.assertRaisesRegex(ValueError, "Re-review"):
+            checks.check_graph(metadata, POLICY, [])
+        backend["version"] = "0.3.11"
+        backend["manifest_path"] = str(ROOT / "unreviewed/wayland-backend/Cargo.toml")
+        with self.assertRaisesRegex(ValueError, "Unapproved local"):
+            checks.check_graph(metadata, POLICY, [])
+        backend["manifest_path"] = str(ROOT / "vendor/wayland-backend/Cargo.toml")
         metadata["resolve"]["nodes"][0]["dependencies"].append("cgmath")
         with self.assertRaisesRegex(ValueError, "consumers changed"):
             checks.check_graph(metadata, POLICY, [])

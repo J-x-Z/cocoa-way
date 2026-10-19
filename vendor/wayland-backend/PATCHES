@@ -1,0 +1,44 @@
+Upstream: wayland-backend 0.3.11, MIT (LICENSE.txt preserved).
+crates.io archive SHA-256:
+673a33c33048a5ade91a6b139580fa174e19fb0d23f396dca9fa15f2e1e49b35
+Upstream VCS: 3a45d67679d763cb813062530d50d0538f4312ae (wayland-backend).
+Copied verbatim from the installed registry source (including hidden files):
+$CARGO_HOME/registry/src/<registry>/wayland-backend-0.3.11
+The registry source was not edited; the initial copy was compared with diff -qr.
+The cached .crate archive SHA-256 was checked against the value above.
+
+Modified upstream files (all other copied files remain unchanged):
+src/server_api.rs
+  Add DispatchOutcome and dispatch_all_clients_with_budget(data, max_requests,
+  max_duration, client_quantum). Result type can be inferred by callers through
+  wayland-server Display::backend(), without a new direct dependency.
+src/rs/server_impl/common_poll.rs
+  Check count/time/quantum before each request, including display/registry paths.
+  Retain serial-qualified client IDs in a deduplicated round-robin queue across
+  calls; sample only one nonblocking readiness batch between quanta. Keep legacy
+  APIs unbounded and able to drain retained clients. Treat interrupted readiness
+  samples as empty instead of hiding the pending queue behind an error result.
+src/rs/server_impl/handle.rs
+  Explicitly deregister dead clients before dropping their original socket FDs,
+  including handler-initiated kills at budget boundaries. This prevents retained
+  socket duplicates from keeping stale Linux epoll registrations alive.
+src/sys/server_impl/mod.rs
+  Return io::ErrorKind::Unsupported without dispatch on the bounded API.
+
+Added vendored file: PATCHES (this file).
+Repository integration files: Cargo.toml ([patch.crates-io] only), Cargo.lock
+(remove only the registry source/checksum of wayland-backend), and new real
+socket integration tests in tests/backend_fairness.rs. No dependency upgrade.
+
+Caller contract: schedule an explicit continuation wake on more_pending; it can
+be conservative at a budget boundary, so stop wakes when a turn returns false.
+No idle polling and no reliance on FD readability for userspace-buffered input.
+Zero count, duration, or quantum consumes no requests. Time is cooperative:
+no hard preemption of a request/visibility/bind handler, parsing, destructor,
+cleanup, or scheduler overhead is promised. Only dispatched requests are counted.
+Validation after the parent authorized an offline test build (2026-10-19):
+cargo tree --offline --locked -i wayland-backend: resolves this vendored path.
+cargo test --offline --locked --test backend_fairness: 18 passed, 0 failed,
+on macOS (kqueue), including Display::backend() API access. System-backend
+runtime behavior and Linux/epoll execution have not been tested here. No network,
+app launch, or full-suite/integrated event-loop acceptance is implied.

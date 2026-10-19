@@ -59,8 +59,10 @@ def check_lock(lock, root=ROOT):
             require(re.fullmatch(r"[0-9a-f]{64}", package.get("checksum", "")),
                     f"Missing registry checksum: {package['name']}")
         else:
-            require(package["name"] in {"cocoa-way", "test-client", "smithay"},
+            require(package["name"] in {"cocoa-way", "test-client", "smithay", "wayland-backend"},
                     f"Unapproved path package: {package['name']}")
+            if package["name"] == "wayland-backend":
+                require(package["version"] == "0.3.11", "Re-review the local Wayland backend patch after version changes")
     client = tomllib.loads((root / "test-client/Cargo.toml").read_text())
     require(set(client["dependencies"]) == {"wayland-client"}, "Review test-client dependencies")
 
@@ -88,12 +90,15 @@ def check_api_sources(paths, tokens):
 def check_graph(metadata, policy, paths, root=ROOT):
     graph = reachable_graph(metadata)
     packages = {package["id"]: package for package in metadata["packages"]}
-    local = {root.resolve(), (root / "test-client").resolve(), (root / "vendor/smithay").resolve()}
+    local = {root.resolve(), (root / "test-client").resolve(), (root / "vendor/smithay").resolve(),
+             (root / "vendor/wayland-backend").resolve()}
     for identifier in graph:
         package = packages[identifier]
         if package["source"] is None:
             require(Path(package["manifest_path"]).parent.resolve() in local,
                     f"Unapproved local dependency: {package['manifest_path']}")
+            if package["name"] == "wayland-backend":
+                require(package["version"] == "0.3.11", "Re-review the local Wayland backend patch after version changes")
         else:
             require(package["source"] == REGISTRY, f"Unapproved dependency source: {identifier}")
     cgmath = [identifier for identifier in graph if packages[identifier]["name"] == "cgmath"]

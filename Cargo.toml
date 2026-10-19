@@ -51,6 +51,9 @@ tempfile = "3.8"
 [build-dependencies]
 pkg-config = "0.3"
 
+[patch.crates-io]
+wayland-backend = { path = "vendor/wayland-backend" }
+
 [[test]]
 name = "native-panel-layout"
 path = "tests/native_panel_layout.rs"
