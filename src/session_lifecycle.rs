@@ -875,7 +875,12 @@ mod tests {
                 }
             },
         );
-        assert!(!cleanup.finish(Duration::from_millis(30)));
+        // Observe the actual failed attempt, not the runner's scheduling speed.
+        wait_until(|| {
+            cleanup.poll();
+            failures.load(Ordering::SeqCst) != 0
+        });
+        assert!(!cleanup.finish(Duration::ZERO));
         assert_eq!(failures.load(Ordering::SeqCst), 1);
         assert!(cleanup.session_busy(id));
         assert!(
