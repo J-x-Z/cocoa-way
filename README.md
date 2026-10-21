@@ -68,7 +68,7 @@ Apple Container is a separate Apple runtime and is not bundled with Cocoa-Way. A
 2. Open Cocoa-Way and select **Container > Apple Container**.
 3. Use **Start System**, then confirm that the Compatibility card reports a running service.
 
-Use the latest official release; the managed workflow has been validated with [1.5.0](https://github.com/apple/container/releases/tag/1.5.0). Avoid versions older than [1.4.1](https://github.com/apple/container/releases/tag/1.4.1), which fixes OCI image loading and Unix-socket vulnerabilities. Cocoa-Way checks runtime capabilities separately from the version number.
+Use the latest official release. [1.6.0](https://github.com/apple/container/releases/tag/1.6.0) adds pinned-image digest verification and build-context security fixes, and is Cocoa-Way's recommended security baseline. Install the complete package: `build` and `builder` are now CLI plugins, not standalone features of the CLI binary. Cocoa-Way checks runtime capabilities separately from the version number; the earlier managed-workflow regression used 1.5.0.
 
 This runtime is optional when Cocoa-Way is used only with SSH, Docker, OrbStack, or an existing local Waypipe socket.
 

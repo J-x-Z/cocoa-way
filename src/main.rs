@@ -11,6 +11,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+mod apple_update_notice;
 mod application_model;
 mod audio;
 mod clipboard_transfer;
@@ -1374,7 +1375,6 @@ fn spawn_image_build(
     context: String,
 ) {
     std::thread::spawn(move || {
-        warn_low_container_disk_for_image_task(&sender, "build", &image);
         let child_path = runtime_paths::build_child_path();
         let Some(command_path) = runtime_paths::find_command_path("container", &child_path) else {
             let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
@@ -1386,6 +1386,18 @@ fn spawn_image_build(
             return;
         };
 
+        if let Err(error) =
+            container_sessions::preflight_apple_image_builder(&command_path, &child_path)
+        {
+            let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                runtime: "build".into(),
+                image,
+                success: false,
+                status: error.to_string(),
+            });
+            return;
+        }
+        warn_low_container_disk_for_image_task(&sender, "build", &image);
         let args = [
             "build".to_string(),
             "--progress".to_string(),
@@ -4306,6 +4318,13 @@ fn create_event_handler(
                 CompositorMessage::StartupDiagnosticsFinished(report) => {
                     container_mode::finish_startup_diagnostics(report);
                 }
+                CompositorMessage::AppleContainerUpdateAvailable(version) => {
+                    if display_worker_slot.is_none()
+                        && let Some(mtm) = objc2_foundation::MainThreadMarker::new()
+                    {
+                        apple_update_notice::present(&version, mtm);
+                    }
+                }
                 CompositorMessage::OpenPanel(page) => menu_bar::open_panel(page),
                 CompositorMessage::ShowDefaultDisplay => {
                     if display_worker_slot.is_none() {
@@ -7014,6 +7033,7 @@ fn create_event_handler(
                         sender.clone(),
                         mtm,
                     );
+                    apple_update_notice::probe(sender.clone());
                     container_mode::set_event_sender(sender);
                     // Disable macOS tab bar via NSView -> NSWindow
                     {

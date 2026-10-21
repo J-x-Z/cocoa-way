@@ -29,6 +29,7 @@ pub enum CompositorMessage {
     ShowDefaultDisplay,
     OpenPanel(crate::container_mode::PanelPage),
     StartupDiagnosticsFinished(crate::startup_diagnostics::Report),
+    AppleContainerUpdateAvailable(String),
     HideDefaultDisplay,
     DesktopToplevelCreated,
     ToggleHiDpi,

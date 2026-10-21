@@ -2397,6 +2397,38 @@ fn validate_display_slot(session: &ContainerSession) -> Result<(), LaunchError> 
     Ok(())
 }
 
+pub(crate) fn apple_build_help_supported(help: &str) -> bool {
+    ["--progress", "--file", "--tag"]
+        .iter()
+        .all(|expected| help.split_whitespace().any(|word| word == *expected))
+}
+
+pub(crate) fn preflight_apple_image_builder(
+    runtime_binary: &Path,
+    child_path: &str,
+) -> Result<(), LaunchError> {
+    preflight_apple_container(runtime_binary, child_path)?;
+    let mut command = Command::new(runtime_binary);
+    command.env("PATH", child_path).args(["build", "--help"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(6))
+        .map_err(|error| LaunchError::RuntimeNotReady {
+            runtime: "Apple Container image builder".into(),
+            hint: format!("Builder capability check failed: {error}. Install the complete official Apple Container package and restart its service."),
+        })?;
+    if !output.status.success()
+        || !apple_build_help_supported(&String::from_utf8_lossy(&output.stdout))
+    {
+        return Err(LaunchError::RuntimeNotReady {
+            runtime: "Apple Container image builder".into(),
+            hint: format!(
+                "{}; Apple Container 1.6.0 moved build and builder into CLI plugins. Install the complete official package and restart its service when existing work can be stopped. No image build was started.",
+                runtime_failure_detail(&output)
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn preflight_apple_container(runtime_binary: &Path, child_path: &str) -> Result<(), LaunchError> {
     const START_HINT: &str = "Use Container > Apple Container > Start System (or `container system start`) and wait until the service reports running. For older CLIs such as 1.0.0, install the latest supported official Apple Container release first.";
     let mut command = Command::new(runtime_binary);
@@ -3051,6 +3083,59 @@ fn spawn_waypipe_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_builder_checks_service_before_plugin_help() {
+        let (_dir, binary) = mock_runtime(
+            r#"
+case "$*" in
+  'system status --format json') printf '%s' '{"status":"unregistered"}'; exit 1 ;;
+  *) printf '%s' 'plugin check must not run while service is stopped'; exit 99 ;;
+esac
+"#,
+        );
+        let error = preflight_apple_image_builder(&binary, "/usr/bin:/bin").unwrap_err();
+        assert!(error.to_string().contains("System status was not running"));
+        assert!(!error.to_string().contains("plugin check must not run"));
+    }
+
+    #[test]
+    fn image_builder_supports_inline_and_plugin_cli_without_building() {
+        for overview in ["container build", "build"] {
+            let (_dir, binary) = mock_runtime(&format!(
+                r#"
+case "$*" in
+  'system status --format json') printf '%s' '{{"status":"running"}}' ;;
+  'build --help') printf '%s\n' 'USAGE: {overview}' '--progress <type>' '-f, --file <path>' '-t, --tag <name>' ;;
+  *) exit 99 ;;
+esac
+"#
+            ));
+            assert!(preflight_apple_image_builder(&binary, "/usr/bin:/bin").is_ok());
+        }
+    }
+
+    #[test]
+    fn image_builder_rejects_missing_plugin_and_incompatible_successful_help() {
+        for help in [
+            "printf 'Plugins are unavailable'; exit 64",
+            "printf 'USAGE: container --help'",
+            "printf '%s' '--progressive --filename --tagged'",
+        ] {
+            let (_dir, binary) = mock_runtime(&format!(
+                r#"
+case "$*" in
+  'system status --format json') printf '%s' '{{"status":"running"}}' ;;
+  'build --help') {help} ;;
+  *) exit 99 ;;
+esac
+"#
+            ));
+            let error = preflight_apple_image_builder(&binary, "/usr/bin:/bin").unwrap_err();
+            assert!(error.to_string().contains("CLI plugins"));
+            assert!(error.to_string().contains("No image build was started"));
+        }
+    }
 
     fn mock_runtime(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;

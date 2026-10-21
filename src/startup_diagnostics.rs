@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::container_sessions::{self, ContainerSession};
 use crate::i18n::{tr, tr_format};
 
-pub(crate) const APPLE_SECURITY_BASELINE: (u64, u64, u64) = (1, 4, 1);
+pub(crate) const APPLE_SECURITY_BASELINE: (u64, u64, u64) = (1, 6, 0);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const REPORT_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_PROFILES: usize = 24;
@@ -230,7 +230,7 @@ fn collect_with(
                 Status::Warning
             };
             report.push("Apple Container version", status, output.detail(),
-                if status == Status::Pass { "" } else { "Cocoa-Way's current security baseline is Apple Container 1.4.1. Older or unidentified versions need review; version alone does not prove runtime readiness." });
+                if status == Status::Pass { "" } else { "Cocoa-Way's current security baseline is Apple Container 1.6.0, including pinned-image digest and build-context security fixes. Version alone does not prove runtime readiness." });
             parsed
         }
         result => {
@@ -286,6 +286,21 @@ fn collect_with(
         result => report.push("Apple Container transport", Status::Warning,
             result.map(|output| output.detail()).unwrap_or_else(|error| error),
             "Published sockets were not confirmed. Cocoa-Way can use its compatibility relay; Transport V2 needs --publish-socket support. This is separate from service readiness."),
+    }
+    // In 1.6+ even plugin help needs the management service. A stopped
+    // service is not evidence of an absent build plugin.
+    if ready {
+        match probe("container", &["build", "--help"]) {
+            Ok(output) if output.success && container_sessions::apple_build_help_supported(&output.stdout) =>
+                report.push("Apple Container image builder", Status::Pass,
+                    "container build --progress --file --tag".into(), ""),
+            result => report.push("Apple Container image builder", Status::Warning,
+                result.map(|output| output.detail()).unwrap_or_else(|error| error),
+                "The image builder is unavailable or incompatible. Apple Container 1.6.0 moved build and builder into CLI plugins. Install the complete official package and restart its service when existing work can be stopped. Existing images can still be launched."),
+        }
+    } else {
+        report.push("Apple Container image builder", Status::NotChecked, String::new(),
+            "Start the management service before checking image builder plugins. No build, image download or builder container was started.");
     }
     let mut images = HashMap::<String, bool>::new();
     for session in valid {
@@ -375,6 +390,7 @@ mod tests {
                 output(r#"{"status":"running","server":{"version":"1.4.1"}}"#, true)
             }
             ("container", ["run", "--help"]) => output("--publish-socket", true),
+            ("container", ["build", "--help"]) => output("--progress --file --tag", true),
             ("container", ["image", "inspect", "local:test"]) => {
                 image_calls += 1;
                 output("{}", true)
@@ -417,6 +433,69 @@ mod tests {
                 .iter()
                 .any(|c| c.title == "Apple Container version" && c.status == Status::NotChecked)
         );
+    }
+
+    #[test]
+    fn missing_build_plugin_warns_without_blocking_existing_images() {
+        let report = collect_with(Ok(vec![session()]), |name, args| match (name, args) {
+            ("waypipe", ["--version"]) => output("waypipe 0.11.0", true),
+            ("container", ["--version"]) => output("container CLI version 1.6.0", true),
+            ("container", ["system", "status", "--format", "json"]) => {
+                output(r#"{"status":"running","server":{"version":"1.6.0"}}"#, true)
+            }
+            ("container", ["run", "--help"]) => output("--publish-socket", true),
+            ("container", ["build", "--help"]) => output("Plugins are unavailable", false),
+            ("container", ["image", "inspect", "local:test"]) => output("{}", true),
+            _ => panic!("unexpected command: {name} {args:?}"),
+        });
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.title == "Apple Container image builder" && c.status == Status::Warning)
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.title == "Example" && c.status == Status::Pass)
+        );
+        assert!(!report.checks.iter().any(|c| c.status == Status::Failed));
+    }
+
+    #[test]
+    fn security_baseline_warns_on_older_compatible_cli() {
+        for (version, expected) in [
+            ("1.4.1", Status::Warning),
+            ("1.5.0", Status::Warning),
+            ("1.6.0", Status::Pass),
+            ("1.7.0", Status::Pass),
+        ] {
+            let report = collect_with(Ok(Vec::new()), |name, args| match (name, args) {
+                ("waypipe", ["--version"]) => output("waypipe 0.11.0", true),
+                ("container", ["--version"]) => {
+                    output(&format!("container CLI version {version}"), true)
+                }
+                ("container", ["system", "status", "--format", "json"]) => {
+                    output(r#"{"status":"unregistered"}"#, false)
+                }
+                ("container", ["run", "--help"]) => output("--publish-socket", true),
+                _ => panic!("unexpected command: {name} {args:?}"),
+            });
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .any(|c| c.title == "Apple Container version" && c.status == expected)
+            );
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .any(|c| c.title == "Apple Container image builder"
+                        && c.status == Status::NotChecked)
+            );
+        }
     }
 
     #[test]

@@ -8863,7 +8863,7 @@ fn apple_container_compatibility(
             .into()
     } else if cli_version != "unknown" && !security_current {
         format!(
-            "Apple Container {} can run through Cocoa-Way, but 1.4.1 fixes OCI image loading and Unix-socket security vulnerabilities. Update to the latest official release before normal use.",
+            "Apple Container {} can run through Cocoa-Way, but 1.6.0 adds pinned-image digest and build-context security fixes. Update to the latest official release before normal use.",
             cli_version
         )
     } else if !publish_socket {
@@ -8874,7 +8874,7 @@ fn apple_container_compatibility(
             "Apple Container is {system_status}. Use Start System before launching applications."
         )
     } else if transport_v2_version {
-        "Apple Container 1.4.1+ satisfies Cocoa-Way's current security and Transport V2 compatibility baseline."
+        "Apple Container 1.6.0+ satisfies Cocoa-Way's current security and Transport V2 compatibility baseline."
             .into()
     } else {
         "This CLI predates reliable non-root published sockets. Cocoa-Way will use its compatibility relay."
@@ -9411,24 +9411,10 @@ fn apple_container_image_rows(child_path: &str) -> Vec<ImageRow> {
     match run_ui_command(
         &path,
         child_path,
-        &["image", "list"],
+        &["image", "list", "--format", "json"],
         Duration::from_secs(2),
     ) {
-        Ok(output) if output.status.success() => {
-            let rows = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(parse_apple_container_image_line)
-                .collect::<Vec<_>>();
-            if rows.is_empty() {
-                vec![ImageRow::message("No local images found")]
-            } else {
-                rows
-            }
-        }
-        Ok(output) => vec![ImageRow::message(first_stderr_line(
-            &output,
-            "Image list failed",
-        ))],
+        Ok(output) => apple_image_rows_from_output(&output),
         Err(error) => vec![ImageRow::message(ui_command_error(
             "Image list failed",
             &error,
@@ -9553,30 +9539,438 @@ fn parse_volume_line(line: &str) -> Option<VolumeRow> {
     })
 }
 
-fn parse_apple_container_image_line(line: &str) -> Option<ImageRow> {
-    let columns = line.split_whitespace().collect::<Vec<_>>();
-    if columns.is_empty() || columns[0].eq_ignore_ascii_case("name") {
+const APPLE_IMAGE_INVENTORY_BYTES: usize = 8 * 1024 * 1024;
+const APPLE_IMAGE_INVENTORY_ROWS: usize = 4096;
+const APPLE_IMAGE_INCOMPLETE: &str =
+    "Incomplete image inventory. Some images could not be read; reload to retry.";
+
+#[derive(Deserialize)]
+struct AppleImageRecord {
+    id: String,
+    configuration: AppleImageConfiguration,
+}
+
+#[derive(Deserialize)]
+struct AppleImageConfiguration {
+    name: String,
+    descriptor: AppleImageDescriptor,
+}
+
+#[derive(Deserialize)]
+struct AppleImageDescriptor {
+    digest: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AppleImageEntry {
+    Image(AppleImageRecord),
+    Invalid(serde::de::IgnoredAny),
+}
+
+fn parse_apple_image_records(bytes: &[u8]) -> Option<Vec<AppleImageEntry>> {
+    if bytes.len() > APPLE_IMAGE_INVENTORY_BYTES {
         return None;
     }
+    struct InventoryVisitor;
+    impl<'de> serde::de::Visitor<'de> for InventoryVisitor {
+        type Value = Vec<AppleImageEntry>;
 
-    let name = columns[0];
-    let tag = columns.get(1).copied().unwrap_or_default();
-    let digest = columns.get(2).copied().unwrap_or_default();
-    let reference = if tag.is_empty() || tag == "<none>" {
-        name.to_string()
-    } else {
-        format!("{}:{}", name, tag)
-    };
-    let label = if digest.is_empty() {
-        reference.clone()
-    } else {
-        format!("{}    {}", reference, digest)
-    };
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded Apple Container image array")
+        }
 
-    Some(ImageRow {
-        label,
-        reference: Some(reference),
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut records = Vec::new();
+            while let Some(record) = sequence.next_element()? {
+                if records.len() == APPLE_IMAGE_INVENTORY_ROWS {
+                    return Err(serde::de::Error::custom("too many image records"));
+                }
+                records.push(record);
+            }
+            Ok(records)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let records = serde::Deserializer::deserialize_seq(&mut decoder, InventoryVisitor).ok()?;
+    decoder.end().ok()?;
+    Some(records)
+}
+
+fn apple_image_rows_from_output(output: &Output) -> Vec<ImageRow> {
+    // Both 1.5 and 1.6 return ImageResource JSON. Never fall back to parsing diagnostics as a table.
+    let Some(records) = parse_apple_image_records(&output.stdout) else {
+        return vec![ImageRow::message(tr(APPLE_IMAGE_INCOMPLETE).into_owned())];
+    };
+    let mut incomplete = !output.status.success();
+    let mut rows = Vec::new();
+    let mut references = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for record in records {
+        let AppleImageEntry::Image(record) = record else {
+            incomplete = true;
+            continue;
+        };
+        let reference = record.configuration.name;
+        let digest = record.configuration.descriptor.digest;
+        if !valid_apple_image_digest(&digest)
+            || !digest[7..].eq_ignore_ascii_case(&record.id)
+            || !valid_apple_image_reference(&reference, &digest)
+        {
+            incomplete = true;
+            continue;
+        }
+        if !references.insert(reference.clone()) {
+            duplicates.insert(reference);
+            incomplete = true;
+            continue;
+        }
+        rows.push(ImageRow {
+            label: format!("{reference}    {digest}"),
+            reference: Some(reference),
+        });
+    }
+    rows.retain(|row| {
+        !row.reference
+            .as_ref()
+            .is_some_and(|name| duplicates.contains(name))
+    });
+    if incomplete {
+        // The list UI shows only its first ten rows; an appended warning could be invisible.
+        rows.insert(
+            0,
+            ImageRow::message(tr(APPLE_IMAGE_INCOMPLETE).into_owned()),
+        );
+    } else if rows.is_empty() {
+        rows.push(ImageRow::message("No local images found"));
+    }
+    rows
+}
+
+fn valid_apple_image_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn valid_apple_image_reference(reference: &str, descriptor_digest: &str) -> bool {
+    if reference.is_empty() || reference.len() > 384 || !reference.is_ascii() {
+        return false;
+    }
+    let (tagged_name, pinned) = reference
+        .split_once('@')
+        .map_or((reference, None), |(name, digest)| (name, Some(digest)));
+    if pinned.is_some_and(|digest| {
+        !valid_apple_image_digest(digest) || !digest.eq_ignore_ascii_case(descriptor_digest)
+    }) {
+        return false;
+    }
+    let (name, tag) = tagged_name
+        .rfind(':')
+        .filter(|colon| tagged_name.rfind('/').is_none_or(|slash| *colon > slash))
+        .map_or((tagged_name, None), |colon| {
+            (&tagged_name[..colon], Some(&tagged_name[colon + 1..]))
+        });
+    if name.len() > 255
+        || tag.is_some_and(|tag| {
+            pinned.is_some()
+                || tag.is_empty()
+                || tag.len() > 128
+                || !tag.starts_with(|character: char| {
+                    character.is_ascii_alphanumeric() || character == '_'
+                })
+                || !tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        })
+    {
+        return false;
+    }
+    let path = match name.split_once('/') {
+        Some((domain, path)) if domain == "localhost" || domain.contains(['.', ':']) => {
+            if !valid_apple_image_domain(domain) {
+                return false;
+            }
+            path
+        }
+        _ => name,
+    };
+    path.split('/').all(|component| {
+        let mut bytes = component.bytes().peekable();
+        loop {
+            let mut length = 0;
+            while bytes
+                .peek()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            {
+                bytes.next();
+                length += 1;
+            }
+            if length == 0 {
+                return false;
+            }
+            match bytes.next() {
+                None => return true,
+                Some(b'.') => {}
+                Some(b'_') => {
+                    if bytes.peek() == Some(&b'_') {
+                        bytes.next();
+                    }
+                }
+                Some(b'-') => {
+                    while bytes.peek() == Some(&b'-') {
+                        bytes.next();
+                    }
+                }
+                _ => return false,
+            }
+        }
     })
+}
+
+fn valid_apple_image_domain(domain: &str) -> bool {
+    let valid_port = |port: &str| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port > 0)
+    };
+    if let Some(address) = domain.strip_prefix('[') {
+        return address.split_once(']').is_some_and(|(address, suffix)| {
+            address.parse::<std::net::Ipv6Addr>().is_ok()
+                && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_port))
+        });
+    }
+    let host = match domain.rsplit_once(':') {
+        Some((host, port)) if valid_port(port) => host,
+        Some(_) => return false,
+        None => domain,
+    };
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.starts_with(|character: char| character.is_ascii_alphanumeric())
+            && label.ends_with(|character: char| character.is_ascii_alphanumeric())
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+#[cfg(test)]
+mod apple_image_inventory_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn image(reference: &str, hash: char) -> serde_json::Value {
+        let hash = hash.to_string().repeat(64);
+        serde_json::json!({
+            "id": hash,
+            "configuration": {
+                "name": reference,
+                "descriptor": { "digest": format!("sha256:{hash}") }
+            },
+            "variants": []
+        })
+    }
+
+    fn output(stdout: Vec<u8>, success: bool) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout,
+            stderr: b"warning: skipping unreadable image\n".to_vec(),
+        }
+    }
+
+    fn inventory(records: Vec<serde_json::Value>, success: bool) -> Vec<ImageRow> {
+        apple_image_rows_from_output(&output(serde_json::to_vec(&records).unwrap(), success))
+    }
+
+    fn references(rows: &[ImageRow]) -> Vec<&str> {
+        rows.iter()
+            .filter_map(|row| row.reference.as_deref())
+            .collect()
+    }
+
+    fn assert_incomplete(rows: &[ImageRow]) {
+        assert!(rows[0].reference.is_none());
+        assert_eq!(rows[0].label, tr(APPLE_IMAGE_INCOMPLETE).as_ref());
+    }
+
+    #[test]
+    fn healthy_15_and_16_schema_preserves_exact_references_and_full_digests() {
+        let first = "docker.io/library/alpine:3.20";
+        let second = "localhost:5000/team/cocoa-way:Release_1";
+        let rows = inventory(vec![image(first, 'a'), image(second, 'b')], true);
+        assert_eq!(references(&rows), [first, second]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].label,
+            format!("{first}    sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            image_id_from_label(&rows[1].label, second),
+            Some(format!("sha256:{}", "b".repeat(64)))
+        );
+    }
+
+    #[test]
+    fn partial_listing_keeps_every_healthy_row_and_puts_warning_before_ui_limit() {
+        let names = (0..12)
+            .map(|index| format!("local/app-{index}:latest"))
+            .collect::<Vec<_>>();
+        let rows = inventory(names.iter().map(|name| image(name, 'a')).collect(), false);
+        assert_incomplete(&rows);
+        assert_eq!(
+            references(&rows),
+            names.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(rows.len(), 13);
+    }
+
+    #[test]
+    fn all_unreadable_is_not_reported_as_an_empty_success() {
+        let rows = inventory(Vec::new(), false);
+        assert_incomplete(&rows);
+        assert_eq!(rows.len(), 1);
+        assert!(references(&rows).is_empty());
+        let empty = inventory(Vec::new(), true);
+        assert_eq!(empty[0].label, "No local images found");
+        assert!(empty[0].reference.is_none());
+    }
+
+    #[test]
+    fn invalid_records_do_not_remove_other_healthy_images() {
+        let rows = inventory(
+            vec![
+                image("local/first:latest", 'a'),
+                serde_json::Value::Null,
+                serde_json::json!({"configuration": {"name": "diagnostic"}}),
+                image("local/last:latest", 'b'),
+            ],
+            true,
+        );
+        assert_incomplete(&rows);
+        assert_eq!(
+            references(&rows),
+            ["local/first:latest", "local/last:latest"]
+        );
+    }
+
+    #[test]
+    fn malformed_json_and_non_json_errors_never_become_image_actions() {
+        for bytes in [
+            b"notFound: image does not exist".as_slice(),
+            b"NAME TAG DIGEST\nmalicious latest deadbeef\n",
+            b"warning: unhealthy registry\n[]",
+            b"[]\nerror: trailing diagnostics",
+            b"[{\"configuration\":",
+            b"{}",
+            b"null",
+            b"\xff",
+        ] {
+            for success in [false, true] {
+                let rows = apple_image_rows_from_output(&output(bytes.to_vec(), success));
+                assert_incomplete(&rows);
+                assert!(references(&rows).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_reference_validation_accepts_ports_ipv6_tags_and_pins() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for reference in [
+            "cocoa-way-niri:latest".to_string(),
+            "team/image__name--debug:v1.2".to_string(),
+            "registry.example:5000/team/app:_Build-1".to_string(),
+            "[::1]:5000/team/app:latest".to_string(),
+            format!("ghcr.io/team/app@{digest}"),
+        ] {
+            let rows = inventory(vec![image(&reference, 'a')], true);
+            assert_eq!(references(&rows), [reference.as_str()]);
+            assert_eq!(rows.len(), 1);
+        }
+    }
+
+    #[test]
+    fn unsafe_references_and_pinned_digest_mismatches_are_not_actionable() {
+        let pinned_mismatch = format!("ghcr.io/team/app@sha256:{}", "b".repeat(64));
+        let long_tag = format!("app:{}", "a".repeat(129));
+        for reference in [
+            "",
+            "--help",
+            "error: missing",
+            "app:latest\n",
+            "https://example.com/app:latest",
+            "repo/../app:latest",
+            "repo//app:latest",
+            "repo/app:bad/tag",
+            "repo/UPPER:latest",
+            "repo/.hidden:latest",
+            "registry:99999/app:latest",
+            "user@registry/app:latest",
+            "app:",
+            "app:tag@sha256:bad",
+            pinned_mismatch.as_str(),
+            long_tag.as_str(),
+        ] {
+            let rows = inventory(vec![image(reference, 'a')], false);
+            assert_incomplete(&rows);
+            assert!(references(&rows).is_empty(), "accepted {reference:?}");
+        }
+    }
+
+    #[test]
+    fn descriptor_and_id_must_be_full_matching_sha256_values() {
+        for digest in [
+            "deadbeef",
+            "sha256:abc",
+            "sha256:../escape",
+            "sha512:deadbeef",
+        ] {
+            let mut record = image("local/app:latest", 'a');
+            record["configuration"]["descriptor"]["digest"] = digest.into();
+            let rows = inventory(vec![record], true);
+            assert_incomplete(&rows);
+            assert!(references(&rows).is_empty());
+        }
+        let mut record = image("local/app:latest", 'a');
+        record["id"] = "b".repeat(64).into();
+        assert!(references(&inventory(vec![record], true)).is_empty());
+    }
+
+    #[test]
+    fn duplicate_names_or_identity_fields_are_not_actionable() {
+        let rows = inventory(
+            vec![
+                image("local/app:latest", 'a'),
+                image("local/app:latest", 'b'),
+            ],
+            true,
+        );
+        assert_incomplete(&rows);
+        assert!(references(&rows).is_empty());
+        let record = serde_json::to_string(&image("local/app:latest", 'a')).unwrap();
+        let duplicate = format!(
+            "[{}]",
+            record.replacen("\"id\":", "\"id\":\"ambiguous\",\"id\":", 1)
+        );
+        let rows = apple_image_rows_from_output(&output(duplicate.into_bytes(), true));
+        assert_incomplete(&rows);
+        assert!(references(&rows).is_empty());
+    }
+
+    #[test]
+    fn inventory_byte_and_row_caps_fail_closed_without_truncating_to_actions() {
+        assert!(parse_apple_image_records(&vec![b' '; APPLE_IMAGE_INVENTORY_BYTES + 1]).is_none());
+        let records = vec![serde_json::Value::Null; APPLE_IMAGE_INVENTORY_ROWS + 1];
+        let rows = inventory(records, true);
+        assert_incomplete(&rows);
+        assert!(references(&rows).is_empty());
+    }
 }
 
 fn parse_docker_image_line(line: &str) -> Option<ImageRow> {
@@ -14142,8 +14536,15 @@ mod tests {
             "1.1.0",
             APPLE_CONTAINER_TRANSPORT_V2_MINIMUM
         ));
-        assert!(version_at_least("1.4.1", APPLE_CONTAINER_SECURITY_BASELINE));
-        assert!(version_at_least("1.5.0", APPLE_CONTAINER_SECURITY_BASELINE));
+        assert!(!version_at_least(
+            "1.4.1",
+            APPLE_CONTAINER_SECURITY_BASELINE
+        ));
+        assert!(!version_at_least(
+            "1.5.0",
+            APPLE_CONTAINER_SECURITY_BASELINE
+        ));
+        assert!(version_at_least("1.6.0", APPLE_CONTAINER_SECURITY_BASELINE));
         assert!(version_at_least("2.0.0", APPLE_CONTAINER_SECURITY_BASELINE));
         assert!(!version_at_least(
             "1.3.1",
