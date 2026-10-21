@@ -69,8 +69,8 @@ sha = "3bb12739c298aeb8a4eeaf626c5b8d85266b0e65"
 # This archive matches the published source tag, not subsequent Formula metadata.
 # The tag is unsigned, so this checksum is integrity evidence,
 # not an independent publisher signature.
-version = "2.1.1"
-url = "https://github.com/J-x-Z/cocoa-way/archive/refs/tags/v2.1.1.tar.gz"
-sha256 = "616f27a5164843a18f2f01c1d43dfb4da8634117a09fa0166cfbc9bf0a2050b2"
-tag_object = "ec26204045758523c0008028df3325bff672881f"
-commit = "4f34b094481ae5b1cfb04b846cffc8515b9b3113"
+version = "2.1.2"
+url = "https://github.com/J-x-Z/cocoa-way/archive/refs/tags/v2.1.2.tar.gz"
+sha256 = "63deea0697c29dd08d616f0dcee87e722196a54f0a0b6562792ee8b39b8e08de"
+tag_object = "c97397a5b3de75f00e225c7baa0352002ab3412c"
+commit = "ca5dd65799248dfc3fa71727b7268731b68ae2d2"
