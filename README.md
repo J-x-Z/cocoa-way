@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-2.1.1-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
+[![Version](https://img.shields.io/badge/version-2.1.2-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
 [![Build Status](https://github.com/J-x-Z/cocoa-way/actions/workflows/release.yml/badge.svg)](https://github.com/J-x-Z/cocoa-way/actions)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
@@ -31,6 +31,8 @@ Applications are modeled around three objects:
 Version 2.1 adds an opt-in interactive desktop background, event-driven Wayland wakeups, display-aware frame pacing, and bounded transport backpressure. It also reduces dependency maintenance with pinned upstream Smithay, a small reproducible patch set, no unused Pixman linkage, and pinned native window bindings. Existing SSH, container, Desktop, and Rootless workflows remain available.
 
 Version 2.1.1 focuses on startup diagnostics, clearer native controls, language settings, bounded client dispatch, and safer application and rendering lifecycles. End-to-end input and display latency remains under investigation; this update does not claim to eliminate it.
+
+Version 2.1.2 is a quality update focused on Apple Container compatibility, clearer dependency checks, and safer startup diagnostics. Existing application profiles and everyday Desktop, Rootless, SSH, Docker, and OrbStack workflows are preserved.
 
 ## Demo
 
@@ -68,7 +70,7 @@ Apple Container is a separate Apple runtime and is not bundled with Cocoa-Way. A
 2. Open Cocoa-Way and select **Container > Apple Container**.
 3. Use **Start System**, then confirm that the Compatibility card reports a running service.
 
-Use the latest official release. [1.6.0](https://github.com/apple/container/releases/tag/1.6.0) adds pinned-image digest verification and build-context security fixes, and is Cocoa-Way's recommended security baseline. Install the complete package: `build` and `builder` are now CLI plugins, not standalone features of the CLI binary. Cocoa-Way checks runtime capabilities separately from the version number; the earlier managed-workflow regression used 1.5.0.
+Use the latest official release. [1.6.0](https://github.com/apple/container/releases/tag/1.6.0) adds pinned-image digest verification and build-context security fixes, and is Cocoa-Way's recommended security baseline. Install the complete package: `build` and `builder` are now CLI plugins, not standalone features of the CLI binary. Cocoa-Way checks runtime capabilities separately from the version number. The installed 1.6.0 CLI and API server passed a bounded managed-workflow regression covering concurrent applications, Transport V2, stop and relaunch; this does not establish end-to-end latency.
 
 This runtime is optional when Cocoa-Way is used only with SSH, Docker, OrbStack, or an existing local Waypipe socket.
 

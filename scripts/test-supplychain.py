@@ -5,6 +5,7 @@ import copy
 from datetime import date
 import importlib.util
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -249,6 +250,12 @@ class SourceAndProvenanceTests(unittest.TestCase):
 
 
 class BundleTests(unittest.TestCase):
+    def test_every_packaged_helper_is_rewritten_and_signed(self):
+        script = (ROOT / "scripts/bundle-macos-app.sh").read_text()
+        helpers = re.search(r"^for helper in (.+); do$", script, re.MULTILINE)
+        self.assertIsNotNone(helpers)
+        self.assertEqual(set(helpers.group(1).split()), set(bundle.EXECUTABLES[1:]))
+
     def test_bare_loader_and_executable_rpaths_are_valid(self):
         binary = Path("/Example.app/Contents/Frameworks/libxkbcommon.dylib")
         executable = Path("/Example.app/Contents/MacOS/cocoa-way")

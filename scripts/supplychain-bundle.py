@@ -17,7 +17,7 @@ import subprocess
 import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
-EXECUTABLES = ("cocoa-way", "cocoa-wayctl", "cocoa-way-mcp")
+EXECUTABLES = ("cocoa-way", "cocoa-wayctl", "cocoa-way-mcp", "cocoa-way-research-mcp")
 
 
 def require(condition, message):
@@ -134,6 +134,7 @@ def check_bundle(app, version, arch):
     run("codesign", "--verify", "--deep", "--strict", str(app))
     subprocess.run([str(binaries[1]), "--help"], check=True, stdout=subprocess.DEVNULL, timeout=15)
     subprocess.run([str(binaries[2])], check=True, input=b"", stdout=subprocess.DEVNULL, timeout=15)
+    subprocess.run([str(binaries[3])], check=True, input=b"", stdout=subprocess.DEVNULL, timeout=15)
     print(f"Verified {len(binaries)} executables, {len(libraries)} transitive dylibs, resources and ad-hoc signatures")
 
 

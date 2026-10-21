@@ -56,7 +56,7 @@ if [[ ! -f "${RESOURCES_DIR}/xkb/rules/evdev" ]]; then
 fi
 
 APP_EXECUTABLES=("${MAIN_BIN}")
-for helper in cocoa-wayctl cocoa-way-mcp; do
+for helper in cocoa-wayctl cocoa-way-mcp cocoa-way-research-mcp; do
     helper_path="${APP_DIR}/Contents/MacOS/${helper}"
     if [[ -f "${helper_path}" ]]; then
         APP_EXECUTABLES+=("${helper_path}")

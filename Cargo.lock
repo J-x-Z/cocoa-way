@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "cocoa-way"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "block2",
  "libc",
@@ -186,6 +186,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "sha2",
  "smithay",
  "tempfile",
  "toml",
