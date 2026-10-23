@@ -92,6 +92,15 @@ macro_rules! chinese_catalog {
 }
 
 chinese_catalog! {
+    "Language preferences are unavailable." => "暂时无法读取语言设置。",
+    "Could not save the interface language." => "无法保存界面语言。",
+    "Select an application profile to inspect its configuration and running instance." => "选择一个应用配置方案，查看其设置和运行中的实例。",
+    "Select an application profile to inspect its launch logs and Waypipe output." => "选择一个应用配置方案，查看启动日志和 Waypipe 输出。",
+    "Select a running application instance to open an interactive terminal." => "选择一个运行中的应用实例，打开交互终端。",
+    "Select an application profile to inspect files exported from its container." => "选择一个应用配置方案，查看其容器导出的文件。",
+    "Launch an application instance from this saved profile" => "使用此配置方案启动应用实例",
+    "V2 capable" => "支持 V2",
+    "V2 Ready" => "V2 就绪",
     "Container Quick Controls" => "容器快捷操作",
     "Controls container lifecycle, not application launch." => "管理容器的启停；图形应用仍从“应用”页面启动。",
     "Select a container" => "选择容器",
