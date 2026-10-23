@@ -7,82 +7,17 @@ use std::time::Duration;
 
 use objc2_foundation::MainThreadMarker;
 
+#[cfg(test)]
+use crate::apple_runtime::MAX_VERSION_OUTPUT;
+use crate::apple_runtime::{Version, confirmed_cli_version, parse_version, version_text};
 use crate::event_loop_signal::Sender;
 use crate::messages::CompositorMessage;
 use crate::startup_diagnostics::APPLE_SECURITY_BASELINE;
 
-type Version = (u64, u64, u64);
-
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_VERSION_OUTPUT: usize = 4096;
-const PREFERENCE_SUITE: &str = "com.jxz.cocoa-way";
 const DISMISSAL_VALUE: &str = "dismissed";
 const OFFICIAL_RELEASE_URL: &str = "https://github.com/apple/container/releases/latest";
 static PROBE_STARTED: AtomicBool = AtomicBool::new(false);
-
-fn version_text(version: Version) -> String {
-    format!("{}.{}.{}", version.0, version.1, version.2)
-}
-
-fn parse_version(text: &str) -> Option<Version> {
-    if text.len() > 128 {
-        return None;
-    }
-    let text = text.strip_prefix('v').unwrap_or(text);
-    let (core, metadata) = text.split_once('+').unwrap_or((text, ""));
-    if text.contains('+')
-        && (metadata.is_empty()
-            || metadata.split('.').any(|part| {
-                part.is_empty()
-                    || !part
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            }))
-    {
-        return None;
-    }
-    let mut parts = core.split('.');
-    let mut number = || {
-        let part = parts.next()?;
-        if part.is_empty()
-            || (part.len() > 1 && part.starts_with('0'))
-            || !part.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return None;
-        }
-        part.parse::<u64>().ok()
-    };
-    let version = (number()?, number()?, number()?);
-    parts.next().is_none().then_some(version)
-}
-
-fn confirmed_cli_version(success: bool, stdout: &[u8]) -> Option<Version> {
-    if !success || stdout.len() > MAX_VERSION_OUTPUT {
-        return None;
-    }
-    let output = std::str::from_utf8(stdout).ok()?.trim();
-    // Do not mistake a build, dependency, warning or prerelease number for the CLI.
-    if output.lines().count() != 1 {
-        return None;
-    }
-    let version = output
-        .strip_prefix("container CLI version ")
-        .or_else(|| output.strip_prefix("container version "))?;
-    let (version, suffix) = version
-        .split_once(char::is_whitespace)
-        .unwrap_or((version, ""));
-    let suffix = suffix.trim();
-    if !suffix.is_empty()
-        && !(suffix.starts_with('(')
-            && suffix.ends_with(')')
-            && suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() || byte == b' '))
-    {
-        return None;
-    }
-    parse_version(version)
-}
 
 fn dismissal_key(baseline: Version) -> String {
     format!("appleContainerUpdateDismissed.{}", version_text(baseline))
@@ -118,7 +53,9 @@ pub fn probe(sender: Sender<CompositorMessage>) {
                     return;
                 };
                 let mut command = Command::new(executable);
-                command.env("PATH", path).arg("--version");
+                command
+                    .env("PATH", path)
+                    .args(crate::apple_runtime::Probe::Version.args());
                 let Ok(output) = crate::runtime_commands::capture(command, PROBE_TIMEOUT) else {
                     return;
                 };
@@ -166,6 +103,7 @@ mod native {
 
     use super::*;
     use crate::i18n::{tr, tr_format};
+    use crate::macos_preferences::app_defaults as defaults;
 
     // The crate's NSApp() wrapper calls sharedApplication and creates one if absent.
     // Read the SDK global instead: notices must not initialize GUI worker instances.
@@ -174,28 +112,24 @@ mod native {
         static NSApp: *mut NSApplication;
     }
 
-    fn defaults() -> Option<Retained<AnyObject>> {
-        let class = AnyClass::get("NSUserDefaults")?;
-        unsafe {
-            let allocated = msg_send_id![class, alloc];
-            msg_send_id![allocated, initWithSuiteName: &*NSString::from_str(PREFERENCE_SUITE)]
-        }
-    }
-
     pub(super) fn dismissed(baseline: Version) -> Option<bool> {
         let defaults = defaults()?;
+        Some(dismissed_with(&defaults, baseline))
+    }
+
+    fn dismissed_with(defaults: &AnyObject, baseline: Version) -> bool {
         unsafe {
-            let value: Option<Retained<AnyObject>> = msg_send_id![&*defaults,
+            let value: Option<Retained<AnyObject>> = msg_send_id![defaults,
                 objectForKey: &*NSString::from_str(&dismissal_key(baseline))];
             let Some(value) = value else {
-                return Some(false);
+                return false;
             };
             let is_string: bool = msg_send![&*value, isKindOfClass: NSString::class()];
             if !is_string {
-                return Some(false);
+                return false;
             }
             let value: Retained<NSString> = Retained::cast(value);
-            Some(value.to_string() == DISMISSAL_VALUE)
+            value.to_string() == DISMISSAL_VALUE
         }
     }
 
@@ -204,11 +138,43 @@ mod native {
             log::warn!("Apple Container notice dismissal preferences are unavailable");
             return;
         };
+        persist_dismissal_with(&defaults, baseline);
+        // NSUserDefaults persists asynchronously; do not synchronize on AppKit.
+    }
+
+    fn persist_dismissal_with(defaults: &AnyObject, baseline: Version) {
         unsafe {
-            let _: () = msg_send![&*defaults, setObject: &*NSString::from_str(DISMISSAL_VALUE)
+            let _: () = msg_send![defaults, setObject: &*NSString::from_str(DISMISSAL_VALUE)
                 forKey: &*NSString::from_str(&dismissal_key(baseline))];
         }
-        // NSUserDefaults persists asynchronously; do not synchronize on AppKit.
+    }
+
+    #[cfg(test)]
+    mod preference_tests {
+        use super::*;
+
+        #[test]
+        fn dismissal_roundtrip_is_scoped_and_preserves_language() {
+            let suite = crate::macos_preferences::tests::OwnedSuite::new();
+            let defaults = suite.defaults();
+            unsafe {
+                let _: () = msg_send![&*defaults, setObject: &*NSString::from_str("zh-Hans") forKey: &*NSString::from_str("language")];
+            }
+            assert!(!dismissed_with(&defaults, (1, 6, 0)));
+            persist_dismissal_with(&defaults, (1, 6, 0));
+            unsafe {
+                let saved: bool = msg_send![&*defaults, synchronize];
+                assert!(saved);
+            }
+            let reloaded = suite.defaults();
+            assert!(dismissed_with(&reloaded, (1, 6, 0)));
+            assert!(!dismissed_with(&reloaded, (1, 7, 0)));
+            unsafe {
+                let language: Retained<NSString> =
+                    msg_send_id![&*reloaded, stringForKey: &*NSString::from_str("language")];
+                assert_eq!(language.to_string(), "zh-Hans");
+            }
+        }
     }
 
     struct HandlerState {
@@ -578,7 +544,7 @@ mod tests {
     fn dismissal_keys_are_stable_per_baseline_without_erasing_previous_ones() {
         let mut preferences = std::collections::BTreeMap::new();
         let key = dismissal_key(BASELINE);
-        assert_eq!(PREFERENCE_SUITE, "com.jxz.cocoa-way");
+        assert_eq!(crate::macos_preferences::DOMAIN, "com.jxz.cocoa-way");
         assert_eq!(key, "appleContainerUpdateDismissed.1.6.0");
         preferences.insert(key.clone(), DISMISSAL_VALUE);
         assert_eq!(

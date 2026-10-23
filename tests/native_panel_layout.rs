@@ -2,6 +2,8 @@
 #[path = "../src/i18n.rs"]
 #[allow(unused_imports)] // This standalone harness does not run nested #[test] items.
 mod i18n;
+#[path = "../src/macos_preferences.rs"]
+mod macos_preferences;
 #[path = "../src/container_mode/native_layout.rs"]
 mod native_layout;
 

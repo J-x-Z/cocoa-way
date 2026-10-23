@@ -666,14 +666,19 @@ pub fn apple_publish_socket_supported(container: &Path, child_path: &str) -> boo
         return *supported;
     }
     let mut command = Command::new(container);
-    command.env("PATH", child_path).args(["run", "--help"]);
+    command
+        .env("PATH", child_path)
+        .args(crate::apple_runtime::Probe::RunHelp.args());
     let Ok(output) = command_output_with_timeout(command, Duration::from_secs(6)) else {
         return false;
     };
     if !output.status.success() {
         return false;
     }
-    let supported = String::from_utf8_lossy(&output.stdout).contains("--publish-socket");
+    let supported = crate::apple_runtime::has_option(
+        &String::from_utf8_lossy(&output.stdout),
+        "--publish-socket",
+    );
     let _ = SUPPORTED.set(supported);
     supported
 }
@@ -2468,9 +2473,7 @@ fn validate_display_slot(session: &ContainerSession) -> Result<(), LaunchError> 
 }
 
 pub(crate) fn apple_build_help_supported(help: &str) -> bool {
-    ["--progress", "--file", "--tag"]
-        .iter()
-        .all(|expected| help.split_whitespace().any(|word| word == *expected))
+    crate::apple_runtime::build_supported(help)
 }
 
 pub(crate) fn preflight_apple_image_builder(
@@ -2479,7 +2482,9 @@ pub(crate) fn preflight_apple_image_builder(
 ) -> Result<(), LaunchError> {
     preflight_apple_container(runtime_binary, child_path)?;
     let mut command = Command::new(runtime_binary);
-    command.env("PATH", child_path).args(["build", "--help"]);
+    command
+        .env("PATH", child_path)
+        .args(crate::apple_runtime::Probe::BuildHelp.args());
     let output = command_output_with_timeout(command, Duration::from_secs(6))
         .map_err(|error| LaunchError::RuntimeNotReady {
             runtime: "Apple Container image builder".into(),
@@ -2504,7 +2509,7 @@ fn preflight_apple_container(runtime_binary: &Path, child_path: &str) -> Result<
     let mut command = Command::new(runtime_binary);
     command
         .env("PATH", child_path)
-        .args(["system", "status", "--format", "json"]);
+        .args(crate::apple_runtime::Probe::SystemStatus.args());
     let output = command_output_with_timeout(command, Duration::from_secs(6)).map_err(|error| {
         LaunchError::RuntimeNotReady {
             runtime: "Apple Container".into(),

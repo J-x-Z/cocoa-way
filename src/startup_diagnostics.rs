@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::apple_runtime::{self, Probe as AppleProbe};
 use crate::container_sessions::{self, ContainerSession};
 use crate::i18n::{tr, tr_format};
 
@@ -153,17 +154,9 @@ fn apple(session: &ContainerSession) -> bool {
     )
 }
 
+#[cfg(test)]
 fn version(text: &str) -> Option<(u64, u64, u64)> {
-    text.split_whitespace().find_map(|word| {
-        let word = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-        let mut parts = word.split('.');
-        let result = (
-            parts.next()?.parse().ok()?,
-            parts.next()?.parse().ok()?,
-            parts.next()?.parse().ok()?,
-        );
-        parts.next().is_none().then_some(result)
-    })
+    apple_runtime::reported_version(text)
 }
 
 fn collect_with(
@@ -221,9 +214,10 @@ fn collect_with(
                 "Check the configured Waypipe path or reinstall waypipe-darwin. A file existing is not enough; --version must run successfully."),
         }
     }
-    let cli = match probe("container", &["--version"]) {
+    let cli = match probe("container", AppleProbe::Version.args()) {
         Ok(output) if output.success => {
-            let parsed = version(&output.stdout);
+            let parsed =
+                apple_runtime::confirmed_cli_version(output.success, output.stdout.as_bytes());
             let status = if parsed.is_some_and(|v| v >= APPLE_SECURITY_BASELINE) {
                 Status::Pass
             } else {
@@ -242,7 +236,7 @@ fn collect_with(
             return report;
         }
     };
-    let ready = match probe("container", &["system", "status", "--format", "json"]) {
+    let ready = match probe("container", AppleProbe::SystemStatus.args()) {
         Ok(output) => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
             Ok(status) => {
                 let service = status
@@ -252,15 +246,7 @@ fn collect_with(
                 let ready = output.success && service == "running";
                 report.push("Apple Container service", if ready { Status::Pass } else if apple_required { Status::Failed } else { Status::Warning },
                     format!("status: {service}"), if ready { "" } else { "The management service is not ready. Open Apple Container > Start System, or run `container system start`, then rerun diagnostics. This check does not start it." });
-                let api = status
-                    .pointer("/server/version")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| {
-                        status
-                            .get("apiServerVersion")
-                            .and_then(serde_json::Value::as_str)
-                    })
-                    .and_then(version);
+                let api = apple_runtime::api_version(&status);
                 if let Some((cli, api)) = cli.zip(api).filter(|(cli, api)| ready && cli != api) {
                     report.push("Client/API version mismatch", Status::Warning,
                         format!("CLI: {}.{}.{}; API: {}.{}.{}", cli.0, cli.1, cli.2, api.0, api.1, api.2),
@@ -280,8 +266,8 @@ fn collect_with(
             false
         }
     };
-    match probe("container", &["run", "--help"]) {
-        Ok(output) if output.success && output.stdout.contains("--publish-socket") =>
+    match probe("container", AppleProbe::RunHelp.args()) {
+        Ok(output) if output.success && apple_runtime::has_option(&output.stdout, "--publish-socket") =>
             report.push("Apple Container transport", Status::Pass, "--publish-socket".into(), ""),
         result => report.push("Apple Container transport", Status::Warning,
             result.map(|output| output.detail()).unwrap_or_else(|error| error),
@@ -290,7 +276,7 @@ fn collect_with(
     // In 1.6+ even plugin help needs the management service. A stopped
     // service is not evidence of an absent build plugin.
     if ready {
-        match probe("container", &["build", "--help"]) {
+        match probe("container", AppleProbe::BuildHelp.args()) {
             Ok(output) if output.success && container_sessions::apple_build_help_supported(&output.stdout) =>
                 report.push("Apple Container image builder", Status::Pass,
                     "container build --progress --file --tag".into(), ""),
@@ -385,7 +371,7 @@ mod tests {
         let mut image_calls = 0;
         let report = collect_with(Ok(vec![first, second]), |name, args| match (name, args) {
             ("/custom/waypipe", ["--version"]) => output("waypipe 0.11.0", true),
-            ("container", ["--version"]) => output("container 1.4.2", true),
+            ("container", ["--version"]) => output("container CLI version 1.4.2", true),
             ("container", ["system", "status", "--format", "json"]) => {
                 output(r#"{"status":"running","server":{"version":"1.4.1"}}"#, true)
             }

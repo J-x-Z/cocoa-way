@@ -8872,7 +8872,7 @@ fn ui_publish_socket_support(command: &std::path::Path, child_path: &str) -> Res
     let output = run_ui_command(
         command,
         child_path,
-        &["run", "--help"],
+        crate::apple_runtime::Probe::RunHelp.args(),
         Duration::from_secs(6),
     )?;
     publish_socket_support_from_output(&output)
@@ -8885,7 +8885,10 @@ fn publish_socket_support_from_output(output: &Output) -> Result<bool, String> {
             "Transport capability check failed",
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).contains("--publish-socket"))
+    Ok(crate::apple_runtime::has_option(
+        &String::from_utf8_lossy(&output.stdout),
+        "--publish-socket",
+    ))
 }
 
 pub fn record_command_cache_updated() {
@@ -8921,18 +8924,24 @@ fn apple_container_compatibility(
         return compatibility.clone();
     }
 
-    let version_output =
-        run_ui_command(command, child_path, &["--version"], Duration::from_secs(1))
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_default();
-    let cli_version = extract_version(&version_output).unwrap_or_else(|| "unknown".into());
+    let version_output = run_ui_command(
+        command,
+        child_path,
+        crate::apple_runtime::Probe::Version.args(),
+        Duration::from_secs(1),
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    .unwrap_or_default();
+    let cli_version = crate::apple_runtime::confirmed_cli_version(true, version_output.as_bytes())
+        .map(crate::apple_runtime::version_text)
+        .unwrap_or_else(|| "unknown".into());
 
     let status_json = run_ui_command(
         command,
         child_path,
-        &["system", "status", "--format", "json"],
+        crate::apple_runtime::Probe::SystemStatus.args(),
         Duration::from_secs(2),
     )
     .ok()
@@ -8957,14 +8966,14 @@ fn apple_container_compatibility(
     let stats_help = run_ui_command(
         command,
         child_path,
-        &["stats", "--help"],
+        crate::apple_runtime::Probe::StatsHelp.args(),
         Duration::from_secs(1),
     )
     .ok()
     .filter(|output| output.status.success())
     .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
     .unwrap_or_default();
-    let stats_json = stats_help.contains("--format") && stats_help.contains("--no-stream");
+    let stats_json = crate::apple_runtime::stats_json_supported(&stats_help);
 
     let versions_match =
         cli_version == "unknown" || api_version == "unknown" || cli_version == api_version;
@@ -9022,32 +9031,12 @@ fn apple_container_compatibility(
 }
 
 fn apple_container_api_version(status: &serde_json::Value) -> Option<String> {
-    // 1.4.1+ nests API metadata under server; older releases use a flat string.
-    status
-        .pointer("/server/version")
-        .and_then(serde_json::Value::as_str)
-        .and_then(extract_version)
-        .or_else(|| {
-            status
-                .get("apiServerVersion")
-                .and_then(serde_json::Value::as_str)
-                .and_then(extract_version)
-        })
+    crate::apple_runtime::api_version(status).map(crate::apple_runtime::version_text)
 }
 
+#[cfg(test)]
 fn extract_version(text: &str) -> Option<String> {
-    text.split(|character: char| character.is_whitespace() || character == '(')
-        .map(|token| {
-            token.trim_matches(|character: char| !character.is_ascii_digit() && character != '.')
-        })
-        .find(|token| {
-            let parts = token.split('.').collect::<Vec<_>>();
-            parts.len() >= 3
-                && parts
-                    .iter()
-                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-        })
-        .map(str::to_string)
+    crate::apple_runtime::reported_version(text).map(crate::apple_runtime::version_text)
 }
 
 fn version_at_least(version: &str, minimum: (u64, u64, u64)) -> bool {
@@ -13947,10 +13936,12 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         let mut output = Output {
             status: std::process::ExitStatus::from_raw(0),
-            stdout: b"Usage: run [--publish-socket]".to_vec(),
+            stdout: b"Usage: run [options]\n  --publish-socket <spec>  Publish a socket".to_vec(),
             stderr: vec![],
         };
         assert_eq!(publish_socket_support_from_output(&output), Ok(true));
+        output.stdout = b"Usage: run [--publish-socket]".to_vec();
+        assert_eq!(publish_socket_support_from_output(&output), Ok(false));
         output.stdout = b"Usage: run".to_vec();
         assert_eq!(publish_socket_support_from_output(&output), Ok(false));
         output.status = std::process::ExitStatus::from_raw(256);

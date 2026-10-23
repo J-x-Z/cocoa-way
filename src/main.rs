@@ -11,6 +11,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+mod apple_runtime;
 mod apple_update_notice;
 mod application_model;
 mod audio;
@@ -35,6 +36,8 @@ mod layout;
 mod lifecycle;
 mod lifecycle_producers;
 mod macos_gestures;
+#[cfg(target_os = "macos")]
+mod macos_preferences;
 mod menu_bar;
 mod messages;
 mod metal_renderer;
