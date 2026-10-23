@@ -293,6 +293,9 @@ print "ok\n";
 
 
 class StdioBackpressure(unittest.TestCase):
+    # Pipes in this fixture force short writes; Unix socket capacities vary.
+    require_partial_writes = True
+
     @classmethod
     def setUpClass(cls):
         subprocess.run(["perl", "-c", "-e", SCRIPT], check=True,
@@ -336,7 +339,8 @@ class StdioBackpressure(unittest.TestCase):
             self.assertEqual(digest.digest(), hashlib.sha256(PAYLOAD).digest())
             stats = relay.finish()
             self.assertGreater(stats["output_pauses"], 0)
-            self.assertGreater(stats["partial_writes"], 0)
+            if self.require_partial_writes:
+                self.assertGreater(stats["partial_writes"], 0)
 
     def test_peer_backpressure_keeps_stdout_live_and_preserves_same_lane_hol(self):
         with Relay() as relay:

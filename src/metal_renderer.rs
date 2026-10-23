@@ -4,6 +4,7 @@ use objc2_foundation::{NSError, NSString};
 use objc2_metal::*;
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use smithay::reexports::wayland_server::backend::ObjectId;
+use smithay::reexports::wayland_server::protocol::wl_shm::Format;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -124,8 +125,79 @@ pub(crate) struct PixelPreflight {
     frame: std::sync::Weak<FrameLifetime>,
     width: i32,
     height: i32,
+    format: Format,
     damage: Option<BufferDamage>,
     resource: Option<TextureResource>,
+    cached_image: Option<Weak<CachedImage>>,
+}
+
+impl PixelPreflight {
+    fn accepts_cached_image(&self, image: Option<&Rc<CachedImage>>) -> bool {
+        self.damage.is_none()
+            && image.is_some_and(|image| {
+                image.compatible(self.width, self.height, self.format)
+                    && self
+                        .cached_image
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.ptr_eq(&Rc::downgrade(image)))
+            })
+    }
+
+    /// Choose before scratch checkout, not after taking an unused SHM snapshot.
+    pub(crate) fn draw_or_snapshot(
+        self,
+        cached: impl FnOnce(Self) -> PixelDrawResult,
+        snapshot: impl FnOnce(Self) -> Option<PixelDrawResult>,
+    ) -> Option<PixelDrawResult> {
+        if self.cached_image.is_some() {
+            Some(cached(self))
+        } else {
+            snapshot(self)
+        }
+    }
+
+    fn validate(
+        &self,
+        owner: &Rc<TextureCache>,
+        surface_id: &ObjectId,
+        geometry: DrawGeometry,
+        frame: Option<&Arc<FrameLifetime>>,
+    ) -> Result<(), PixelDrawResult> {
+        if geometry.width <= 0
+            || geometry.height <= 0
+            || self.surface_id != *surface_id
+            || !self.owner.ptr_eq(&Rc::downgrade(owner))
+        {
+            return Err(PixelDrawResult::Rejected);
+        }
+        if !frame.is_some_and(|frame| frame.accepts_preflight(&self.frame)) {
+            return Err(PixelDrawResult::Deferred);
+        }
+        Ok(())
+    }
+}
+
+// Identity changes even when an upload reuses the same Metal storage.
+struct CachedImage {
+    width: i32,
+    height: i32,
+    format: Format,
+}
+
+impl CachedImage {
+    fn compatible(&self, width: i32, height: i32, format: Format) -> bool {
+        (self.width, self.height, self.format) == (width, height, format)
+    }
+
+    fn preflight(
+        self: &Rc<Self>,
+        width: i32,
+        height: i32,
+        format: Format,
+        damage: Option<BufferDamage>,
+    ) -> Option<Weak<Self>> {
+        (damage.is_none() && self.compatible(width, height, format)).then(|| Rc::downgrade(self))
+    }
 }
 
 // Slots cover size changes too; a busy old-sized resource cannot be replaced.
@@ -133,6 +205,7 @@ struct CachedTexture {
     textures: TextureVersions<TextureResource>,
     buffer_id: ObjectId,
     alpha: TextureAlpha,
+    image: Rc<CachedImage>,
 }
 
 type TextureCache = RefCell<HashMap<ObjectId, CachedTexture>>;
@@ -692,7 +765,11 @@ impl MetalRenderer {
         {
             return PixelDrawResult::Rejected;
         }
-        let prepared = match self.preflight_pixels(&surface_id, tex_w, tex_h, damage) {
+        let format = match alpha {
+            TextureAlpha::Opaque => Format::Xrgb8888,
+            TextureAlpha::Premultiplied => Format::Argb8888,
+        };
+        let prepared = match self.preflight_pixels(&surface_id, tex_w, tex_h, format, damage) {
             Ok(prepared) => prepared,
             Err(result) => return result,
         };
@@ -718,6 +795,7 @@ impl MetalRenderer {
         surface_id: &ObjectId,
         tex_w: i32,
         tex_h: i32,
+        format: Format,
         damage: &[BufferDamage],
     ) -> Result<PixelPreflight, PixelDrawResult> {
         if tex_w <= 0 || tex_h <= 0 {
@@ -730,14 +808,16 @@ impl MetalRenderer {
             .map(|frame| Arc::downgrade(&frame.lifetime))
             .ok_or(PixelDrawResult::Deferred)?;
         let damage = coalesce_damage(damage, tex_w, tex_h);
-        let prepared = |resource| PixelPreflight {
+        let prepared = |resource, cached_image| PixelPreflight {
             owner: Rc::downgrade(&self.texture_cache),
             surface_id: surface_id.clone(),
             frame: frame.clone(),
             width: tex_w,
             height: tex_h,
+            format,
             damage,
             resource,
+            cached_image,
         };
         let compatible =
             |texture: &TextureResource| texture.width == tex_w && texture.height == tex_h;
@@ -747,8 +827,10 @@ impl MetalRenderer {
             let mut cache = self.texture_cache.borrow_mut();
             let mut retry_in_place = false;
             let allocation = if let Some(entry) = cache.get_mut(surface_id) {
-                if entry.textures.current().is_some_and(compatible) && damage.is_none() {
-                    return Ok(prepared(None));
+                if entry.textures.current().is_some_and(compatible)
+                    && let Some(image) = entry.image.preflight(tex_w, tex_h, format, damage)
+                {
+                    return Ok(prepared(None, Some(image)));
                 }
                 entry.textures.retain_idle_spare(compatible);
                 retry_in_place = entry.textures.current_busy()
@@ -767,7 +849,7 @@ impl MetalRenderer {
             // A pressure sweep must be able to reclaim this cache too.
             drop(cache);
             let denial = match allocation {
-                Ok(resource) => return Ok(prepared(resource)),
+                Ok(resource) => return Ok(prepared(resource, None)),
                 Err(PrepareError::Busy) => {
                     self.frame_gate.defer_redraw();
                     return Err(PixelDrawResult::Deferred);
@@ -862,21 +944,19 @@ impl MetalRenderer {
         pixels: &[u8],
         alpha: TextureAlpha,
     ) -> PixelDrawResult {
-        if geometry.width <= 0
-            || geometry.height <= 0
-            || prepared.surface_id != surface_id
-            || !prepared.owner.ptr_eq(&Rc::downgrade(&self.texture_cache))
-        {
-            return PixelDrawResult::Rejected;
-        }
         let frame_ref = self.frame.borrow();
-        let Some(frame) = frame_ref.as_ref() else {
-            return PixelDrawResult::Deferred;
-        };
-        if !frame.lifetime.accepts_preflight(&prepared.frame) {
-            self.frame_gate.defer_redraw();
-            return PixelDrawResult::Deferred;
+        if let Err(result) = prepared.validate(
+            &self.texture_cache,
+            &surface_id,
+            geometry,
+            frame_ref.as_ref().map(|frame| &frame.lifetime),
+        ) {
+            if result == PixelDrawResult::Deferred && frame_ref.is_some() {
+                self.frame_gate.defer_redraw();
+            }
+            return result;
         }
+        let frame = frame_ref.as_ref().unwrap();
 
         let texture = self.get_or_create_texture(
             prepared,
@@ -894,6 +974,59 @@ impl MetalRenderer {
             Err(result) => return result,
         };
 
+        self.encode_pixels(frame, &texture, x, y, geometry, alpha);
+        PixelDrawResult::Drawn
+    }
+
+    pub(crate) fn draw_prepared_cached(
+        &self,
+        prepared: PixelPreflight,
+        surface_id: ObjectId,
+        buffer_id: ObjectId,
+        x: i32,
+        y: i32,
+        geometry: DrawGeometry,
+    ) -> PixelDrawResult {
+        let frame_ref = self.frame.borrow();
+        if let Err(result) = prepared.validate(
+            &self.texture_cache,
+            &surface_id,
+            geometry,
+            frame_ref.as_ref().map(|frame| &frame.lifetime),
+        ) {
+            if result == PixelDrawResult::Deferred && frame_ref.is_some() {
+                self.frame_gate.defer_redraw();
+            }
+            return result;
+        }
+        let frame = frame_ref.as_ref().unwrap();
+        let mut cache = self.texture_cache.borrow_mut();
+        let Some(entry) = cache.get_mut(&surface_id) else {
+            return PixelDrawResult::Rejected;
+        };
+        if !prepared.accepts_cached_image(Some(&entry.image)) || entry.textures.current().is_none()
+        {
+            return PixelDrawResult::Rejected;
+        }
+        // Read-only reuse is safe even with in-flight readers. Never replaceRegion.
+        entry.textures.mark_read(&frame.lifetime);
+        let resource = entry.textures.current().unwrap();
+        frame.lifetime.retain_reservation(&resource.reservation);
+        entry.buffer_id = buffer_id;
+        self.allocation_warning.set(false);
+        self.encode_pixels(frame, &resource.texture, x, y, geometry, entry.alpha);
+        PixelDrawResult::Drawn
+    }
+
+    fn encode_pixels(
+        &self,
+        frame: &FrameState,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        x: i32,
+        y: i32,
+        geometry: DrawGeometry,
+        alpha: TextureAlpha,
+    ) {
         let rect = self.to_ndc(x, y, geometry.width, geometry.height);
         let uv = UvUniform::from(geometry);
         unsafe {
@@ -909,12 +1042,11 @@ impl MetalRenderer {
                 std::mem::size_of::<RectUniform>(),
                 0,
             );
-            enc.setFragmentTexture_atIndex(Some(&texture), 0);
+            enc.setFragmentTexture_atIndex(Some(texture), 0);
             enc.setVertexBytes_length_atIndex(as_bytes(&uv), std::mem::size_of::<UvUniform>(), 1);
             enc.setFragmentBytes_length_atIndex(as_bytes(&uv), std::mem::size_of::<UvUniform>(), 0);
             enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         }
-        PixelDrawResult::Drawn
     }
 
     pub fn draw_border(&self, x: i32, y: i32, width: i32, height: i32, border_width: f32) {
@@ -982,19 +1114,31 @@ impl MetalRenderer {
             return Err(PixelDrawResult::Rejected);
         }
 
+        if prepared.cached_image.is_some()
+            && !prepared.accepts_cached_image(cache.get(&surface_id).map(|entry| &entry.image))
+        {
+            return Err(PixelDrawResult::Rejected);
+        }
+
         let entry = cache
             .entry(surface_id.clone())
             .or_insert_with(|| CachedTexture {
                 textures: TextureVersions::new(),
                 buffer_id: buffer_id.clone(),
                 alpha,
+                image: Rc::new(CachedImage {
+                    width: tex_w,
+                    height: tex_h,
+                    format: prepared.format,
+                }),
             });
         let same_size = entry
             .textures
             .current()
             .is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
         let damage = prepared.damage;
-        if !same_size || damage.is_some() {
+        let same_format = entry.image.format == prepared.format;
+        if !same_size || !same_format || damage.is_some() {
             let previous = entry
                 .textures
                 .current()
@@ -1005,8 +1149,13 @@ impl MetalRenderer {
                     let same_size = idle
                         .is_some_and(|texture| texture.width == tex_w && texture.height == tex_h);
                     // Idle alternates contain an older image (or old dimensions).
-                    let upload =
-                        texture_upload_damage(is_current, same_size, damage, tex_w, tex_h)?;
+                    let upload = texture_upload_damage(
+                        is_current,
+                        same_size && same_format,
+                        damage,
+                        tex_w,
+                        tex_h,
+                    )?;
                     let byte_offset = (upload.y as usize)
                         .checked_mul(bytes_per_row)?
                         .checked_add((upload.x as usize).checked_mul(4)?)?;
@@ -1070,6 +1219,11 @@ impl MetalRenderer {
             entry
                 .textures
                 .retain_idle_spare(|texture| texture.width == tex_w && texture.height == tex_h);
+            entry.image = Rc::new(CachedImage {
+                width: tex_w,
+                height: tex_h,
+                format: prepared.format,
+            });
         }
         entry.buffer_id = buffer_id;
         entry.alpha = alpha;
@@ -1196,6 +1350,196 @@ mod headless_tests;
 #[cfg(test)]
 mod tests {
     use super::{BufferDamage, TextureAlpha, coalesce_damage, texture_upload_damage};
+
+    #[test]
+    fn empty_damage_routes_without_snapshot_only_for_the_same_image_layout() {
+        use super::*;
+        let owner = new_texture_cache();
+        let gate = Arc::new(FrameGate::default());
+        let frame = gate.begin().unwrap();
+        let image = Rc::new(CachedImage {
+            width: 2,
+            height: 3,
+            format: Format::Argb8888,
+        });
+        let damage = Some(BufferDamage {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+        for (cached, width, height, format, damage, expected_copies) in [
+            (None, 2, 3, Format::Argb8888, None, 1), // First frame.
+            (Some(&image), 2, 3, Format::Argb8888, None, 0),
+            (Some(&image), 3, 3, Format::Argb8888, None, 1),
+            (Some(&image), 2, 4, Format::Argb8888, None, 1),
+            (Some(&image), 2, 3, Format::Abgr8888, None, 1), // Same alpha, new channel order.
+            (Some(&image), 2, 3, Format::Xrgb8888, None, 1), // New alpha contract.
+            (Some(&image), 2, 3, Format::Argb8888, damage, 1),
+        ] {
+            let prepared = PixelPreflight {
+                owner: Rc::downgrade(&owner),
+                surface_id: ObjectId::null(),
+                frame: Arc::downgrade(&frame),
+                width,
+                height,
+                format,
+                damage,
+                resource: None,
+                cached_image: cached
+                    .and_then(|image| image.preflight(width, height, format, damage)),
+            };
+            let snapshots = Cell::new(0);
+            let cached_draws = Cell::new(0);
+            let copies_before = crate::render::tests::snapshot_copies();
+            assert_eq!(
+                prepared.draw_or_snapshot(
+                    |prepared| {
+                        assert!(prepared.accepts_cached_image(cached));
+                        cached_draws.set(cached_draws.get() + 1);
+                        PixelDrawResult::Drawn
+                    },
+                    |_| {
+                        snapshots.set(snapshots.get() + 1);
+                        let source = vec![42; (width * height * 4) as usize];
+                        let pixels = crate::render::tests::snapshot_fixture(
+                            smithay::wayland::shm::BufferData {
+                                offset: 0,
+                                width,
+                                height,
+                                stride: width * 4,
+                                format,
+                            },
+                            &source,
+                        )
+                        .unwrap();
+                        assert_eq!(pixels.len(), source.len());
+                        Some(PixelDrawResult::Drawn)
+                    },
+                ),
+                Some(PixelDrawResult::Drawn)
+            );
+            assert_eq!(snapshots.get(), expected_copies);
+            assert_eq!(
+                crate::render::tests::snapshot_copies() - copies_before,
+                expected_copies
+            );
+            assert_eq!(cached_draws.get(), 1 - expected_copies);
+        }
+    }
+
+    #[test]
+    fn cached_preflight_rejects_stale_image_owner_geometry_and_frame() {
+        use super::*;
+        let owner = new_texture_cache();
+        let gate = Arc::new(FrameGate::default());
+        let frame = gate.begin().unwrap();
+        let other_frame = gate.begin().unwrap();
+        let image = Rc::new(CachedImage {
+            width: 2,
+            height: 3,
+            format: Format::Argb8888,
+        });
+        let prepared = PixelPreflight {
+            owner: Rc::downgrade(&owner),
+            surface_id: ObjectId::null(),
+            frame: Arc::downgrade(&frame),
+            width: 2,
+            height: 3,
+            format: Format::Argb8888,
+            damage: None,
+            resource: None,
+            cached_image: image.preflight(2, 3, Format::Argb8888, None),
+        };
+        let geometry = SurfaceMapping {
+            buffer_scale: 1,
+            transform: smithay::reexports::wayland_server::protocol::wl_output::Transform::Normal,
+            viewport: Default::default(),
+        }
+        .geometry((2, 3), 1.0)
+        .unwrap();
+        assert_eq!(
+            prepared.validate(&owner, &ObjectId::null(), geometry, Some(&frame)),
+            Ok(())
+        );
+        assert!(prepared.accepts_cached_image(Some(&image)));
+        let replaced = Rc::new(CachedImage {
+            width: 2,
+            height: 3,
+            format: Format::Argb8888,
+        });
+        assert!(!prepared.accepts_cached_image(Some(&replaced)));
+        assert!(!prepared.accepts_cached_image(None));
+        assert_eq!(
+            prepared.validate(
+                &new_texture_cache(),
+                &ObjectId::null(),
+                geometry,
+                Some(&frame)
+            ),
+            Err(PixelDrawResult::Rejected)
+        );
+        assert_eq!(
+            prepared.validate(
+                &owner,
+                &ObjectId::null(),
+                DrawGeometry {
+                    width: 0,
+                    ..geometry
+                },
+                Some(&frame)
+            ),
+            Err(PixelDrawResult::Rejected)
+        );
+        assert_eq!(
+            prepared.validate(&owner, &ObjectId::null(), geometry, None),
+            Err(PixelDrawResult::Deferred)
+        );
+        assert_eq!(
+            prepared.validate(&owner, &ObjectId::null(), geometry, Some(&other_frame)),
+            Err(PixelDrawResult::Deferred)
+        );
+        frame.complete();
+        assert_eq!(
+            prepared.validate(&owner, &ObjectId::null(), geometry, Some(&frame)),
+            Err(PixelDrawResult::Deferred)
+        );
+        drop(image);
+        assert!(!prepared.accepts_cached_image(Some(&replaced)));
+    }
+
+    #[test]
+    fn empty_damage_can_reuse_inflight_image_without_writable_storage() {
+        use super::*;
+        let mut versions = TextureVersions::new();
+        let image = Rc::new(CachedImage {
+            width: 2,
+            height: 3,
+            format: Format::Argb8888,
+        });
+        versions
+            .update_matching(|_| true, |_, _| Some(image.clone()))
+            .unwrap();
+        let gate = Arc::new(FrameGate::default());
+        let first = gate.begin().unwrap();
+        versions.mark_read(&first);
+        assert!(versions.current_busy());
+        let second = gate.begin().unwrap();
+        let prepared = versions
+            .current()
+            .unwrap()
+            .preflight(2, 3, Format::Argb8888, None);
+        assert!(prepared.is_some());
+        versions.mark_read(&second);
+        first.complete();
+        assert!(
+            versions.current_busy(),
+            "cached draws retain their own reader fence"
+        );
+        assert!(Rc::ptr_eq(versions.current().unwrap(), &image));
+        second.complete();
+        assert!(!versions.current_busy());
+    }
 
     #[test]
     fn retaining_submitted_trace_ids_only_filters_existing_correlations_in_order() {

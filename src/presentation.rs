@@ -552,49 +552,65 @@ fn render_surface_tree(
                     let buffer_id = buffer.id();
                     // Read immutable protocol metadata only. Do not touch client
                     // pixels or invoke Metal while Smithay's SIGBUS guard is active.
-                    let preflight = smithay::wayland::shm::with_buffer_contents(
-                        &buffer,
-                        |_, _, data| data,
-                    )
-                    .map_err(|_| PixelDrawResult::Rejected)
-                    .and_then(|data| {
-                        let (width, height) = (data.width, data.height);
-                        let buffer_damage = buffer_damage_rects(
-                            &damage,
-                            width,
-                            height,
-                            buffer_scale,
-                            current.buffer_transform,
-                            mapping.viewport.src.is_some() || mapping.viewport.dst.is_some(),
-                        );
-                        let Some(geometry) = mapping.geometry((width, height), scale) else {
-                            log::warn!(
-                                "Invalid committed surface/viewport geometry for {surface_id:?}"
+                    let preflight = crate::render::buffer_metadata(&buffer)
+                        .ok_or(PixelDrawResult::Rejected)
+                        .and_then(|data| {
+                            let (width, height) = (data.width, data.height);
+                            let buffer_damage = buffer_damage_rects(
+                                &damage,
+                                width,
+                                height,
+                                buffer_scale,
+                                current.buffer_transform,
+                                mapping.viewport.src.is_some() || mapping.viewport.dst.is_some(),
                             );
-                            return Err(PixelDrawResult::Rejected);
-                        };
-                        renderer
-                            .preflight_pixels(&surface_id, width, height, &buffer_damage)
-                            .map(|prepared| (prepared, geometry))
-                    });
+                            let Some(geometry) = mapping.geometry((width, height), scale) else {
+                                log::warn!(
+                                    "Invalid committed surface/viewport geometry for {surface_id:?}"
+                                );
+                                return Err(PixelDrawResult::Rejected);
+                            };
+                            renderer
+                                .preflight_pixels(
+                                    &surface_id,
+                                    width,
+                                    height,
+                                    data.format,
+                                    &buffer_damage,
+                                )
+                                .map(|prepared| (prepared, geometry))
+                        });
                     let result = upload_after_preflight(preflight, |(prepared, geometry)| {
-                        // Keep all validation, owned copying, swizzling, and
-                        // SIGBUS handling in the existing snapshotter unchanged.
-                        crate::render::with_buffer_pixels(
-                            &buffer,
-                            |width, height, bytes_per_row, pixels, alpha| {
-                                renderer.draw_prepared_pixels(
+                        prepared.draw_or_snapshot(
+                            |prepared| {
+                                renderer.draw_prepared_cached(
                                     prepared,
                                     surface_id.clone(),
-                                    buffer_id,
+                                    buffer_id.clone(),
                                     x,
                                     y,
                                     geometry,
-                                    width,
-                                    height,
-                                    bytes_per_row,
-                                    pixels,
-                                    alpha,
+                                )
+                            },
+                            |prepared| {
+                                // Reads still use the owned, SIGBUS-guarded snapshotter.
+                                crate::render::with_buffer_pixels(
+                                    &buffer,
+                                    |width, height, bytes_per_row, pixels, alpha| {
+                                        renderer.draw_prepared_pixels(
+                                            prepared,
+                                            surface_id.clone(),
+                                            buffer_id.clone(),
+                                            x,
+                                            y,
+                                            geometry,
+                                            width,
+                                            height,
+                                            bytes_per_row,
+                                            pixels,
+                                            alpha,
+                                        )
+                                    },
                                 )
                             },
                         )

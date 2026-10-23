@@ -1233,6 +1233,7 @@ use File::Path qw(make_path);
 use POSIX qw(WNOHANG);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use Errno qw(EAGAIN EWOULDBLOCK EINTR);
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
 my $sock_path = shift @ARGV;
 my $transport_path = shift @ARGV;
 for my $path ($sock_path, $transport_path) {
@@ -1282,7 +1283,7 @@ while (length($hello) < 5) {
 die "unsupported transport handshake\n" unless $hello eq "CWV2\x01";
 print STDERR "cocoa-way transport v2: host channel connected\n";
 
-# Limits count pending user-space bytes, not kernel buffers. Outer DATA frames
+# Limits count retained user-space queue bytes, not kernel buffers. Outer DATA frames
 # may be 16 MiB, so consume their payload incrementally rather than allocating
 # an entire frame or overflowing a per-peer queue.
 my $chunk_size = 65536;
@@ -1293,6 +1294,8 @@ my $input_limit = 4 * 1024 * 1024;
 my $output_limit = 256 * 1024;
 my $output_frames_limit = 4096;
 my $max_peers = 128;
+# Bound lack of I/O progress, not the total lifetime of a slow legal transfer.
+my $deadline = 10;
 my %peers;
 my %peer_ids;
 my $next_id = 1;
@@ -1301,7 +1304,7 @@ my $output_offset = 0;
 my $output_bytes = 0;
 my $input_bytes = 0;
 my $header = '';
-my ($incoming_kind, $incoming_id, $incoming_left);
+my ($incoming_kind, $incoming_id, $incoming_left, $frame_started);
 my $transport_eof = 0;
 my $child_exited = 0;
 my $exit_code = 0;
@@ -1312,6 +1315,7 @@ my %stats = map { $_ => 0 } qw(output_high input_high peer_high peers_high outpu
 # Only isolated tests install this handler; production signal dispositions stay unchanged.
 $SIG{USR1} = sub { $stats{signals}++ } if exists $ENV{COCOA_WAY_RELAY_TEST_SIGNALS};
 
+sub now { clock_gettime(CLOCK_MONOTONIC) }
 sub nonblocking {
   my ($fh) = @_;
   my $flags = fcntl($fh, F_GETFL, 0);
@@ -1327,10 +1331,17 @@ sub send_frame {
   my $frame = pack('CNN', $kind, $id, length($data)) . $data;
   die "transport output limit exceeded\n" if $output_bytes + length($frame) > $output_limit;
   die "transport frame limit exceeded\n" if @output >= $output_frames_limit;
-  push @output, $frame;
+  push @output, [$frame, now()];
   $output_bytes += length($frame);
   $stats{output_high} = $output_bytes if $test_stats && $output_bytes > $stats{output_high};
   $stats{output_frames_high} = @output if $test_stats && @output > $stats{output_frames_high};
+}
+
+sub peer_read_size {
+  return 0 if @output >= $output_frames_limit;
+  my $size = $output_limit - $output_bytes - 9;
+  return 0 if $size <= 0;
+  return $size < $chunk_size ? $size : $chunk_size;
 }
 
 sub closing_peer {
@@ -1377,14 +1388,36 @@ sub watch {
   $poll->mask($fh => ($poll->mask($fh) || 0) | $flags);
 }
 
+sub child_exit_code {
+  my ($status) = @_;
+  return ($status & 127) ? 128 + ($status & 127) : $status >> 8;
+}
+
 RELAY: while (1) {
   if (!$child_exited && waitpid($pid, WNOHANG) == $pid) {
+    $exit_code ||= child_exit_code($?);
     $child_exited = 1;
     closing_peer($_, 0, 0) for keys %peers;
   }
   retire_peers();
   last RELAY if ($transport_eof || $child_exited) && !$input_bytes && !$output_bytes;
 
+  my @expires;
+  push @expires, $frame_started + $deadline if defined $frame_started;
+  push @expires, $output[0][1] + $deadline if @output;
+  for my $p (values %peers) {
+    push @expires, $p->{queue}[0][1] + $deadline if @{$p->{queue}};
+  }
+  my $wait = 0.25;
+  for my $expires (@expires) {
+    my $remaining = $expires - now();
+    if ($remaining <= 0) {
+      print STDERR "transport queue/frame deadline exceeded\n";
+      $exit_code = 1;
+      last RELAY;
+    }
+    $wait = $remaining if $remaining < $wait;
+  }
   my $poll = IO::Poll->new();
   # Observe full disconnect even while DATA reads are paused by a slow peer.
   # A write-half EOF still drains completed peer queues; a full HUP cannot.
@@ -1415,7 +1448,7 @@ RELAY: while (1) {
   for my $p (values %peers) {
     watch($poll, $p->{fh}, POLLOUT) if $p->{bytes};
     if (!$p->{closing} && !$transport_eof && !$child_exited) {
-      if ($output_bytes + $chunk_size + 9 <= $output_limit && @output < $output_frames_limit) {
+      if (peer_read_size()) {
         watch($poll, $p->{fh}, POLLIN);
       } else {
         $stats{output_pauses}++ if $test_stats;
@@ -1423,7 +1456,7 @@ RELAY: while (1) {
     }
   }
   $! = 0;
-  my $ready_count = $poll->poll(0.25);
+  my $ready_count = $poll->poll($wait);
   if ($ready_count < 0) {
     $stats{eintr}++ if $test_stats && $! == EINTR;
     next RELAY if !$! || $! == EINTR;
@@ -1440,38 +1473,48 @@ RELAY: while (1) {
   # offset. Frames stay FIFO on the transport, and bytes stay FIFO in each peer.
   for my $fh ($poll->handles(POLLOUT)) {
     if ($fh == $transport) {
-      my $size = length($output[0]) - $output_offset;
+      my $size = length($output[0][0]) - $output_offset;
       $size = $chunk_size if $size > $chunk_size;
-      my $n = syswrite($transport, $output[0], $size, $output_offset);
+      my $n = syswrite($transport, $output[0][0], $size, $output_offset);
       next if retry_io($n, 'write_eagain');
       if (!defined $n || $n == 0) {
         $exit_code = 1;
         last RELAY;
       }
       $stats{transport_partial}++ if $test_stats && $n < $size;
-      $output_bytes -= $n;
       $output_offset += $n;
-      if ($output_offset == length($output[0])) {
+      # Keep the allocation charged until completion, but refresh only this
+      # lane's successful-write clock. Enqueueing must not hide a stalled sink.
+      $output[0][1] = now();
+      if ($output_offset == length($output[0][0])) {
+        $output_bytes -= length($output[0][0]);
         shift @output;
         $output_offset = 0;
+        $output[0][1] = now() if @output;
       }
     } else {
       my $id = $peer_ids{fileno($fh)};
       my $p = $peers{$id} or next;
-      my $size = length($p->{queue}[0]) - $p->{offset};
-      my $n = syswrite($fh, $p->{queue}[0], $size, $p->{offset});
+      my $size = length($p->{queue}[0][0]) - $p->{offset};
+      my $n = syswrite($fh, $p->{queue}[0][0], $size, $p->{offset});
       next if retry_io($n, 'write_eagain');
       if (!defined $n || $n == 0) {
         closing_peer($id, 1, 1);
         next;
       }
       $stats{peer_partial}++ if $test_stats && $n < $size;
-      $p->{bytes} -= $n;
-      $input_bytes -= $n;
       $p->{offset} += $n;
-      if ($p->{offset} == length($p->{queue}[0])) {
+      $p->{queue}[0][1] = now();
+      # A DATA frame can be flow-controlled by its own destination. Draining
+      # that peer is progress too; traffic on other peers must not extend it.
+      $frame_started = now() if defined $frame_started && defined $incoming_kind
+        && $incoming_kind == 2 && $incoming_id == $id;
+      if ($p->{offset} == length($p->{queue}[0][0])) {
+        $p->{bytes} -= length($p->{queue}[0][0]);
+        $input_bytes -= length($p->{queue}[0][0]);
         shift @{$p->{queue}};
         $p->{offset} = 0;
+        $p->{queue}[0][1] = now() if @{$p->{queue}};
       }
     }
   }
@@ -1522,6 +1565,7 @@ RELAY: while (1) {
         closing_peer($_, 0, 0) for keys %peers;
         next;
       }
+      $frame_started = now();
       if (!defined $incoming_kind) {
         $header .= $data;
         next unless length($header) == 9;
@@ -1537,11 +1581,11 @@ RELAY: while (1) {
       } else {
         if ($p) {
           if (@{$p->{queue}}) {
-            my $space = $chunk_size - length($p->{queue}[-1]);
+            my $space = $chunk_size - length($p->{queue}[-1][0]);
             $space = length($data) if length($data) < $space;
-            $p->{queue}[-1] .= substr($data, 0, $space, '') if $space;
+            $p->{queue}[-1][0] .= substr($data, 0, $space, '') if $space;
           }
-          push @{$p->{queue}}, $data if length($data);
+          push @{$p->{queue}}, [pack('a*', $data), now()] if length($data);
           $p->{bytes} += $n;
           $input_bytes += $n;
           $stats{peer_high} = $p->{bytes} if $test_stats && $p->{bytes} > $stats{peer_high};
@@ -1550,17 +1594,17 @@ RELAY: while (1) {
         }
         $incoming_left -= $n;
       }
-      ($incoming_kind, $incoming_id, $incoming_left) = (undef, undef, undef) unless $incoming_left;
+      ($incoming_kind, $incoming_id, $incoming_left, $frame_started) = (undef, undef, undef, undef) unless $incoming_left;
       next;
     }
 
     my $id = $peer_ids{fileno($fh)};
     my $p = $peers{$id} or next;
-    next if $p->{closing} || $output_bytes + $chunk_size + 9 > $output_limit
-      || @output >= $output_frames_limit;
+    my $size = peer_read_size();
+    next if $p->{closing} || !$size;
     $read_cursor = $id + 1;
     my $data = '';
-    my $n = sysread($fh, $data, $chunk_size);
+    my $n = sysread($fh, $data, $size);
     next if retry_io($n, 'read_eagain');
     if (!defined $n || $n == 0) {
       closing_peer($id, 1, 0);
@@ -1572,13 +1616,39 @@ RELAY: while (1) {
 for my $id (keys %peers) {
   close $peers{$id}{fh};
 }
+sub stop_child {
+  my ($child) = @_;
+  my $reaped = waitpid($child, WNOHANG);
+  return child_exit_code($?) if $reaped == $child;
+  return 1 if $reaped < 0 && $! != EINTR;
+  for my $phase (['TERM', 1.0], ['KILL', 0.25]) {
+    my ($signal, $grace) = @$phase;
+    print STDERR "transport child exceeded TERM grace; sending KILL\n" if $signal eq 'KILL';
+    kill $signal, $child;
+    my $until = now() + $grace;
+    while (1) {
+      my $result = waitpid($child, WNOHANG);
+      if ($result == $child) {
+        my $status = $?;
+        # TERM is our ordinary shutdown request; forced KILL and a cleanup
+        # handler's explicit failure must never masquerade as success.
+        return 0 if $signal eq 'TERM' && ($status & 127) == 15;
+        return child_exit_code($status);
+      }
+      return 1 if $result < 0 && $! != EINTR;
+      last if now() >= $until;
+      select undef, undef, undef, 0.005;
+    }
+  }
+  return 137;
+}
 unless ($child_exited) {
-  kill 'TERM', $pid;
-  waitpid($pid, 0);
+  my $status = stop_child($pid);
+  $exit_code ||= $status;
 }
 if (defined $audio_pid) {
-  kill 'TERM', $audio_pid;
-  waitpid($audio_pid, 0);
+  my $status = stop_child($audio_pid);
+  $exit_code ||= $status;
 }
 unlink $sock_path;
 unlink $transport_path;

@@ -12,6 +12,8 @@ const MAX_CACHED_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 thread_local! {
     static PIXEL_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static SNAPSHOT_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct PixelScratch {
@@ -72,6 +74,16 @@ pub fn with_buffer_pixels<T>(
         &scratch.pixels,
         alpha,
     ))
+}
+
+/// Validate the entire advertised buffer range without reading client memory.
+/// The returned protocol metadata is owned; no SHM pointer escapes the guard.
+pub(crate) fn buffer_metadata(buffer: &WlBuffer) -> Option<BufferData> {
+    with_buffer_contents(buffer, |ptr, len, data| {
+        validate_pool_metadata(ptr, len, data)?;
+        Some(data)
+    })
+    .ok()?
 }
 
 /// Read only the audit marker's first-row prefix, without a full-image snapshot.
@@ -176,17 +188,28 @@ unsafe fn snapshot_pool_pixels(
     data: BufferData,
     pixels: &mut Vec<u8>,
 ) -> Option<PixelLayout> {
-    shm_format_alpha(data.format)?;
-    let layout = PixelLayout::for_buffer(pool_len, data)?;
-    if ptr.is_null() {
-        return None;
-    }
+    let layout = validate_pool_metadata(ptr, pool_len, data)?;
     pixels.clear();
     pixels.try_reserve_exact(layout.byte_len).ok()?;
     // Only expose initialized host bytes, and only after the raw copy completes.
     unsafe {
         std::ptr::copy_nonoverlapping(ptr.add(layout.offset), pixels.as_mut_ptr(), layout.byte_len);
         pixels.set_len(layout.byte_len);
+    }
+    #[cfg(test)]
+    SNAPSHOT_COPIES.with(|copies| copies.set(copies.get() + 1));
+    Some(layout)
+}
+
+fn validate_pool_metadata(
+    ptr: *const u8,
+    pool_len: usize,
+    data: BufferData,
+) -> Option<PixelLayout> {
+    shm_format_alpha(data.format)?;
+    let layout = PixelLayout::for_buffer(pool_len, data)?;
+    if ptr.is_null() {
+        return None;
     }
     Some(layout)
 }
@@ -253,8 +276,20 @@ fn pixel_to_bgra(format: Format, bytes: &[u8]) -> Option<[u8; 4]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn snapshot_copies() -> usize {
+        SNAPSHOT_COPIES.with(|copies| copies.get())
+    }
+
+    // Exercise real scratch checkout, raw copy and conversion with stable host input.
+    pub(crate) fn snapshot_fixture(data: BufferData, source: &[u8]) -> Option<Vec<u8>> {
+        let mut scratch = PixelScratch::take();
+        let layout = snapshot_into(source, data, &mut scratch.pixels)?;
+        prepare_snapshot_pixels(&mut scratch.pixels, layout, data.format)?;
+        Some(scratch.pixels.clone())
+    }
 
     fn buffer_data(format: Format) -> BufferData {
         BufferData {
@@ -537,6 +572,7 @@ mod tests {
         ];
         let mut pixels = vec![42];
         for data in invalid {
+            assert!(validate_pool_metadata([1, 2, 3, 4].as_ptr(), 4, data).is_none());
             assert!(snapshot_into(&[1, 2, 3, 4], data, &mut pixels).is_none());
             assert_eq!(pixels, [42]);
         }
@@ -544,6 +580,47 @@ mod tests {
         // SAFETY: A null source is rejected without dereferencing it.
         assert!(unsafe { snapshot_pool_pixels(std::ptr::null(), 4, data, &mut pixels) }.is_none());
         assert_eq!(pixels, [42]);
+    }
+
+    #[test]
+    fn metadata_validation_never_reads_pixels_and_checks_the_full_range() {
+        // Deliberately inaccessible: validation must use only the pointer's nullness.
+        let ptr = std::ptr::dangling::<u8>();
+        let data = BufferData {
+            offset: 7,
+            width: 2,
+            height: 3,
+            stride: 12,
+            format: Format::Argb8888,
+        };
+        for format in [
+            Format::Argb8888,
+            Format::Xrgb8888,
+            Format::Abgr8888,
+            Format::Xbgr8888,
+            Format::Rgba8888,
+            Format::Rgbx8888,
+            Format::Bgra8888,
+            Format::Bgrx8888,
+        ] {
+            let data = BufferData { format, ..data };
+            assert!(validate_pool_metadata(ptr, 39, data).is_some());
+            assert!(validate_pool_metadata(ptr, 38, data).is_none());
+        }
+        assert!(validate_pool_metadata(std::ptr::null(), 39, data).is_none());
+        assert!(
+            validate_pool_metadata(
+                ptr,
+                usize::MAX,
+                BufferData {
+                    width: 1,
+                    height: 2,
+                    stride: MAX_SNAPSHOT_BYTES as i32,
+                    ..data
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -4,6 +4,31 @@
 //! the previous focus before applying an owner change to the actual keyboard.
 
 use std::collections::BTreeSet;
+use std::time::Instant;
+
+use winit::event::{Event, MouseButton};
+
+/// Winit emits device precursors and NewEvents before native window input.
+/// UserEvent must not drain/replenish control work inside Winit's proxy drain.
+pub fn admit_control_work<T: 'static>(
+    event: &Event<T>,
+    budget: &mut crate::event_turn::ControlWorkBudget,
+    now: Instant,
+) -> bool {
+    matches!(event, Event::AboutToWait) && budget.admit(now)
+}
+
+/// NSEvent's Other button numbers are not Linux evdev codes.
+pub fn evdev_mouse_button(button: MouseButton) -> Option<u32> {
+    match button {
+        MouseButton::Left => Some(0x110),
+        MouseButton::Right => Some(0x111),
+        MouseButton::Middle => Some(0x112),
+        MouseButton::Back => Some(0x116),
+        MouseButton::Forward => Some(0x115),
+        MouseButton::Other(_) => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyTransition {
@@ -141,6 +166,217 @@ impl PointerLockEligibility {
 #[cfg(test)]
 mod tests {
     use super::{KeyTransition, KeyTransitionReducer, PointerLockEligibility, resume_focus};
+
+    #[test]
+    fn native_precursors_and_proxy_events_leave_control_work_for_about_to_wait() {
+        use super::admit_control_work;
+        use crate::event_turn::ControlWorkBudget;
+        use std::time::Instant;
+        use winit::event::{
+            DeviceEvent, DeviceId, ElementState, Event, MouseButton, MouseScrollDelta, StartCause,
+            TouchPhase, WindowEvent,
+        };
+
+        let (sender, receiver) = crate::event_loop_signal::channel_with_waker(|| {});
+        sender.send(1).unwrap();
+        sender.send(2).unwrap();
+        let now = Instant::now();
+        let device_id = DeviceId::dummy();
+        let window_id = winit::window::WindowId::from(1_u64);
+        let device = |event| Event::<()>::DeviceEvent { device_id, event };
+        let window = |event| Event::<()>::WindowEvent { window_id, event };
+        let delta = MouseScrollDelta::LineDelta(0.0, 1.0);
+        // Preserve macOS's axis -> relative -> absolute, device -> button, and
+        // device-wheel -> window-wheel ordering, plus the surrounding loop events.
+        let events = [
+            Event::NewEvents(StartCause::WaitCancelled {
+                start: now,
+                requested_resume: None,
+            }),
+            window(WindowEvent::CursorEntered { device_id }),
+            device(DeviceEvent::Motion {
+                axis: 0,
+                value: 2.0,
+            }),
+            device(DeviceEvent::Motion {
+                axis: 1,
+                value: 3.0,
+            }),
+            device(DeviceEvent::MouseMotion { delta: (2.0, 3.0) }),
+            window(WindowEvent::CursorMoved {
+                device_id,
+                position: (20.0, 30.0).into(),
+            }),
+            device(DeviceEvent::Button {
+                button: 0,
+                state: ElementState::Pressed,
+            }),
+            window(WindowEvent::MouseInput {
+                device_id,
+                button: MouseButton::Left,
+                state: ElementState::Pressed,
+            }),
+            window(WindowEvent::ModifiersChanged(Default::default())),
+            device(DeviceEvent::MouseWheel { delta }),
+            window(WindowEvent::MouseWheel {
+                device_id,
+                delta,
+                phase: TouchPhase::Moved,
+            }),
+            Event::UserEvent(()),
+            window(WindowEvent::RedrawRequested),
+            window(WindowEvent::Focused(false)),
+            window(WindowEvent::CursorLeft { device_id }),
+            window(WindowEvent::CloseRequested),
+            window(WindowEvent::Destroyed),
+            Event::LoopExiting,
+        ];
+        // Use an otherwise-admitting budget: event policy, not the old input
+        // classification, must prevent each precursor from consuming the queue.
+        for event in events {
+            let mut budget = ControlWorkBudget::new(false, now);
+            assert!(!admit_control_work(&event, &mut budget, now), "{event:?}");
+        }
+        let mut budget = ControlWorkBudget::new(false, now);
+        let mut received = Vec::new();
+        while admit_control_work(&Event::<()>::AboutToWait, &mut budget, now) {
+            let Ok(message) = receiver.try_recv() else {
+                break;
+            };
+            sender.message_received();
+            received.push(message);
+        }
+        assert_eq!(received, [1, 2]);
+        assert!(!sender.finish_turn());
+    }
+
+    #[test]
+    fn control_backlog_yields_without_replenishing_the_proxy_drain() {
+        use super::admit_control_work;
+        use crate::event_turn::ControlWorkBudget;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Instant;
+        use winit::event::{DeviceEvent, DeviceId, Event, StartCause, WindowEvent};
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counted_wakes = wakes.clone();
+        let (sender, receiver) = crate::event_loop_signal::channel_with_waker(move || {
+            counted_wakes.fetch_add(1, Ordering::SeqCst);
+        });
+        for message in 0..130 {
+            sender.send(message).unwrap();
+        }
+        let now = Instant::now();
+        let mut received = Vec::new();
+        for expected in [64, 128, 131] {
+            // A backlog must not turn repeated proxy events into control turns.
+            for _ in 0..64 {
+                let mut budget = ControlWorkBudget::new(false, now);
+                assert!(!admit_control_work(&Event::UserEvent(()), &mut budget, now));
+            }
+            for event in [
+                Event::NewEvents(StartCause::Poll),
+                Event::DeviceEvent {
+                    device_id: DeviceId::dummy(),
+                    event: DeviceEvent::MouseMotion { delta: (1.0, 0.0) },
+                },
+                Event::WindowEvent {
+                    window_id: winit::window::WindowId::from(1_u64),
+                    event: WindowEvent::RedrawRequested,
+                },
+            ] {
+                let mut budget = ControlWorkBudget::new(false, now);
+                assert!(!admit_control_work::<()>(&event, &mut budget, now));
+            }
+            let mut budget = ControlWorkBudget::new(false, now);
+            while admit_control_work(&Event::<()>::AboutToWait, &mut budget, now) {
+                let Ok(message) = receiver.try_recv() else {
+                    break;
+                };
+                sender.message_received();
+                received.push(message);
+                if message == 0 {
+                    sender.send(130).unwrap();
+                }
+            }
+            assert_eq!(received.len(), expected);
+            assert_eq!(sender.finish_turn(), expected < 131);
+            assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(received, (0..131).collect::<Vec<_>>());
+        // Once idle, fresh work still wakes the native loop.
+        sender.send(131).unwrap();
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn maintenance_time_budget_preserves_queued_work_for_the_next_turn() {
+        use super::admit_control_work;
+        use crate::event_turn::ControlWorkBudget;
+        use std::time::{Duration, Instant};
+        use winit::event::Event;
+
+        let (sender, receiver) = crate::event_loop_signal::channel_with_waker(|| {});
+        sender.send(1).unwrap();
+        sender.send(2).unwrap();
+        let event = Event::<()>::AboutToWait;
+        let now = Instant::now();
+        let mut budget = ControlWorkBudget::new(false, now);
+        assert!(admit_control_work(&event, &mut budget, now));
+        assert_eq!(receiver.try_recv().unwrap(), 1);
+        sender.message_received();
+        let later = now + Duration::from_millis(2);
+        assert!(!admit_control_work(&event, &mut budget, later));
+        assert!(sender.finish_turn());
+        let mut next_budget = ControlWorkBudget::new(false, later);
+        assert!(admit_control_work(&event, &mut next_budget, later));
+        assert_eq!(receiver.try_recv().unwrap(), 2);
+        sender.message_received();
+        assert!(!sender.finish_turn());
+    }
+
+    #[test]
+    fn mouse_buttons_use_explicit_evdev_codes() {
+        use super::evdev_mouse_button;
+        use winit::event::MouseButton::*;
+
+        for (button, expected) in [
+            (Left, 0x110),
+            (Right, 0x111),
+            (Middle, 0x112),
+            (Back, 0x116),
+            (Forward, 0x115),
+        ] {
+            assert_eq!(evdev_mouse_button(button), Some(expected));
+        }
+        for code in [0, 5, 0x110, u16::MAX] {
+            assert_eq!(evdev_mouse_button(Other(code)), None);
+        }
+    }
+
+    #[test]
+    fn side_button_release_cannot_release_a_held_left_button() {
+        use super::evdev_mouse_button;
+        use winit::event::MouseButton::*;
+
+        for side in [Back, Forward] {
+            let sequence = [(Left, true), (side, true), (side, false), (Left, false)];
+            for (length, expected) in [(3, vec![0x110]), (4, vec![])] {
+                let mut pointer = crate::pointer_input::PointerInput::<u64, u64>::default();
+                let mut delivered = Vec::new();
+                for &(button, pressed) in &sequence[..length] {
+                    let code = evdev_mouse_button(button).unwrap();
+                    pointer.button(code, pressed);
+                    delivered.push((code, pressed));
+                }
+                assert_eq!(delivered[2], (evdev_mouse_button(side).unwrap(), false));
+                assert_eq!(pointer.take_buttons(), expected);
+            }
+        }
+    }
 
     #[test]
     fn clipboard_refresh_is_reserved_for_paste_not_ordinary_key_transitions() {

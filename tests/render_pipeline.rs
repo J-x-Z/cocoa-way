@@ -130,3 +130,34 @@ fn bounded_wayland_dispatch_reschedules_buffered_work_without_idle_polling() {
     let (_, waiting) = source.split_once("Event::AboutToWait => {").unwrap();
     assert!(waiting.contains("wayland_source.rearm();"));
 }
+
+#[test]
+fn cached_empty_damage_keeps_validation_preflight_and_shared_finish_wired() {
+    let source = include_str!("../src/presentation.rs");
+    let (_, render) = source.split_once("fn render_surface_tree(").unwrap();
+    let (render, _) = render.split_once("fn upload_after_preflight").unwrap();
+    let metadata = render
+        .find("crate::render::buffer_metadata(&buffer)")
+        .unwrap();
+    let preflight = render.find(".preflight_pixels(").unwrap();
+    let route = render.find("prepared.draw_or_snapshot(").unwrap();
+    let cached = render.find("renderer.draw_prepared_cached(").unwrap();
+    let snapshot = render.find("crate::render::with_buffer_pixels(").unwrap();
+    let finish = render.find("rendered += finish_buffer_upload(").unwrap();
+    assert!(metadata < preflight && preflight < route && route < cached);
+    assert!(cached < snapshot && snapshot < finish);
+
+    let renderer = include_str!("../src/metal_renderer.rs");
+    let (_, cached) = renderer
+        .split_once("pub(crate) fn draw_prepared_cached(")
+        .unwrap();
+    let (cached, _) = cached.split_once("fn encode_pixels(").unwrap();
+    assert!(cached.contains("prepared.validate("));
+    assert!(cached.contains("prepared.accepts_cached_image("));
+    assert!(cached.contains("entry.textures.mark_read(&frame.lifetime)"));
+    assert!(cached.contains("frame.lifetime.retain_reservation(&resource.reservation)"));
+    assert!(cached.contains("entry.buffer_id = buffer_id"));
+    assert!(cached.contains("geometry, entry.alpha"));
+    assert!(!cached.contains("replaceRegion_"));
+    assert!(renderer.contains("same_size && same_format,"));
+}

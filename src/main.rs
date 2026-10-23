@@ -3805,6 +3805,54 @@ fn window_refresh_millihertz(window: &winit::window::Window) -> Option<u32> {
         .and_then(|monitor| monitor.refresh_rate_millihertz())
 }
 
+fn sync_window_refresh(
+    window_id: winit::window::WindowId,
+    refresh: Option<u32>,
+    window_clock: &mut frame_clock::FrameClock,
+    cursor_owner: Option<winit::window::WindowId>,
+    cursor_clock: &mut frame_clock::FrameClock,
+) {
+    window_clock.set_refresh_millihertz(refresh);
+    if cursor_owner == Some(window_id) {
+        cursor_clock.set_refresh_millihertz(Some(window_clock.refresh_millihertz()));
+    }
+}
+
+#[cfg(test)]
+mod input_refresh_tests {
+    use super::{frame_clock::FrameClock, sync_window_refresh};
+    use std::time::{Duration, Instant};
+    use winit::window::WindowId;
+
+    #[test]
+    fn selected_window_refresh_updates_cursor_without_reentry() {
+        let owner = WindowId::from(1_u64);
+        for (old, new) in [(60_000, 120_000), (120_000, 60_000)] {
+            let mut window = FrameClock::new(Some(old));
+            let mut cursor = FrameClock::new(Some(old));
+            let start = Instant::now();
+            cursor.record_frame_started(start);
+            sync_window_refresh(owner, Some(new), &mut window, Some(owner), &mut cursor);
+            assert_eq!(window.refresh_millihertz(), new);
+            assert_eq!(cursor.refresh_millihertz(), new);
+            let period = Duration::from_nanos(1_000_000_000_000_u64.div_ceil(u64::from(new)));
+            assert_eq!(cursor.next_due(start, true), Some(start + period));
+            assert_eq!(cursor.next_due(start, false), None);
+        }
+    }
+
+    #[test]
+    fn another_windows_refresh_cannot_retime_the_active_cursor() {
+        let owner = WindowId::from(1_u64);
+        let other = WindowId::from(2_u64);
+        let mut window = FrameClock::new(Some(60_000));
+        let mut cursor = FrameClock::new(Some(60_000));
+        sync_window_refresh(other, Some(120_000), &mut window, Some(owner), &mut cursor);
+        assert_eq!(window.refresh_millihertz(), 120_000);
+        assert_eq!(cursor.refresh_millihertz(), 60_000);
+    }
+}
+
 fn dispatch_wayland_turn(
     display: &mut Display<AppState>,
     state: &mut AppState,
@@ -3842,17 +3890,12 @@ fn rootless_pointer_button(
     element_state: ElementState,
     time: u32,
 ) {
+    let Some(button) = input_policy::evdev_mouse_button(button) else {
+        return;
+    };
     if element_state == ElementState::Pressed {
         activate_toplevel(state, Some(rootless.toplevel.wl_surface()));
     }
-    let button = match button {
-        winit::event::MouseButton::Left => 0x110,
-        winit::event::MouseButton::Right => 0x111,
-        winit::event::MouseButton::Middle => 0x112,
-        winit::event::MouseButton::Back => 0x116,
-        winit::event::MouseButton::Forward => 0x115,
-        winit::event::MouseButton::Other(code) => u32::from(code),
-    };
     let pointer = state
         .seat
         .get_pointer()
@@ -4048,6 +4091,9 @@ fn create_event_handler(
     let mut desktop_clock =
         frame_clock::FrameClock::new(window_refresh_millihertz(&renderer.window));
     let mut cursor_clock = frame_clock::FrameClock::new(Some(desktop_clock.refresh_millihertz()));
+    // Like the clock, retain the last native content owner until another takes over.
+    // Wayland focus may instead remain on an old surface during an implicit grab.
+    let mut cursor_clock_owner = None;
 
     let mut last_mouse_pos =
         smithay::utils::Point::<f64, smithay::utils::Logical>::from((0.0, 0.0));
@@ -4071,7 +4117,9 @@ fn create_event_handler(
     let mut desktop_keyboard_focus = None;
     let mut reveal_first_desktop_client = !presentation_mode.is_rootless();
     Ok(move |event: Event<()>, target: &ActiveEventLoop| {
-        lifecycle_cleanup.poll();
+        if matches!(&event, Event::AboutToWait) {
+            lifecycle_cleanup.poll();
+        }
         if !matches!(&event, Event::LoopExiting)
             && let Some(error) = wayland_source.take_failure()
         {
@@ -4213,7 +4261,9 @@ fn create_event_handler(
         let mut message_budget =
             event_turn::ControlWorkBudget::new(input_event, std::time::Instant::now());
         let mut profile_ownership_changed = false;
-        while message_budget.admit(std::time::Instant::now()) {
+        // Only AboutToWait consumes control work. Device precursors/NewEvents
+        // precede native input; UserEvent must yield out of Winit's proxy drain.
+        while input_policy::admit_control_work(&event, &mut message_budget, std::time::Instant::now()) {
             let Ok(msg) = loop_receiver.try_recv() else {
                 break;
             };
@@ -5924,6 +5974,20 @@ fn create_event_handler(
                     .expect("rootless window disappeared during event dispatch");
                 let mut keep_window = true;
                 let event_time = start_time.elapsed().as_millis() as u32;
+                if matches!(
+                    &event,
+                    WindowEvent::Resized(_)
+                        | WindowEvent::ScaleFactorChanged { .. }
+                        | WindowEvent::Moved(_)
+                ) {
+                    sync_window_refresh(
+                        window_id,
+                        window_refresh_millihertz(&rootless.renderer.window),
+                        rootless_clocks.entry(window_id).or_default(),
+                        cursor_clock_owner,
+                        &mut cursor_clock,
+                    );
+                }
                 match event {
                     WindowEvent::Resized(size) => {
                         waiting_for_renderer.remove(&window_id);
@@ -5932,12 +5996,6 @@ fn create_event_handler(
                             &rootless.renderer.window,
                             event_time,
                         );
-                        rootless_clocks
-                            .entry(window_id)
-                            .or_default()
-                            .set_refresh_millihertz(window_refresh_millihertz(
-                                &rootless.renderer.window,
-                            ));
                         log::debug!(
                             "Rootless native resize {:?}: physical={}x{} logical={}x{} scale={}",
                             rootless.surface_id(),
@@ -5966,12 +6024,6 @@ fn create_event_handler(
                             &rootless.renderer.window,
                             event_time,
                         );
-                        rootless_clocks
-                            .entry(window_id)
-                            .or_default()
-                            .set_refresh_millihertz(window_refresh_millihertz(
-                                &rootless.renderer.window,
-                            ));
                         rootless.scale_factor = scale_factor;
                         rootless.renderer.set_scale_factor(scale_factor);
                         let size = rootless.renderer.window.inner_size();
@@ -5985,14 +6037,6 @@ fn create_event_handler(
                         );
                         state.rootless_dirty_surfaces.insert(rootless.surface_id());
                         state.needs_redraw = true;
-                    }
-                    WindowEvent::Moved(_) => {
-                        rootless_clocks
-                            .entry(window_id)
-                            .or_default()
-                            .set_refresh_millihertz(window_refresh_millihertz(
-                                &rootless.renderer.window,
-                            ));
                     }
                     WindowEvent::CloseRequested => {
                         retire_input_window(
@@ -6053,6 +6097,7 @@ fn create_event_handler(
                         if state.pointer_input.native_grab().is_none() =>
                     {
                         rootless.renderer.window.set_cursor_visible(true);
+                        cursor_clock_owner = Some(window_id);
                         cursor_clock.set_refresh_millihertz(Some(
                             rootless_clocks
                                 .entry(window_id)
@@ -6086,6 +6131,12 @@ fn create_event_handler(
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
                         }
+                        if cursor_clock_owner != Some(window_id) {
+                            cursor_clock_owner = Some(window_id);
+                            cursor_clock.set_refresh_millihertz(Some(
+                                rootless_clocks.entry(window_id).or_default().refresh_millihertz(),
+                            ));
+                        }
                         state.native_cursor_motion(&rootless.renderer.window, window_id);
                         rootless_pointer_motion(&mut state, &mut rootless, position, event_time);
                     }
@@ -6096,7 +6147,8 @@ fn create_event_handler(
                     } if state
                         .pointer_input
                         .native_grab()
-                        .is_none_or(|grab| grab.owner == window_id) =>
+                        .is_none_or(|grab| grab.owner == window_id)
+                        && input_policy::evdev_mouse_button(button).is_some() =>
                     {
                         if pending_input_sample.is_none() {
                             pending_input_sample =
@@ -6232,6 +6284,28 @@ fn create_event_handler(
                 }
             }
             Event::WindowEvent { window_id, event } if window_id == renderer.window.id() => {
+                if matches!(
+                    &event,
+                    WindowEvent::Resized(_)
+                        | WindowEvent::ScaleFactorChanged { .. }
+                        | WindowEvent::Moved(_)
+                ) {
+                    sync_window_refresh(
+                        window_id,
+                        window_refresh_millihertz(&renderer.window),
+                        &mut desktop_clock,
+                        cursor_clock_owner,
+                        &mut cursor_clock,
+                    );
+                    // Resize publishes the new size and rate together below.
+                    if !matches!(&event, WindowEvent::Resized(_))
+                        && let Some(mut mode) = state.output.current_mode()
+                        && mode.refresh != desktop_clock.refresh_millihertz() as i32
+                    {
+                        mode.refresh = desktop_clock.refresh_millihertz() as i32;
+                        state.output.change_current_state(Some(mode), None, None, None);
+                    }
+                }
                 match event {
                     WindowEvent::Resized(size) => {
                         invalidate_pointer_window(
@@ -6240,8 +6314,6 @@ fn create_event_handler(
                             start_time.elapsed().as_millis() as u32,
                         );
                         waiting_for_renderer.remove(&window_id);
-                        desktop_clock
-                            .set_refresh_millihertz(window_refresh_millihertz(&renderer.window));
                         renderer.resize(size.width, size.height);
                         state.width = size.width;
                         state.height = size.height;
@@ -6286,26 +6358,11 @@ fn create_event_handler(
                             start_time.elapsed().as_millis() as u32,
                         );
                         waiting_for_renderer.remove(&window_id);
-                        desktop_clock
-                            .set_refresh_millihertz(window_refresh_millihertz(&renderer.window));
                         log::info!("ScaleFactorChanged: {}", scale_factor);
                         state.update_scale_factor(scale_factor);
                         renderer.set_scale_factor(scale_factor);
                         state.set_native_cursor_point_scale(state.scale_factor / scale_factor);
                         state.needs_redraw = true;
-                    }
-                    WindowEvent::Moved(_) => {
-                        let previous_refresh = desktop_clock.refresh_millihertz();
-                        desktop_clock
-                            .set_refresh_millihertz(window_refresh_millihertz(&renderer.window));
-                        if previous_refresh != desktop_clock.refresh_millihertz()
-                            && let Some(mut mode) = state.output.current_mode()
-                        {
-                            mode.refresh = desktop_clock.refresh_millihertz() as i32;
-                            state
-                                .output
-                                .change_current_state(Some(mode), None, None, None);
-                        }
                     }
                     WindowEvent::CloseRequested => {
                         retire_input_window(
@@ -6339,6 +6396,7 @@ fn create_event_handler(
                         if state.pointer_input.native_grab().is_none() =>
                     {
                         renderer.window.set_cursor_visible(true);
+                        cursor_clock_owner = Some(window_id);
                         cursor_clock
                             .set_refresh_millihertz(Some(desktop_clock.refresh_millihertz()));
                         state.set_native_cursor_point_scale(
@@ -6432,6 +6490,11 @@ fn create_event_handler(
                             pending_input_sample =
                                 Some((std::time::Instant::now(), state.commit_counter));
                         }
+                        if cursor_clock_owner != Some(window_id) {
+                            cursor_clock_owner = Some(window_id);
+                            cursor_clock
+                                .set_refresh_millihertz(Some(desktop_clock.refresh_millihertz()));
+                        }
                         state.native_cursor_motion(&renderer.window, window_id);
                         let scale = state.scale_factor;
                         let logical_pos = position.to_logical::<f64>(scale);
@@ -6497,7 +6560,8 @@ fn create_event_handler(
                     } if state
                         .pointer_input
                         .native_grab()
-                        .is_none_or(|grab| grab.owner == window_id) =>
+                        .is_none_or(|grab| grab.owner == window_id)
+                        && input_policy::evdev_mouse_button(button).is_some() =>
                     {
                         if pending_input_sample.is_none() {
                             pending_input_sample =
@@ -6522,12 +6586,8 @@ fn create_event_handler(
                         let serial = SERIAL_COUNTER.next_serial();
                         let pointer = state.seat.get_pointer().unwrap();
                         let keyboard = state.seat.get_keyboard().unwrap();
-                        let button_code = match button {
-                            winit::event::MouseButton::Left => 0x110,
-                            winit::event::MouseButton::Right => 0x111,
-                            winit::event::MouseButton::Middle => 0x112,
-                            _ => 0x110,
-                        };
+                        let button_code = input_policy::evdev_mouse_button(button)
+                            .expect("mouse button was checked by the event guard");
                         let p_state = match el_state {
                             ElementState::Pressed => smithay::backend::input::ButtonState::Pressed,
                             ElementState::Released => {

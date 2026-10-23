@@ -32,6 +32,7 @@ use crate::runtime_commands::action_targets::{
 };
 use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quote};
 
+mod command_cache;
 mod displays;
 mod native_layout;
 mod panel_shell;
@@ -82,10 +83,8 @@ static MANAGED_DISPLAY_LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static MANAGED_DISPLAY_ACTIONS: Mutex<Vec<ManagedDisplaySnapshot>> = Mutex::new(Vec::new());
 static APPLE_COMPATIBILITY_CACHE: Mutex<Option<(Instant, AppleContainerCompatibility)>> =
     Mutex::new(None);
-static UI_COMMAND_CACHE: LazyLock<Mutex<HashMap<String, UiCommandCacheEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static UI_COMMAND_REFRESHING: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static UI_COMMAND_CACHE: LazyLock<Mutex<command_cache::CommandCache<UiCommandCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(command_cache::CommandCache::new()));
 static SCROLL_POSITIONS: LazyLock<Mutex<HashMap<String, f64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static LIST_SCROLL_VIEW: Mutex<Option<TrackedScrollView>> = Mutex::new(None);
@@ -127,6 +126,7 @@ pub enum PanelPage {
 struct SessionState {
     profile: ProfileStatus,
     instance: Option<InstanceStatus>,
+    checking: bool,
     detail: String,
     failed_step: Option<LaunchStep>,
     force_stop_available: bool,
@@ -263,7 +263,7 @@ struct AppleContainerCompatibility {
     cli_version: String,
     api_version: String,
     system_status: String,
-    publish_socket: bool,
+    publish_socket: Option<bool>,
     stats_json: bool,
     summary: String,
     detail: String,
@@ -422,6 +422,7 @@ fn schedule_automatic_profile_validation(sessions: &[ContainerSession]) {
         };
         if should_validate {
             if let Some(id) = profile_id_at(index) {
+                set_session_state(id, "Checking", "Running launch preflight checks.".into());
                 send(CompositorMessage::CheckContainerSession(id));
             }
         }
@@ -868,6 +869,9 @@ pub fn record_performance_snapshot(
     };
     publish_worker_performance(&snapshot);
     *PERFORMANCE.lock().unwrap() = Some(snapshot.clone());
+    if !panel_is_visible() {
+        return;
+    }
     if let Some(pointer) = *SUMMARY_FPS_LABEL.lock().unwrap() {
         let summary = summary_performance_snapshot().unwrap_or_else(|| snapshot.clone());
         unsafe {
@@ -923,6 +927,9 @@ fn register_live_display_fps_label(
 }
 
 fn update_live_display_fps_labels() {
+    if LIVE_DISPLAY_FPS_LABELS.lock().unwrap().is_empty() {
+        return;
+    }
     let snapshots = control_display_performance()
         .into_iter()
         .map(
@@ -1727,7 +1734,7 @@ fn add_or_select_smoke_session() {
 
 fn state_from_legacy_label(label: &str) -> (ProfileStatus, Option<InstanceStatus>) {
     match label {
-        "Starting" | "Checking" => (ProfileStatus::Ready, Some(InstanceStatus::Starting)),
+        "Starting" => (ProfileStatus::Ready, Some(InstanceStatus::Starting)),
         "Running" => (ProfileStatus::Ready, Some(InstanceStatus::Running)),
         "Stopping" => (ProfileStatus::Ready, Some(InstanceStatus::Stopping)),
         "Stopped" | "Exited" => (ProfileStatus::Ready, Some(InstanceStatus::Exited)),
@@ -1738,6 +1745,9 @@ fn state_from_legacy_label(label: &str) -> (ProfileStatus, Option<InstanceStatus
 }
 
 fn session_state_label(state: &SessionState) -> &'static str {
+    if state.checking && !session_can_stop(Some(state)) {
+        return "Checking";
+    }
     state
         .instance
         .map(InstanceStatus::label)
@@ -1751,12 +1761,14 @@ fn set_session_state(index: impl ProfileKey, label: &'static str, detail: String
         .iter_mut()
         .find(|(stored, _)| Some(*stored) == profile_id_at(index))
     {
+        if label == "Checking" {
+            begin_session_check(state, detail);
+            return;
+        }
         state.profile = profile;
         state.instance = instance;
+        state.checking = false;
         state.detail = detail;
-        if label == "Checking" {
-            state.health_check = None;
-        }
         if instance != Some(InstanceStatus::Stopping) {
             state.force_stop_available = false;
         }
@@ -1769,6 +1781,7 @@ fn set_session_state(index: impl ProfileKey, label: &'static str, detail: String
             SessionState {
                 profile,
                 instance,
+                checking: label == "Checking",
                 detail,
                 failed_step: None,
                 force_stop_available: false,
@@ -1776,6 +1789,66 @@ fn set_session_state(index: impl ProfileKey, label: &'static str, detail: String
             },
         ));
     }
+}
+
+fn begin_session_check(state: &mut SessionState, detail: String) {
+    state.checking = true;
+    state.health_check = None;
+    if !session_can_stop(Some(state)) {
+        state.detail = detail;
+    }
+}
+
+fn apply_session_check_result(
+    state: &mut SessionState,
+    profile: ProfileStatus,
+    instance: Option<InstanceStatus>,
+    detail: String,
+    health_check: Option<HealthCheckSummary>,
+) {
+    // A probe describes readiness, not a lifecycle transition or a stop acknowledgement.
+    if !session_can_stop(Some(state)) {
+        state.instance = instance;
+        state.force_stop_available = false;
+    }
+    if health_check.is_none()
+        || !matches!(
+            state.instance,
+            Some(InstanceStatus::Starting | InstanceStatus::Stopping)
+        )
+    {
+        state.detail = detail;
+    }
+    state.profile = profile;
+    state.checking = false;
+    state.failed_step = health_check.is_none().then_some(LaunchStep::ValidateProfile);
+    state.health_check = health_check;
+}
+
+fn record_session_check_result(
+    id: ProfileId,
+    profile: ProfileStatus,
+    instance: Option<InstanceStatus>,
+    detail: String,
+    health_check: Option<HealthCheckSummary>,
+) {
+    let mut states = SESSION_STATES.lock().unwrap();
+    if !states.iter().any(|(stored, _)| *stored == id) {
+        states.push((
+            id,
+            SessionState {
+                profile,
+                instance: None,
+                checking: false,
+                detail: String::new(),
+                failed_step: None,
+                force_stop_available: false,
+                health_check: None,
+            },
+        ));
+    }
+    let (_, state) = states.iter_mut().find(|(stored, _)| *stored == id).unwrap();
+    apply_session_check_result(state, profile, instance, detail, health_check);
 }
 
 fn session_state(index: impl ProfileKey) -> Option<SessionState> {
@@ -1811,10 +1884,28 @@ fn session_can_stop(state: Option<&SessionState>) -> bool {
 }
 
 fn session_is_launch_busy(state: Option<&SessionState>) -> bool {
-    state
-        .and_then(|state| state.instance)
-        .map(InstanceStatus::is_active)
-        .unwrap_or(false)
+    state.is_some_and(|state| state.checking || session_can_stop(Some(state)))
+}
+
+fn session_can_check(state: Option<&SessionState>) -> bool {
+    !state.is_some_and(|state| {
+        state.checking
+            || matches!(
+                state.instance,
+                Some(InstanceStatus::Starting | InstanceStatus::Stopping)
+            )
+    })
+}
+
+fn overview_instance_status(
+    state: Option<&SessionState>,
+    tracked: Option<InstanceStatus>,
+) -> Option<InstanceStatus> {
+    let instance = state.and_then(|state| state.instance);
+    instance
+        .filter(|status| status.is_active())
+        .or(tracked)
+        .or(instance)
 }
 
 fn checked_instance_status(
@@ -1917,24 +2008,17 @@ pub fn record_check_success(id: ProfileId, report: &container_sessions::CheckRep
         "ready"
     };
     let detail = check_report_detail(name, status, report);
-    set_session_state(
+    record_session_check_result(
         index,
-        instance.map(InstanceStatus::label).unwrap_or("Ready"),
+        ProfileStatus::Ready,
+        instance,
         detail.clone(),
-    );
-    if let Some((_, state)) = SESSION_STATES
-        .lock()
-        .unwrap()
-        .iter_mut()
-        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
-    {
-        state.failed_step = None;
-        state.health_check = Some(HealthCheckSummary {
+        Some(HealthCheckSummary {
             detail: detail.clone(),
             waypipe_version: report.waypipe_version.clone(),
             warnings: report.warnings.clone(),
-        });
-    }
+        }),
+    );
     AUTO_VALIDATION_REQUESTED
         .lock()
         .unwrap()
@@ -1977,25 +2061,7 @@ pub fn record_check_failure(id: ProfileId, error: &container_sessions::LaunchErr
         .unwrap_or("Unknown application");
     let detail = format!("{} check failed: {}", name, error);
     let profile_status = check_failure_profile_status(error);
-    let label = if error.is_container_already_running() {
-        "Running"
-    } else if profile_status == ProfileStatus::Blocked {
-        "Blocked"
-    } else {
-        "Error"
-    };
-    set_session_state(index, label, detail.clone());
-    if let Some((_, state)) = SESSION_STATES
-        .lock()
-        .unwrap()
-        .iter_mut()
-        .find(|(stored, _)| Some(*stored) == profile_id_at(index))
-    {
-        state.profile = profile_status;
-        state.instance = None;
-        state.failed_step = Some(LaunchStep::ValidateProfile);
-        state.health_check = None;
-    }
+    record_session_check_result(index, profile_status, None, detail.clone(), None);
     AUTO_VALIDATION_REQUESTED
         .lock()
         .unwrap()
@@ -4574,6 +4640,11 @@ declare_class!(
             }
         }
 
+        #[method(windowDidDeminiaturize:)]
+        fn window_did_deminiaturize(&self, _notification: &AnyObject) {
+            unsafe { refresh_window_without_focus(); }
+        }
+
         #[method(windowDidChangeScreen:)]
         fn window_did_change_screen(&self, _notification: &AnyObject) {
             let window_ptr = *WINDOW.lock().unwrap();
@@ -4616,6 +4687,7 @@ declare_class!(
         #[method(checkContainerSession:)]
         fn check_container_session(&self, sender: &AnyObject) {
             let Some(index) = profile_action_index(sender) else { return; };
+            if !session_can_check(session_state(index).as_ref()) { return; }
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
             *SELECTED_SESSION.lock().unwrap() = profile_id_at(index);
             set_session_state(index, "Checking", "Running launch preflight checks.".into());
@@ -5543,7 +5615,6 @@ pub fn show(sender: Sender<CompositorMessage>, mtm: MainThreadMarker) {
         ensure_handler();
         let first_creation = WINDOW.lock().unwrap().is_none();
         let window = ensure_window(mtm);
-        install_content(window, mtm);
         if first_creation {
             if let Some(visible) = main_screen_visible_frame() {
                 let frame = window.frame();
@@ -5556,12 +5627,13 @@ pub fn show(sender: Sender<CompositorMessage>, mtm: MainThreadMarker) {
             }
         }
         fit_panel_to_visible_screen(window);
+        install_content(window, mtm);
         window.makeKeyAndOrderFront(None);
     }
 }
 
 unsafe fn rebuild_window() {
-    if crate::lifecycle_producers::GLOBAL.closing() {
+    if crate::lifecycle_producers::GLOBAL.closing() || !panel_is_visible() {
         return;
     }
     let Some(window_ptr) = *WINDOW.lock().unwrap() else {
@@ -5577,17 +5649,17 @@ unsafe fn rebuild_window() {
 }
 
 unsafe fn refresh_window_without_focus() {
-    if crate::lifecycle_producers::GLOBAL.closing() {
-        return;
-    }
-    let Some(window_ptr) = *WINDOW.lock().unwrap() else {
-        return;
-    };
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    let window = unsafe { &*(window_ptr as *mut NSWindow) };
     unsafe {
-        install_content(window, mtm);
+        rebuild_window();
     }
+}
+
+fn panel_is_visible() -> bool {
+    let pointer = *WINDOW.lock().unwrap();
+    pointer.is_some_and(|pointer| unsafe {
+        let window = &*(pointer as *const NSWindow);
+        window.isVisible() && !window.isMiniaturized()
+    })
 }
 
 unsafe fn ensure_handler() -> *mut AnyObject {
@@ -5766,7 +5838,7 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     if selected_nav == NAV_IMAGES {
         add_images_list(&content, content_w, content_height, handler, mtm);
     } else if selected_nav == NAV_VOLUMES {
-        add_volumes_list(&content, content_w, content_height, handler, mtm);
+        add_volumes_list(&content, content_w, content_height, &sessions, handler, mtm);
     } else if matches!(
         selected_nav,
         NAV_APPLE_CONTAINER | NAV_DOCKER | NAV_ORBSTACK
@@ -6810,6 +6882,7 @@ fn add_volumes_list(
     parent: &NSView,
     width: f64,
     content_height: f64,
+    sessions: &[ContainerSession],
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
@@ -6914,7 +6987,7 @@ fn add_volumes_list(
                 add_separator(parent, rect(24.0, y - 62.0, 4.0, 96.0), mtm);
             }
             let name = row.name.as_ref().unwrap();
-            let usage = volume_usage(inventory.runtime_key, name);
+            let usage = volume_usage_with_sessions(inventory.runtime_key, name, sessions);
             let metadata = volume_inspect_metadata(inventory.runtime_key, name, &row.label);
             let usage_summary = if usage.loading {
                 "Checking profile and container usage...".into()
@@ -7264,7 +7337,7 @@ fn add_runtime_list(
         );
         add_label(
             parent,
-            &compatibility.summary,
+            &tr(&compatibility.summary),
             rect(38.0, y - 20.0, width - 76.0, 20.0),
             mtm,
             TextStyle::Body,
@@ -7283,7 +7356,7 @@ fn add_runtime_list(
             parent,
             &format!(
                 "Published sockets: {} · resource JSON: {}",
-                yes_no(compatibility.publish_socket),
+                compatibility.publish_socket.map(yes_no).unwrap_or("Unknown"),
                 yes_no(compatibility.stats_json)
             ),
             rect(38.0, y - 76.0, width - 76.0, 20.0),
@@ -7299,7 +7372,7 @@ fn add_runtime_list(
         );
         add_label(
             parent,
-            &compatibility.detail,
+            &tr(&compatibility.detail),
             rect(38.0, y - 174.0, width - 76.0, 54.0),
             mtm,
             TextStyle::Caption,
@@ -7318,22 +7391,22 @@ fn add_runtime_list(
         );
         add_label(
             parent,
-            if publish_socket_ready {
-                "Transport V2 ready"
-            } else {
-                "Compatibility relay"
-            },
+            &tr(match publish_socket_ready {
+                Some(true) => "Transport V2 capable",
+                Some(false) => "Compatibility relay",
+                None => "Unknown",
+            }),
             rect(38.0, y - 28.0, width - 76.0, 20.0),
             mtm,
             TextStyle::Body,
         );
         add_label(
             parent,
-            if publish_socket_ready {
-                "Waypipe data uses Apple Container's published Unix socket. The stdio relay remains an automatic fallback."
-            } else {
-                "This Apple Container CLI has no --publish-socket support, so GUI launch uses the stdio compatibility relay."
-            },
+            &tr(match publish_socket_ready {
+                Some(true) => "Waypipe data uses Apple Container's published Unix socket. The stdio relay remains an automatic fallback.",
+                Some(false) => "This Apple Container CLI has no --publish-socket support, so GUI launch uses the stdio compatibility relay.",
+                None => &compatibility.detail,
+            }),
             rect(38.0, y - 112.0, width - 76.0, 70.0),
             mtm,
             TextStyle::Caption,
@@ -8503,11 +8576,12 @@ fn runtime_overview(
                 status,
                 compatibility.detail,
                 format_count(running, "running container"),
-                if compatibility.publish_socket {
-                    "GUI Transport V2".into()
-                } else {
-                    "Compatibility relay".into()
-                },
+                match compatibility.publish_socket {
+                    Some(true) => "GUI Transport V2",
+                    Some(false) => "Compatibility relay",
+                    None => "Unknown",
+                }
+                .into(),
             )
         }
         NAV_ORBSTACK => {
@@ -8719,23 +8793,22 @@ fn refresh_ui_command(
     args: Vec<String>,
     timeout: Duration,
 ) {
-    {
-        let mut refreshing = UI_COMMAND_REFRESHING.lock().unwrap();
-        if !refreshing.insert(key.clone()) {
-            return;
-        }
-    }
+    let Some(generation) = UI_COMMAND_CACHE.lock().unwrap().begin_refresh(&key) else {
+        return;
+    };
     std::thread::spawn(move || {
         let result = execute_ui_command(&command, &child_path, &args, timeout).map(Arc::new);
-        UI_COMMAND_CACHE.lock().unwrap().insert(
-            key.clone(),
+        let accepted = UI_COMMAND_CACHE.lock().unwrap().finish_refresh(
+            key,
+            generation,
             UiCommandCacheEntry {
                 completed_at: Instant::now(),
                 result,
             },
         );
-        UI_COMMAND_REFRESHING.lock().unwrap().remove(&key);
-        send(CompositorMessage::ContainerModeCommandCacheUpdated);
+        if accepted {
+            send(CompositorMessage::ContainerModeCommandCacheUpdated);
+        }
     });
 }
 
@@ -8754,7 +8827,7 @@ fn execute_ui_command(
 }
 
 fn invalidate_ui_command_cache() {
-    UI_COMMAND_CACHE.lock().unwrap().clear();
+    UI_COMMAND_CACHE.lock().unwrap().invalidate();
     *APPLE_COMPATIBILITY_CACHE.lock().unwrap() = None;
 }
 
@@ -8764,6 +8837,23 @@ fn ui_command_error(prefix: &str, error: &str) -> String {
     } else {
         format!("{}: {}", prefix, error)
     }
+}
+
+fn ui_publish_socket_support(command: &std::path::Path, child_path: &str) -> Result<bool, String> {
+    let output = run_ui_command(
+        command,
+        child_path,
+        &["run", "--help"],
+        Duration::from_secs(6),
+    )?;
+    publish_socket_support_from_output(&output)
+}
+
+fn publish_socket_support_from_output(output: &Output) -> Result<bool, String> {
+    if !output.status.success() {
+        return Err(first_stderr_line(output, "Transport capability check failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).contains("--publish-socket"))
 }
 
 pub fn record_command_cache_updated() {
@@ -8830,7 +8920,8 @@ fn apple_container_compatibility(
         .and_then(apple_container_api_version)
         .unwrap_or_else(|| "unknown".into());
 
-    let publish_socket = container_sessions::apple_publish_socket_supported(command, child_path);
+    let publish_socket_result = ui_publish_socket_support(command, child_path);
+    let publish_socket = publish_socket_result.as_ref().ok().copied();
     let stats_help = run_ui_command(
         command,
         child_path,
@@ -8847,18 +8938,22 @@ fn apple_container_compatibility(
         cli_version == "unknown" || api_version == "unknown" || cli_version == api_version;
     let transport_v2_version = version_at_least(&cli_version, APPLE_CONTAINER_TRANSPORT_V2_MINIMUM);
     let security_current = version_at_least(&cli_version, APPLE_CONTAINER_SECURITY_BASELINE);
-    let summary = if !versions_match {
+    let summary = if let Err(error) = &publish_socket_result {
+        ui_command_error("Transport capability unavailable", error)
+    } else if !versions_match {
         "Client/API version mismatch".into()
     } else if cli_version != "unknown" && !security_current {
         "Compatible; security update strongly recommended".into()
-    } else if !publish_socket {
+    } else if publish_socket == Some(false) {
         "Legacy transport fallback required".into()
     } else if system_status != "running" {
         "Installed; management service is not running".into()
     } else {
         "Compatible with Cocoa-Way".into()
     };
-    let detail = if !versions_match {
+    let detail = if let Err(error) = &publish_socket_result {
+        ui_command_error("Transport capability unavailable", error)
+    } else if !versions_match {
         "The CLI and API server differ. Restart or reinstall Apple Container before launching applications."
             .into()
     } else if cli_version != "unknown" && !security_current {
@@ -8866,7 +8961,7 @@ fn apple_container_compatibility(
             "Apple Container {} can run through Cocoa-Way, but 1.6.0 adds pinned-image digest and build-context security fixes. Update to the latest official release before normal use.",
             cli_version
         )
-    } else if !publish_socket {
+    } else if publish_socket == Some(false) {
         "Cocoa-Way can use its compatibility relay, but Transport V2 requires `container run --publish-socket`."
             .into()
     } else if system_status != "running" {
@@ -9167,8 +9262,16 @@ fn volume_inventories() -> Vec<VolumeInventory> {
 }
 
 fn volume_usage(runtime_key: &str, volume_name: &str) -> VolumeUsage {
-    let referenced_profiles = container_sessions::load_sessions()
-        .into_iter()
+    volume_usage_with_sessions(runtime_key, volume_name, &container_sessions::load_sessions())
+}
+
+fn volume_profile_references(
+    runtime_key: &str,
+    volume_name: &str,
+    sessions: &[ContainerSession],
+) -> Vec<String> {
+    sessions
+        .iter()
         .filter(|session| {
             runtime_key_matches(runtime_key, &session.runtime)
                 && session
@@ -9176,8 +9279,16 @@ fn volume_usage(runtime_key: &str, volume_name: &str) -> VolumeUsage {
                     .iter()
                     .any(|mount| mount_references_volume(mount, volume_name))
         })
-        .map(|session| session.name)
-        .collect::<Vec<_>>();
+        .map(|session| session.name.clone())
+        .collect()
+}
+
+fn volume_usage_with_sessions(
+    runtime_key: &str,
+    volume_name: &str,
+    sessions: &[ContainerSession],
+) -> VolumeUsage {
+    let referenced_profiles = volume_profile_references(runtime_key, volume_name, sessions);
     let child_path = build_child_path();
     let (command, args) = if runtime_key == "docker" {
         let filter = format!("volume={volume_name}");
@@ -10440,7 +10551,9 @@ fn add_session_detail(
     } else {
         sel!(launchContainerSession:)
     };
-    let primary_tooltip = if launch_busy {
+    let primary_tooltip = if state.is_some_and(|state| state.checking) {
+        "Running launch preflight checks."
+    } else if launch_busy {
         "This application already has an active instance. Stop it before launching again."
     } else if transport_blocked {
         "Apple Container GUI relay is currently unavailable"
@@ -10478,6 +10591,7 @@ fn add_session_detail(
     );
     unsafe {
         bind_profile_control(&check, index);
+        check.setEnabled(session_can_check(state));
         let _: () = msg_send![&*check, setToolTip:
             &*NSString::from_str(&tr("Validate the profile, runtime, image, command, and transport without launching"))];
         bind_profile_control(&primary, index);
@@ -10613,17 +10727,16 @@ fn add_session_info(
     let derived_transport_blocked = session_has_apple_transport_block(session);
     let active = active_session(index);
     let profile_status = state
-        .map(|state| state.profile.label().to_string())
-        .unwrap_or_else(|| "Checking".into());
-    let instance_status = active
-        .as_ref()
-        .map(|active| active.instance.status.label().to_string())
-        .or_else(|| {
-            state
-                .and_then(|state| state.instance)
-                .map(|status| status.label().to_string())
+        .map(|state| {
+            if state.checking { "Checking" } else { state.profile.label() }.to_string()
         })
-        .unwrap_or_else(|| "Not running".into());
+        .unwrap_or_else(|| "Checking".into());
+    let instance_status = overview_instance_status(
+        state,
+        active.as_ref().map(|active| active.instance.status),
+    )
+    .map(|status| status.label().to_string())
+    .unwrap_or_else(|| "Not running".into());
     let overview_rows = vec![
         ("Profile status".to_string(), profile_status),
         ("Instance status".to_string(), instance_status),
@@ -10987,6 +11100,7 @@ fn add_full_check_card(
     );
     unsafe {
         bind_profile_control(&check, index);
+        check.setEnabled(session_can_check(session_state(index).as_ref()));
         let _: () = msg_send![&*logs, setTag: 1isize];
     }
     bottom
@@ -12661,12 +12775,15 @@ fn apple_gui_transport_diagnostic(child_path: &str) -> RuntimeDiagnostic {
 
     RuntimeDiagnostic {
         name: "Apple Transport",
-        state: transport_readiness_state(
-            container_sessions::apple_publish_socket_supported(&container, child_path),
-            crate::diagnostics::resource_snapshot().available,
-            find_command_path("waypipe", child_path).is_some(),
-        )
-        .into(),
+        state: match ui_publish_socket_support(&container, child_path) {
+            Ok(published_sockets) => transport_readiness_state(
+                published_sockets,
+                crate::diagnostics::resource_snapshot().available,
+                find_command_path("waypipe", child_path).is_some(),
+            )
+            .into(),
+            Err(error) => ui_command_error("Transport capability unavailable", &error),
+        },
     }
 }
 
@@ -12824,6 +12941,8 @@ unsafe fn add_session_row(
     };
     let primary_tooltip = if process_active {
         "Open this application profile and inspect its running instance"
+    } else if state.as_ref().is_some_and(|state| state.checking) {
+        "Running launch preflight checks."
     } else if launch_busy {
         "This application is starting or stopping"
     } else if transport_blocked {
@@ -13629,6 +13748,144 @@ mod runtime_container_detail_tests {
 mod tests {
     use super::*;
 
+    fn checked_state(instance: Option<InstanceStatus>) -> SessionState {
+        SessionState {
+            profile: ProfileStatus::Ready,
+            instance,
+            checking: false,
+            detail: "lifecycle progress".into(),
+            failed_step: None,
+            force_stop_available: instance == Some(InstanceStatus::Stopping),
+            health_check: None,
+        }
+    }
+
+    #[test]
+    fn health_check_does_not_create_a_stoppable_instance() {
+        let id = ProfileId::new().unwrap();
+        set_session_state(id, "Checking", "preflight".into());
+        let state = session_state(id).unwrap();
+        assert_eq!(session_state_label(&state), "Checking");
+        assert_eq!(state.instance, None);
+        assert!(!session_can_stop(Some(&state)));
+        assert!(session_is_launch_busy(Some(&state)));
+        assert!(!session_can_check(Some(&state)));
+        invalidate_profile_validation(id);
+    }
+
+    #[test]
+    fn health_check_results_preserve_live_lifecycle_and_force_stop() {
+        for instance in [
+            InstanceStatus::Starting,
+            InstanceStatus::Running,
+            InstanceStatus::Stopping,
+        ] {
+            for success in [false, true] {
+                let mut state = checked_state(Some(instance));
+                assert_eq!(
+                    session_can_check(Some(&state)),
+                    instance == InstanceStatus::Running
+                );
+                begin_session_check(&mut state, "preflight".into());
+                assert_eq!(state.instance, Some(instance));
+                assert_eq!(session_state_label(&state), instance.label());
+                assert_eq!(state.detail, "lifecycle progress");
+                let health = success.then(|| HealthCheckSummary {
+                    detail: "probe result".into(),
+                    waypipe_version: "0.11.0".into(),
+                    warnings: vec![],
+                });
+                apply_session_check_result(
+                    &mut state,
+                    if success { ProfileStatus::Ready } else { ProfileStatus::Invalid },
+                    None,
+                    "probe result".into(),
+                    health,
+                );
+                assert_eq!(state.instance, Some(instance));
+                assert_eq!(
+                    state.force_stop_available,
+                    instance == InstanceStatus::Stopping
+                );
+                assert!(session_can_stop(Some(&state)));
+                assert!(!state.checking);
+                assert_eq!(state.health_check.is_some(), success);
+                if success && instance != InstanceStatus::Running {
+                    assert_eq!(state.detail, "lifecycle progress");
+                } else {
+                    assert_eq!(state.detail, "probe result");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn health_check_completion_releases_idle_actions_and_replaces_old_failure() {
+        let mut state = checked_state(None);
+        begin_session_check(&mut state, "preflight".into());
+        apply_session_check_result(
+            &mut state, ProfileStatus::Blocked, None, "not ready".into(), None,
+        );
+        assert_eq!(session_state_label(&state), "Blocked");
+        assert_eq!(state.failed_step, Some(LaunchStep::ValidateProfile));
+        assert_eq!(state.detail, "not ready");
+        assert!(session_can_check(Some(&state)));
+        assert!(!session_is_launch_busy(Some(&state)));
+        begin_session_check(&mut state, "retry".into());
+        apply_session_check_result(
+            &mut state,
+            ProfileStatus::Ready,
+            None,
+            "ready".into(),
+            Some(HealthCheckSummary {
+                detail: "ready".into(),
+                waypipe_version: "0.11.0".into(),
+                warnings: vec![],
+            }),
+        );
+        assert_eq!(session_state_label(&state), "Ready");
+        assert_eq!(state.failed_step, None);
+        assert!(!session_can_stop(Some(&state)));
+        assert!(session_can_check(Some(&state)));
+    }
+
+    #[test]
+    fn health_check_overview_keeps_stopping_until_tracked_instance_exits() {
+        for status in [InstanceStatus::Starting, InstanceStatus::Stopping] {
+            let state = checked_state(Some(status));
+            assert_eq!(
+                overview_instance_status(Some(&state), Some(InstanceStatus::Running)),
+                Some(status)
+            );
+        }
+        let state = checked_state(Some(InstanceStatus::Exited));
+        assert_eq!(overview_instance_status(Some(&state), None), Some(InstanceStatus::Exited));
+        assert_eq!(overview_instance_status(None, None), None);
+        assert_eq!(
+            overview_instance_status(None, Some(InstanceStatus::Running)),
+            Some(InstanceStatus::Running)
+        );
+    }
+
+    #[test]
+    fn publish_socket_probe_failure_is_not_reported_as_unsupported() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"Usage: run [--publish-socket]".to_vec(),
+            stderr: vec![],
+        };
+        assert_eq!(publish_socket_support_from_output(&output), Ok(true));
+        output.stdout = b"Usage: run".to_vec();
+        assert_eq!(publish_socket_support_from_output(&output), Ok(false));
+        output.status = std::process::ExitStatus::from_raw(256);
+        output.stderr = b"capability probe failed\nmore detail".to_vec();
+        assert_eq!(
+            publish_socket_support_from_output(&output),
+            Err("capability probe failed".into())
+        );
+    }
+
     #[test]
     fn localization_only_interprets_semantic_detail_values() {
         for key in [
@@ -14047,6 +14304,7 @@ mod tests {
         let mut state = SessionState {
             profile: ProfileStatus::Blocked,
             instance: Some(InstanceStatus::Failed),
+            checking: false,
             detail: "Runtime is installed but is not running.\nStart the runtime and run Health Check again.".into(),
             failed_step: None,
             force_stop_available: false,
@@ -14409,6 +14667,28 @@ mod tests {
         let row = parse_volume_line("project-cache\tlocal").unwrap();
         assert_eq!(row.name.as_deref(), Some("project-cache"));
         assert!(row.label.contains("local"));
+    }
+
+    #[test]
+    fn volume_profile_references_reuse_snapshot_and_keep_runtime_boundaries() {
+        let mut apple = smoke_session();
+        apple.name = "Apple profile".into();
+        apple.runtime = "container".into();
+        apple.mounts = vec!["type=volume,source=project-data,target=/workspace".into()];
+        let mut docker = apple.clone();
+        docker.name = "Docker profile".into();
+        docker.runtime = "docker".into();
+        docker.mounts = vec!["project-data:/workspace".into()];
+        let sessions = [apple, docker];
+        assert_eq!(
+            volume_profile_references("container", "project-data", &sessions),
+            ["Apple profile"]
+        );
+        assert_eq!(
+            volume_profile_references("docker", "project-data", &sessions),
+            ["Docker profile"]
+        );
+        assert!(volume_profile_references("container", "unreferenced", &sessions).is_empty());
     }
 
     #[test]
