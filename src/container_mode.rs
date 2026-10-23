@@ -1623,25 +1623,6 @@ fn smoke_image_reference() -> &'static str {
     "localhost/cocoa-way-niri:latest"
 }
 
-fn preferred_gui_image_reference() -> String {
-    let child_path = build_child_path();
-    let references = apple_container_image_rows(&child_path)
-        .into_iter()
-        .filter_map(|row| row.reference)
-        .collect::<Vec<_>>();
-
-    references
-        .iter()
-        .find(|reference| reference.as_str() == smoke_image_reference())
-        .or_else(|| {
-            references
-                .iter()
-                .find(|reference| reference.contains("cocoa-way-niri"))
-        })
-        .cloned()
-        .unwrap_or_else(|| smoke_image_reference().into())
-}
-
 fn smoke_image_build_paths(
     resources: Result<crate::image_resources::ExampleImageResources, String>,
 ) -> Result<(String, String), String> {
@@ -2896,23 +2877,22 @@ pub fn record_process_exit(id: ProfileId, process: &str, status: &str) {
 
 unsafe fn show_add_session_dialog() {
     unsafe {
-        let image = preferred_gui_image_reference();
-        show_add_session_dialog_with_defaults(session_defaults_for_image("container", &image));
+        show_add_session_dialog_with_defaults(new_application_defaults());
     }
 }
 
 unsafe fn show_new_image_session_dialog() {
     unsafe {
-        let image = preferred_gui_image_reference();
-        show_add_session_dialog_with_defaults(AddSessionDefaults {
-            name: "Niri Desktop".into(),
-            runtime: "container".into(),
-            display: "auto".into(),
-            profile: "niri".into(),
-            image,
-            command: "niri".into(),
-            ..AddSessionDefaults::default()
-        });
+        show_add_session_dialog();
+    }
+}
+
+fn new_application_defaults() -> AddSessionDefaults {
+    AddSessionDefaults {
+        runtime: "container".into(),
+        display: "auto".into(),
+        profile: "single-app".into(),
+        ..AddSessionDefaults::default()
     }
 }
 
@@ -3249,7 +3229,10 @@ fn defaults_from_session(session: &ContainerSession) -> AddSessionDefaults {
             .presentation
             .clone()
             .unwrap_or_else(|| "desktop".into()),
-        profile: session.profile.clone().unwrap_or_else(|| "niri".into()),
+        profile: session
+            .profile
+            .clone()
+            .unwrap_or_else(|| "single-app".into()),
         image: session.image.clone(),
         command: session
             .command
@@ -3315,7 +3298,7 @@ unsafe fn show_session_dialog(
     let name_field = add_text_field(
         &view,
         rect(116.0, 380.0, 304.0, 26.0),
-        &tr("Niri Desktop"),
+        &tr("Application name"),
         &defaults.name,
         mtm,
     );
@@ -3379,9 +3362,9 @@ unsafe fn show_session_dialog(
     let profile_field = add_text_field(
         &view,
         rect(116.0, 220.0, 304.0, 26.0),
-        &tr("niri / single-app / shell"),
+        &tr("single-app / shell / optional preset"),
         if defaults.profile.is_empty() {
-            "niri"
+            "single-app"
         } else {
             &defaults.profile
         },
@@ -3397,7 +3380,7 @@ unsafe fn show_session_dialog(
     let image_field = add_text_field(
         &view,
         rect(116.0, 180.0, 304.0, 26.0),
-        smoke_image_reference(),
+        "registry/image:tag",
         &defaults.image,
         mtm,
     );
@@ -3411,7 +3394,7 @@ unsafe fn show_session_dialog(
     let command_field = add_text_field(
         &view,
         rect(116.0, 140.0, 304.0, 26.0),
-        &tr("niri"),
+        &tr("Launch command"),
         &defaults.command,
         mtm,
     );
@@ -3488,6 +3471,12 @@ unsafe fn show_session_dialog(
     let audio_requested = popup_index(&audio_popup) == 1;
     if image.is_empty() {
         show_error_alert("Enter an image reference before creating the session.");
+        return;
+    }
+    if !is_edit && command.is_empty() {
+        show_error_alert(&tr(
+            "Enter the application's launch command before creating it.",
+        ));
         return;
     }
 
@@ -6238,40 +6227,21 @@ fn add_session_empty_list(
     add_label(
         parent,
         &tr(
-            "Restore the bundled Niri desktop profile or create a custom Wayland application profile.",
+            "Add a Wayland application or desktop with your preferred container image and launch command.",
         ),
-        rect(34.0, center_y - 42.0, width - 68.0, 42.0),
+        rect(34.0, center_y - 68.0, width - 68.0, 60.0),
         mtm,
         TextStyle::Body,
     );
-    add_label(
-        parent,
-        &tr(
-            "Example\nruntime = \"container\"\nimage = \"localhost/cocoa-way-niri:latest\"\nprofile = \"niri\"\ncommand = \"niri\"",
-        ),
-        rect(34.0, center_y - 142.0, width - 68.0, 90.0),
-        mtm,
-        TextStyle::Mono,
-    );
-    let restore = add_button(
-        parent,
-        &tr("Restore Example"),
-        rect(34.0, center_y - 190.0, 128.0, 30.0),
-        handler,
-        sel!(restoreSmokeContainerSession:),
-        mtm,
-    );
     let add = add_button(
         parent,
-        &tr("Custom..."),
-        rect(174.0, center_y - 190.0, 96.0, 30.0),
+        &tr("New Application"),
+        rect(34.0, center_y - 110.0, 150.0, 30.0),
         handler,
         sel!(addContainerSession:),
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*restore, setToolTip:
-            &*NSString::from_str(&tr("Restore the bundled example application profile"))];
         let _: () = msg_send![&*add, setToolTip:
             &*NSString::from_str(&tr("Create a custom Container Mode application"))];
     }
@@ -14484,6 +14454,21 @@ mod tests {
         let niri = session_defaults_for_image("container", "example/cocoa-way-niri:latest");
         assert_eq!(niri.profile, "niri");
         assert_eq!(niri.command, "niri");
+    }
+
+    #[test]
+    fn new_applications_do_not_choose_a_compositor_or_image() {
+        let defaults = new_application_defaults();
+        assert_eq!(defaults.runtime, "container");
+        assert_eq!(defaults.display, "auto");
+        assert_eq!(defaults.profile, "single-app");
+        assert!(defaults.name.is_empty());
+        assert!(defaults.image.is_empty());
+        assert!(defaults.command.is_empty());
+
+        let mut session = smoke_session();
+        session.profile = None;
+        assert_eq!(defaults_from_session(&session).profile, "single-app");
     }
 
     #[test]
