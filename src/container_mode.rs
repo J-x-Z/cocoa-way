@@ -255,6 +255,10 @@ struct PerformanceSnapshot {
     input_to_present_ms: Option<f64>,
     #[serde(default)]
     cursor: Option<serde_json::Value>,
+    #[serde(default)]
+    render_progress: Option<crate::render_progress::RenderProgress>,
+    #[serde(default)]
+    worker_pid: Option<u32>,
     sampled_at_unix_ms: u128,
 }
 
@@ -854,6 +858,7 @@ pub fn record_performance_snapshot(
     max_redraw_wait_ms: f64,
     input_to_present_ms: Option<f64>,
     cursor: serde_json::Value,
+    render_progress: crate::render_progress::RenderProgress,
 ) {
     let snapshot = PerformanceSnapshot {
         redraw_fps,
@@ -865,6 +870,8 @@ pub fn record_performance_snapshot(
         max_redraw_wait_ms,
         input_to_present_ms,
         cursor: Some(cursor),
+        render_progress: Some(render_progress),
+        worker_pid: Some(std::process::id()),
         sampled_at_unix_ms: now_unix_ms(),
     };
     publish_worker_performance(&snapshot);
@@ -954,6 +961,8 @@ fn update_live_display_fps_labels() {
                         max_redraw_wait_ms,
                         input_to_present_ms,
                         cursor: None,
+                        render_progress: None,
+                        worker_pid: None,
                         sampled_at_unix_ms,
                     },
                 )
@@ -1044,17 +1053,44 @@ pub(crate) fn control_performance_snapshot()
 
 pub(crate) fn control_display_performance() -> Vec<(String, f64, f64, f64, f64, Option<f64>, u128)>
 {
+    display_performance_snapshots()
+        .into_iter()
+        .map(|(slot, snapshot)| {
+            (
+                slot,
+                snapshot.redraw_fps,
+                snapshot.commits_per_second,
+                snapshot.late_redraws_per_second,
+                snapshot.max_redraw_wait_ms,
+                snapshot.input_to_present_ms,
+                snapshot.sampled_at_unix_ms,
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn control_display_render_progress() -> Vec<serde_json::Value> {
+    display_performance_snapshots()
+        .into_iter()
+        .map(|(slot, snapshot)| {
+            serde_json::json!({
+                "slot": slot,
+                "progress": snapshot.render_progress,
+                "worker_pid": snapshot.worker_pid,
+                "counter_scope": "display_worker_lifetime",
+                "live_toplevels": snapshot.tiles,
+                "dirty": snapshot.dirty,
+                "pending_frame_callbacks": snapshot.pending_frame_callbacks,
+                "sampled_at_unix_ms": snapshot.sampled_at_unix_ms,
+            })
+        })
+        .collect()
+}
+
+fn display_performance_snapshots() -> Vec<(String, PerformanceSnapshot)> {
     let mut displays = Vec::new();
     if let Some(snapshot) = performance_snapshot() {
-        displays.push((
-            "default".into(),
-            snapshot.redraw_fps,
-            snapshot.commits_per_second,
-            snapshot.late_redraws_per_second,
-            snapshot.max_redraw_wait_ms,
-            snapshot.input_to_present_ms,
-            snapshot.sampled_at_unix_ms,
-        ));
+        displays.push(("default".into(), snapshot));
     }
     for active in active_sessions_snapshot() {
         if active.instance.display_slot == "default"
@@ -1065,15 +1101,7 @@ pub(crate) fn control_display_performance() -> Vec<(String, f64, f64, f64, f64, 
             continue;
         }
         if let Some(snapshot) = performance_for_active_session(&active) {
-            displays.push((
-                active.instance.display_slot,
-                snapshot.redraw_fps,
-                snapshot.commits_per_second,
-                snapshot.late_redraws_per_second,
-                snapshot.max_redraw_wait_ms,
-                snapshot.input_to_present_ms,
-                snapshot.sampled_at_unix_ms,
-            ));
+            displays.push((active.instance.display_slot, snapshot));
         }
     }
     for display in managed_displays_snapshot() {
@@ -1081,15 +1109,7 @@ pub(crate) fn control_display_performance() -> Vec<(String, f64, f64, f64, f64, 
             continue;
         }
         if let Some(snapshot) = worker_performance_snapshot(&display.runtime_dir) {
-            displays.push((
-                display.slot,
-                snapshot.redraw_fps,
-                snapshot.commits_per_second,
-                snapshot.late_redraws_per_second,
-                snapshot.max_redraw_wait_ms,
-                snapshot.input_to_present_ms,
-                snapshot.sampled_at_unix_ms,
-            ));
+            displays.push((display.slot, snapshot));
         }
     }
     displays
@@ -1821,7 +1841,9 @@ fn apply_session_check_result(
     }
     state.profile = profile;
     state.checking = false;
-    state.failed_step = health_check.is_none().then_some(LaunchStep::ValidateProfile);
+    state.failed_step = health_check
+        .is_none()
+        .then_some(LaunchStep::ValidateProfile);
     state.health_check = health_check;
 }
 
@@ -7356,7 +7378,10 @@ fn add_runtime_list(
             parent,
             &format!(
                 "Published sockets: {} · resource JSON: {}",
-                compatibility.publish_socket.map(yes_no).unwrap_or("Unknown"),
+                compatibility
+                    .publish_socket
+                    .map(yes_no)
+                    .unwrap_or("Unknown"),
                 yes_no(compatibility.stats_json)
             ),
             rect(38.0, y - 76.0, width - 76.0, 20.0),
@@ -7403,8 +7428,12 @@ fn add_runtime_list(
         add_label(
             parent,
             &tr(match publish_socket_ready {
-                Some(true) => "Waypipe data uses Apple Container's published Unix socket. The stdio relay remains an automatic fallback.",
-                Some(false) => "This Apple Container CLI has no --publish-socket support, so GUI launch uses the stdio compatibility relay.",
+                Some(true) => {
+                    "Waypipe data uses Apple Container's published Unix socket. The stdio relay remains an automatic fallback."
+                }
+                Some(false) => {
+                    "This Apple Container CLI has no --publish-socket support, so GUI launch uses the stdio compatibility relay."
+                }
                 None => &compatibility.detail,
             }),
             rect(38.0, y - 112.0, width - 76.0, 70.0),
@@ -8851,7 +8880,10 @@ fn ui_publish_socket_support(command: &std::path::Path, child_path: &str) -> Res
 
 fn publish_socket_support_from_output(output: &Output) -> Result<bool, String> {
     if !output.status.success() {
-        return Err(first_stderr_line(output, "Transport capability check failed"));
+        return Err(first_stderr_line(
+            output,
+            "Transport capability check failed",
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).contains("--publish-socket"))
 }
@@ -9262,7 +9294,11 @@ fn volume_inventories() -> Vec<VolumeInventory> {
 }
 
 fn volume_usage(runtime_key: &str, volume_name: &str) -> VolumeUsage {
-    volume_usage_with_sessions(runtime_key, volume_name, &container_sessions::load_sessions())
+    volume_usage_with_sessions(
+        runtime_key,
+        volume_name,
+        &container_sessions::load_sessions(),
+    )
 }
 
 fn volume_profile_references(
@@ -10728,15 +10764,18 @@ fn add_session_info(
     let active = active_session(index);
     let profile_status = state
         .map(|state| {
-            if state.checking { "Checking" } else { state.profile.label() }.to_string()
+            if state.checking {
+                "Checking"
+            } else {
+                state.profile.label()
+            }
+            .to_string()
         })
         .unwrap_or_else(|| "Checking".into());
-    let instance_status = overview_instance_status(
-        state,
-        active.as_ref().map(|active| active.instance.status),
-    )
-    .map(|status| status.label().to_string())
-    .unwrap_or_else(|| "Not running".into());
+    let instance_status =
+        overview_instance_status(state, active.as_ref().map(|active| active.instance.status))
+            .map(|status| status.label().to_string())
+            .unwrap_or_else(|| "Not running".into());
     let overview_rows = vec![
         ("Profile status".to_string(), profile_status),
         ("Instance status".to_string(), instance_status),
@@ -13748,6 +13787,31 @@ mod runtime_container_detail_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn old_worker_snapshot_keeps_render_progress_unknown() {
+        let mut payload = serde_json::json!({
+            "redraw_fps": 0.0,
+            "commits_per_second": 0.0,
+            "tiles": 1,
+            "dirty": false,
+            "pending_frame_callbacks": 0,
+            "late_redraws_per_second": 0.0,
+            "max_redraw_wait_ms": 0.0,
+            "input_to_present_ms": null,
+            "sampled_at_unix_ms": 1,
+        });
+        let legacy: PerformanceSnapshot = serde_json::from_value(payload.clone()).unwrap();
+        assert!(legacy.render_progress.is_none());
+        assert!(legacy.worker_pid.is_none());
+        payload["render_progress"] = serde_json::json!({
+            "surface_commits": 4,
+            "submitted_content_frames": 2,
+        });
+        let current: PerformanceSnapshot = serde_json::from_value(payload).unwrap();
+        assert_eq!(current.redraw_fps, 0.0);
+        assert_eq!(current.render_progress.unwrap().submitted_content_frames, 2);
+    }
+
     fn checked_state(instance: Option<InstanceStatus>) -> SessionState {
         SessionState {
             profile: ProfileStatus::Ready,
@@ -13797,7 +13861,11 @@ mod tests {
                 });
                 apply_session_check_result(
                     &mut state,
-                    if success { ProfileStatus::Ready } else { ProfileStatus::Invalid },
+                    if success {
+                        ProfileStatus::Ready
+                    } else {
+                        ProfileStatus::Invalid
+                    },
                     None,
                     "probe result".into(),
                     health,
@@ -13824,7 +13892,11 @@ mod tests {
         let mut state = checked_state(None);
         begin_session_check(&mut state, "preflight".into());
         apply_session_check_result(
-            &mut state, ProfileStatus::Blocked, None, "not ready".into(), None,
+            &mut state,
+            ProfileStatus::Blocked,
+            None,
+            "not ready".into(),
+            None,
         );
         assert_eq!(session_state_label(&state), "Blocked");
         assert_eq!(state.failed_step, Some(LaunchStep::ValidateProfile));
@@ -13859,7 +13931,10 @@ mod tests {
             );
         }
         let state = checked_state(Some(InstanceStatus::Exited));
-        assert_eq!(overview_instance_status(Some(&state), None), Some(InstanceStatus::Exited));
+        assert_eq!(
+            overview_instance_status(Some(&state), None),
+            Some(InstanceStatus::Exited)
+        );
         assert_eq!(overview_instance_status(None, None), None);
         assert_eq!(
             overview_instance_status(None, Some(InstanceStatus::Running)),

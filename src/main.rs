@@ -45,6 +45,7 @@ mod probe_marker;
 mod process_output;
 mod profile_activity;
 mod render;
+mod render_progress;
 mod runtime_commands;
 mod runtime_paths;
 mod session_lifecycle;
@@ -4107,6 +4108,7 @@ fn create_event_handler(
     let mut perf_last_commits = state.commit_counter;
     let mut perf_last_redraws = 0u64;
     let mut perf_redraws = 0u64;
+    let mut render_progress = render_progress::RenderProgress::default();
     let mut perf_late_redraws = 0u64;
     let mut perf_max_redraw_wait_ms = 0.0f64;
     let mut pending_redraw_since: Option<std::time::Instant> = None;
@@ -4263,7 +4265,11 @@ fn create_event_handler(
         let mut profile_ownership_changed = false;
         // Only AboutToWait consumes control work. Device precursors/NewEvents
         // precede native input; UserEvent must yield out of Winit's proxy drain.
-        while input_policy::admit_control_work(&event, &mut message_budget, std::time::Instant::now()) {
+        while input_policy::admit_control_work(
+            &event,
+            &mut message_budget,
+            std::time::Instant::now(),
+        ) {
             let Ok(msg) = loop_receiver.try_recv() else {
                 break;
             };
@@ -6134,7 +6140,10 @@ fn create_event_handler(
                         if cursor_clock_owner != Some(window_id) {
                             cursor_clock_owner = Some(window_id);
                             cursor_clock.set_refresh_millihertz(Some(
-                                rootless_clocks.entry(window_id).or_default().refresh_millihertz(),
+                                rootless_clocks
+                                    .entry(window_id)
+                                    .or_default()
+                                    .refresh_millihertz(),
                             ));
                         }
                         state.native_cursor_motion(&rootless.renderer.window, window_id);
@@ -6196,6 +6205,7 @@ fn create_event_handler(
                         let outcome =
                             presentation::render_rootless_window(&mut rootless, &state.popups);
                         if let presentation::RootlessRenderOutcome::Submitted(rendered) = outcome {
+                            render_progress.record_submission(true, rendered);
                             state.retire_trace_frames(&traced);
                             failed_redraw_retries.remove(&window_id);
                             if rendered > 0 && !rootless.presented_once {
@@ -6303,7 +6313,9 @@ fn create_event_handler(
                         && mode.refresh != desktop_clock.refresh_millihertz() as i32
                     {
                         mode.refresh = desktop_clock.refresh_millihertz() as i32;
-                        state.output.change_current_state(Some(mode), None, None, None);
+                        state
+                            .output
+                            .change_current_state(Some(mode), None, None, None);
                     }
                 }
                 match event {
@@ -6824,6 +6836,7 @@ fn create_event_handler(
                                         false
                                     }
                                 };
+                                render_progress.record_submission(submitted, rendered_count);
                                 if submitted {
                                     state.retire_trace_frames(&submitted_traces);
                                 }
@@ -6958,6 +6971,7 @@ fn create_event_handler(
                     let elapsed = now.duration_since(perf_window_start).as_secs_f64();
                     let redraw_delta = perf_redraws.saturating_sub(perf_last_redraws);
                     let commit_delta = state.commit_counter.saturating_sub(perf_last_commits);
+                    render_progress.surface_commits = state.commit_counter;
                     container_mode::record_performance_snapshot(
                         redraw_delta as f64 / elapsed,
                         commit_delta as f64 / elapsed,
@@ -6972,6 +6986,7 @@ fn create_event_handler(
                         perf_max_redraw_wait_ms,
                         input_to_present_ms,
                         state.native_cursor_diagnostics(),
+                        render_progress,
                     );
                     perf_window_start = now;
                     perf_last_redraws = perf_redraws;

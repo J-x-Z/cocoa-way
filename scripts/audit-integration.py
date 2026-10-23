@@ -26,6 +26,39 @@ def execute(args, **kwargs):
     return result.stdout
 
 
+def cleanup_owned_containers(container, label, token, run=execute):
+    def inventory():
+        rows = json.loads(run([container, "list", "--all", "--format", "json"]))
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("configuration"), dict)
+            or not isinstance(row["configuration"].get("id"), str)
+            for row in rows
+        ):
+            raise RuntimeError("container inventory schema cannot establish cleanup authority")
+        return rows
+
+    rows = inventory()
+    resolved_races = []
+    for row in rows:
+        configuration = row.get("configuration", {})
+        if configuration.get("labels", {}).get(label) != token:
+            continue
+        name = configuration.get("id")
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("test container inspect schema missing identity")
+        try:
+            run([container, "delete", "--force", name], timeout=30)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            # The app's asynchronous cleanup can win after our inventory read.
+            # Only a successful fresh inventory proving absence resolves this.
+            current = inventory()
+            if any(item.get("configuration", {}).get("id") == name for item in current):
+                raise
+            resolved_races.append(name)
+    return resolved_races
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true", help="actually launch isolated test windows/containers")
@@ -34,6 +67,8 @@ def main():
     parser.add_argument("--image", default="localhost/cocoa-way-niri:2.0-rc2")
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--shutdown-during-launch", action="store_true")
+    parser.add_argument("--require-content", action="store_true",
+                        help="also require each instance's worker to submit a frame containing client buffers")
     parser.add_argument("--output", type=Path, default=Path("target/audit-20261015/integration.json"))
     options = parser.parse_args()
     if not options.run:
@@ -46,6 +81,7 @@ def main():
     label = "org.cocoa-way.audit"
     report = {"schema": 1, "run": token, "image": options.image, "observations": [],
               "scope": "control/lifecycle smoke and bounded soak; visual and input latency not inferred",
+              "require_content": options.require_content,
               "success": False, "cleanup_errors": []}
     report["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
     report["ctl_sha256"] = hashlib.sha256(ctl.read_bytes()).hexdigest()
@@ -92,6 +128,20 @@ def main():
             rows = request("running")["data"]
             return any(row.get("profile_id") == profile_id for row in rows)
 
+        def content_submitted(name):
+            profile_id = next(f"{index + 1:032x}" for index, profile in enumerate(profiles) if profile[0] == name)
+            instance = next((row for row in request("running")["data"]
+                             if row.get("profile_id") == profile_id), None)
+            if instance is None:
+                return None
+            progress = request("performance")["data"].get("render_progress", [])
+            expected_pid = instance.get("display_pid") or process.pid
+            return next((row for row in progress
+                         if row.get("slot") == instance["display_slot"]
+                         and row.get("worker_pid") == expected_pid
+                         and isinstance(row.get("progress"), dict)
+                         and row["progress"].get("submitted_content_frames", 0) > 0), None)
+
         def wait_for(predicate, message, timeout=90):
             deadline = time.monotonic() + timeout
             last = None
@@ -117,6 +167,11 @@ def main():
                 for name, _, _ in profiles:
                     observe("launch_accepted", request("launch", name))
                     wait_for(lambda: active(name), f"instance {name} did not become active")
+                    if options.require_content:
+                        evidence = wait_for(lambda: content_submitted(name),
+                            f"instance {name} became active but submitted no client content", 30)
+                        observe("client_content_submitted", {"name": name, "snapshot": evidence,
+                            "meaning": "CPU submission with client buffers, not visual or screen-presentation acceptance"})
                 observe("three_active", request("running"))
                 observe("displays", request("displays"))
                 deadline = time.monotonic() + options.seconds
@@ -142,6 +197,9 @@ def main():
                 name = profiles[1][0]
                 observe("relaunch_accepted", request("launch", name))
                 wait_for(lambda: active(name), "terminal reconnect", 90)
+                if options.require_content:
+                    observe("relaunch_content_submitted", wait_for(lambda: content_submitted(name),
+                        "restarted terminal submitted no client content", 30))
                 observe("reconnected", request("running"))
                 observe("final_stop", request("stop", name))
                 wait_for(lambda: not active(name), "terminal final stop", 30)
@@ -171,16 +229,12 @@ def main():
                     process.wait(timeout=5)
             # Never match names alone; a user could reuse a test name externally.
             try:
-                rows = json.loads(execute([container, "list", "--all", "--format", "json"]))
-                for row in rows:
-                    configuration = row.get("configuration", {})
-                    if configuration.get("labels", {}).get(label) == token:
-                        if report["success"] and options.shutdown_during_launch:
-                            report["cleanup_errors"].append("graceful shutdown left an owned audit container; fallback cleanup was required")
-                        name = configuration.get("id")
-                        if not isinstance(name, str):
-                            raise RuntimeError("test container inspect schema missing identity")
-                        execute([container, "delete", "--force", name], timeout=30)
+                if report["success"] and options.shutdown_during_launch:
+                    remaining = json.loads(execute([container, "list", "--all", "--format", "json"]))
+                    if any(row.get("configuration", {}).get("labels", {}).get(label) == token
+                           for row in remaining):
+                        report["cleanup_errors"].append("graceful shutdown left an owned audit container; fallback cleanup was required")
+                report["cleanup_races_resolved"] = cleanup_owned_containers(container, label, token)
             except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
                 report["cleanup_errors"].append(str(error))
             options.output.write_text(json.dumps(report, indent=2) + "\n")

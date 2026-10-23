@@ -204,7 +204,7 @@ fn tools(allow_control: bool) -> Vec<Value> {
         read_only_tool(
             "cocoa_way_performance",
             "Cocoa-Way performance",
-            "Read host/display performance, cursor paths, resources, and measurement_limits. Sampled CPU-side timings are not end-to-end latency, GPU completion, or proof of physical presentation. No invented percentiles; missing samples are not zero.",
+            "Read host/display performance, cursor paths, resources, and measurement_limits. render_progress includes worker PID, cumulative surface commits and CPU submissions containing client content, which can distinguish idle zero FPS from no content submission. Counters cover the worker lifetime, not an individual application. Null progress means unavailable. Sampled CPU-side timings are not end-to-end latency, GPU completion, or proof of physical presentation. No invented percentiles; missing samples are not zero.",
             empty_schema(),
         ),
         read_only_tool(

@@ -569,6 +569,7 @@ fn performance_snapshot(path: &Path) -> Value {
     redact_value(json!({
         "host": status["performance"],
         "displays": displays["performance"],
+        "render_progress": displays["render_progress"],
         "cursor_paths": displays["cursor_paths"],
         "resources": status["resources"],
         "measurement_limits": {
@@ -576,6 +577,7 @@ fn performance_snapshot(path: &Path) -> Value {
             "guest_clock": "No synchronized Guest receive timestamps are available in this snapshot.",
             "percentiles": "A snapshot does not establish P50/P95/P99; collect correlated trace samples for a latency distribution.",
             "freshness": "Per-display and resource entries include their own sampling timestamps. Idle displays may report zero FPS.",
+            "content_frames": "Worker-local cumulative CPU submissions with client content; not GPU completion, visible pixels, or screen presentation. Null progress means an older worker did not report counters.",
         },
     }))
 }
@@ -628,6 +630,7 @@ fn displays_snapshot() -> Value {
         },
         "active": active_sessions_json(),
         "cursor_paths": container_mode::control_cursor_paths(),
+        "render_progress": container_mode::control_display_render_progress(),
         "performance": container_mode::control_display_performance()
             .into_iter()
             .map(|(slot, redraw_fps, commits_per_second, late_redraws_per_second, max_redraw_wait_ms, input_to_present_ms, sampled_at_unix_ms)| json!({
@@ -1123,6 +1126,13 @@ mod tests {
     #[test]
     fn performance_debug_snapshots_describe_evidence_limits_without_clipboard_contents() {
         let performance = performance_snapshot(Path::new("unused"));
+        assert!(performance["render_progress"].is_array());
+        assert!(
+            performance["measurement_limits"]["content_frames"]
+                .as_str()
+                .unwrap()
+                .contains("cumulative CPU submissions")
+        );
         assert!(
             performance["measurement_limits"]["input_latency"]
                 .as_str()
