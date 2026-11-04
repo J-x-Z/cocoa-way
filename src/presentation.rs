@@ -48,6 +48,125 @@ impl PresentationMode {
     }
 }
 
+/// Rootless windows open at a default size, but dialogs and other fixed-size
+/// toplevels ignore the configured size and draw at their own. On the first
+/// presented frame, size the native window to what the client committed, keep
+/// fixed-size toplevels (min == max) non-resizable, and attach a toplevel with
+/// an xdg parent as a child window centered over that parent.
+pub fn fit_rootless_window_to_client(
+    rootless: &RootlessWindow,
+    parent: Option<&winit::window::Window>,
+) {
+    use smithay::reexports::wayland_server::Resource;
+
+    let window = &rootless.renderer.window;
+    let surface = rootless.toplevel.wl_surface();
+    let (geometry, min_size, max_size, buffer_scale) =
+        smithay::wayland::compositor::with_states(surface, |states| {
+            let mut xdg = states
+                .cached_state
+                .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+            let xdg = *xdg.current();
+            let mut attributes = states
+                .cached_state
+                .get::<smithay::wayland::compositor::SurfaceAttributes>();
+            (
+                xdg.geometry,
+                xdg.min_size,
+                xdg.max_size,
+                attributes.current().buffer_scale,
+            )
+        });
+    let client_size = geometry
+        .map(|geometry| (geometry.size.w, geometry.size.h))
+        .or_else(|| {
+            rootless
+                .renderer
+                .cached_surface_size(&surface.id())
+                .map(|(width, height)| (width / buffer_scale.max(1), height / buffer_scale.max(1)))
+        });
+    let Some((width, height)) = client_size.filter(|(width, height)| *width > 0 && *height > 0)
+    else {
+        return;
+    };
+    let scale = rootless.scale_factor;
+    let current = window.inner_size().to_logical::<f64>(scale);
+    if (current.width - f64::from(width)).abs() > 1.0
+        || (current.height - f64::from(height)).abs() > 1.0
+    {
+        log::info!(
+            "Rootless {:?}: adopting client size {}x{} (was {:.0}x{:.0})",
+            rootless.surface_id(),
+            width,
+            height,
+            current.width,
+            current.height
+        );
+        let _ = window.request_inner_size(winit::dpi::LogicalSize::new(
+            f64::from(width),
+            f64::from(height),
+        ));
+    }
+    if is_fixed_size((min_size.w, min_size.h), (max_size.w, max_size.h)) {
+        window.set_resizable(false);
+    }
+    let Some(parent) = parent else {
+        return;
+    };
+    // The title bar is the difference between the outer and inner heights.
+    let title_bar = window.outer_size().to_logical::<f64>(scale).height
+        - window.inner_size().to_logical::<f64>(scale).height;
+    if let Ok(parent_position) = parent.outer_position() {
+        let parent_scale = parent.scale_factor();
+        let parent_position = parent_position.to_logical::<f64>(parent_scale);
+        let parent_size = parent.outer_size().to_logical::<f64>(parent_scale);
+        let (x, y) = centered_child_origin(
+            (parent_position.x, parent_position.y),
+            (parent_size.width, parent_size.height),
+            (f64::from(width), f64::from(height) + title_bar),
+        );
+        window.set_outer_position(winit::dpi::LogicalPosition::new(x, y));
+    }
+    attach_child_window(parent, window);
+}
+
+/// xdg_toplevel min == max (both axes constrained) marks a fixed-size window.
+pub fn is_fixed_size(min_size: (i32, i32), max_size: (i32, i32)) -> bool {
+    min_size.0 > 0 && min_size.1 > 0 && min_size == max_size
+}
+
+/// Outer origin, in logical points, that centers a child over its parent,
+/// clamped so the child never starts above or left of the screen origin.
+pub fn centered_child_origin(
+    parent_origin: (f64, f64),
+    parent_size: (f64, f64),
+    child_size: (f64, f64),
+) -> (f64, f64) {
+    let x = parent_origin.0 + (parent_size.0 - child_size.0) / 2.0;
+    let y = parent_origin.1 + (parent_size.1 - child_size.1) / 2.0;
+    (x.max(0.0), y.max(0.0))
+}
+
+/// NSWindow addChildWindow: keeps a dialog above its parent and moves it along.
+fn attach_child_window(parent: &winit::window::Window, child: &winit::window::Window) {
+    use objc2_app_kit::{NSView, NSWindowOrderingMode};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    fn ns_window(
+        window: &winit::window::Window,
+    ) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+        let RawWindowHandle::AppKit(handle) = window.window_handle().ok()?.as_raw() else {
+            return None;
+        };
+        // winit's AppKit handle is the content view of a live window on the main thread.
+        let view = unsafe { &*(handle.ns_view.as_ptr() as *const NSView) };
+        view.window()
+    }
+    if let (Some(parent), Some(child)) = (ns_window(parent), ns_window(child)) {
+        unsafe { parent.addChildWindow_ordered(&child, NSWindowOrderingMode::NSWindowAbove) };
+    }
+}
+
 pub fn honor_rootless_maximize(presented_once: bool, maximized: bool) -> bool {
     !maximized || presented_once
 }
@@ -809,7 +928,7 @@ pub(crate) fn surface_logical_size(
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentationMode, honor_rootless_maximize};
+    use super::{PresentationMode, centered_child_origin, honor_rootless_maximize, is_fixed_size};
     use crate::metal_renderer::PixelDrawResult;
 
     use smithay::{
@@ -1732,5 +1851,26 @@ mod tests {
         assert!(!honor_rootless_maximize(false, true));
         assert!(honor_rootless_maximize(true, true));
         assert!(honor_rootless_maximize(false, false));
+    }
+
+    #[test]
+    fn only_fully_constrained_equal_sizes_are_fixed() {
+        assert!(is_fixed_size((424, 358), (424, 358)));
+        assert!(!is_fixed_size((0, 0), (0, 0)));
+        assert!(!is_fixed_size((424, 0), (424, 0)));
+        assert!(!is_fixed_size((200, 100), (800, 600)));
+    }
+
+    #[test]
+    fn child_windows_center_over_their_parent() {
+        assert_eq!(
+            centered_child_origin((100.0, 50.0), (1000.0, 800.0), (400.0, 300.0)),
+            (400.0, 300.0)
+        );
+        // A child larger than its parent near the screen origin is clamped.
+        assert_eq!(
+            centered_child_origin((10.0, 0.0), (300.0, 200.0), (600.0, 500.0)),
+            (0.0, 0.0)
+        );
     }
 }

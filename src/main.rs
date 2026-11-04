@@ -6156,6 +6156,13 @@ fn create_event_handler(
                                 // causing the earlier focus request to be ignored. Activate once
                                 // after real client content has reached the native window.
                                 rootless.presented_once = true;
+                                let parent = rootless.toplevel.parent().and_then(|parent| {
+                                    rootless_windows
+                                        .values()
+                                        .find(|window| window.toplevel.wl_surface() == &parent)
+                                        .map(|window| window.renderer.window.as_ref())
+                                });
+                                presentation::fit_rootless_window_to_client(&rootless, parent);
                                 rootless.renderer.window.set_visible(true);
                                 rootless.renderer.window.focus_window();
                             }
