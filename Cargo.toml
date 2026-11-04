@@ -26,7 +26,7 @@ objc2-metal = { version = "=0.2.2", default-features = false, features = [
 ] }
 objc2-app-kit = { version = "=0.2.2", default-features = false, features = [
     "NSApplication", "NSMenu", "NSMenuItem", "NSResponder",
-    "NSWindow", "NSAlert", "NSView", "NSGraphics",
+    "NSWindow", "NSScreen", "NSAlert", "NSView", "NSGraphics",
     "NSControl", "NSText", "NSTextField", "NSSecureTextField",
     "NSButton", "NSPopUpButton", "NSScrollView", "NSTextView", "NSFont", "NSBox", "NSColor",
     "NSStatusBar", "NSStatusItem", "NSStatusBarButton",
@@ -58,6 +58,11 @@ wayland-backend = { path = "vendor/wayland-backend" }
 [[test]]
 name = "native-panel-layout"
 path = "tests/native_panel_layout.rs"
+harness = false
+
+[[test]]
+name = "native-rootless-dialogs"
+path = "tests/native_rootless_dialogs.rs"
 harness = false
 
 [workspace]

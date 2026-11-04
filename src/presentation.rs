@@ -15,6 +15,15 @@ pub struct RootlessWindow {
     pub last_render_metrics: Option<(u32, u32, u64, i32, i32, i32, i32)>,
 }
 
+impl Drop for RootlessWindow {
+    fn drop(&mut self) {
+        native::detach_window(&self.renderer.window);
+    }
+}
+
+#[path = "rootless_native.rs"]
+mod native;
+
 impl RootlessWindow {
     pub fn surface_id(&self) -> smithay::reexports::wayland_server::backend::ObjectId {
         use smithay::reexports::wayland_server::Resource;
@@ -46,6 +55,91 @@ impl PresentationMode {
     pub fn is_rootless(self) -> bool {
         self == Self::Rootless
     }
+}
+
+/// Rootless windows open at a default size, but dialogs and other fixed-size
+/// toplevels ignore the configured size and draw at their own. On the first
+/// presented frame, size the native window to what the client committed, keep
+/// fixed-size toplevels (min == max) non-resizable, and attach a toplevel with
+/// an xdg parent as a child window centered over that parent.
+pub fn fit_rootless_window_to_client(
+    rootless: &RootlessWindow,
+    parent: Option<&winit::window::Window>,
+) {
+    use smithay::reexports::wayland_server::Resource;
+
+    let window = &rootless.renderer.window;
+    let surface = rootless.toplevel.wl_surface();
+    let (geometry, min_size, max_size, mapping) =
+        smithay::wayland::compositor::with_states(surface, |states| {
+            let mut xdg = states
+                .cached_state
+                .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+            let xdg = *xdg.current();
+            let mut attributes = states
+                .cached_state
+                .get::<smithay::wayland::compositor::SurfaceAttributes>();
+            (
+                xdg.geometry,
+                xdg.min_size,
+                xdg.max_size,
+                crate::metal_renderer::geometry::SurfaceMapping {
+                    buffer_scale: attributes.current().buffer_scale,
+                    transform: attributes.current().buffer_transform,
+                    viewport: *states
+                        .cached_state
+                        .get::<smithay::wayland::viewporter::ViewportCachedState>()
+                        .current(),
+                },
+            )
+        });
+    let Some((width, height)) = rootless_client_size(
+        geometry.map(|geometry| (geometry.size.w, geometry.size.h)),
+        rootless.renderer.cached_surface_size(&surface.id()),
+        mapping,
+    ) else {
+        return;
+    };
+    let scale = rootless.scale_factor;
+    let current = window.inner_size().to_logical::<f64>(scale);
+    if (current.width - width).abs() > 1.0 || (current.height - height).abs() > 1.0 {
+        log::info!(
+            "Rootless {:?}: adopting client size {}x{} (was {:.0}x{:.0})",
+            rootless.surface_id(),
+            width,
+            height,
+            current.width,
+            current.height
+        );
+        let _ = window.request_inner_size(winit::dpi::LogicalSize::new(width, height));
+    }
+    if is_fixed_size((min_size.w, min_size.h), (max_size.w, max_size.h)) {
+        window.set_resizable(false);
+    }
+    if let Some(parent) = parent {
+        native::attach_child_window(parent, window);
+    }
+}
+
+fn rootless_client_size(
+    geometry: Option<(i32, i32)>,
+    buffer: Option<(i32, i32)>,
+    mapping: crate::metal_renderer::geometry::SurfaceMapping,
+) -> Option<(f64, f64)> {
+    let (width, height) = match geometry {
+        Some((width, height)) => (f64::from(width), f64::from(height)),
+        None => {
+            let size = mapping.logical_size(buffer?)?;
+            (size.w, size.h)
+        }
+    };
+    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+        .then_some((width, height))
+}
+
+/// xdg_toplevel min == max (both axes constrained) marks a fixed-size window.
+pub fn is_fixed_size(min_size: (i32, i32), max_size: (i32, i32)) -> bool {
+    min_size.0 > 0 && min_size.1 > 0 && min_size == max_size
 }
 
 pub fn honor_rootless_maximize(presented_once: bool, maximized: bool) -> bool {
@@ -825,7 +919,7 @@ pub(crate) fn surface_logical_size(
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentationMode, honor_rootless_maximize};
+    use super::{PresentationMode, honor_rootless_maximize, is_fixed_size};
     use crate::metal_renderer::PixelDrawResult;
 
     use smithay::{
@@ -1748,5 +1842,54 @@ mod tests {
         assert!(!honor_rootless_maximize(false, true));
         assert!(honor_rootless_maximize(true, true));
         assert!(honor_rootless_maximize(false, false));
+    }
+
+    #[test]
+    fn only_fully_constrained_equal_sizes_are_fixed() {
+        assert!(is_fixed_size((424, 358), (424, 358)));
+        assert!(!is_fixed_size((0, 0), (0, 0)));
+        assert!(!is_fixed_size((424, 0), (424, 0)));
+        assert!(!is_fixed_size((200, 100), (800, 600)));
+    }
+
+    #[test]
+    fn rootless_dialog_size_uses_logical_geometry_or_the_full_buffer_mapping() {
+        use crate::metal_renderer::geometry::SurfaceMapping;
+        let mut mapping = SurfaceMapping {
+            buffer_scale: 2,
+            transform: Transform::_90,
+            viewport: ViewportCachedState::default(),
+        };
+        assert_eq!(
+            super::rootless_client_size(None, Some((800, 400)), mapping),
+            Some((200.0, 400.0))
+        );
+        mapping.viewport.dst = Some((424, 358).into());
+        assert_eq!(
+            super::rootless_client_size(None, Some((800, 400)), mapping),
+            Some((424.0, 358.0))
+        );
+        assert_eq!(
+            super::rootless_client_size(Some((300, 200)), Some((800, 400)), mapping),
+            Some((300.0, 200.0))
+        );
+        mapping.viewport.dst = None;
+        mapping.viewport.src = Some(smithay::utils::Rectangle::new(
+            (10.0, 20.0).into(),
+            (30.0, 40.0).into(),
+        ));
+        assert_eq!(
+            super::rootless_client_size(None, Some((800, 400)), mapping),
+            Some((30.0, 40.0))
+        );
+        assert_eq!(super::rootless_client_size(None, None, mapping), None);
+        assert_eq!(
+            super::rootless_client_size(Some((0, 200)), None, mapping),
+            None
+        );
+        assert_eq!(
+            super::rootless_client_size(None, Some((0, 400)), mapping),
+            None
+        );
     }
 }
