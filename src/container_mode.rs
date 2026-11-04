@@ -3268,6 +3268,24 @@ fn unique_duplicate_name(sessions: &[ContainerSession], name: &str) -> String {
     )
 }
 
+fn session_dialog_error(
+    image: &str,
+    command: &str,
+    runtime: &str,
+    audio: bool,
+    is_edit: bool,
+) -> Option<&'static str> {
+    if image.is_empty() {
+        Some("Enter an image reference before creating the session.")
+    } else if !is_edit && command.is_empty() {
+        Some("Enter the application's launch command before creating it.")
+    } else if audio && matches!(runtime, "docker" | "orb" | "orbstack") {
+        Some("Audio forwarding currently requires Apple Container.")
+    } else {
+        None
+    }
+}
+
 unsafe fn show_session_dialog(
     defaults: AddSessionDefaults,
     edit_target: Option<(usize, ContainerSession)>,
@@ -3450,120 +3468,116 @@ unsafe fn show_session_dialog(
         let _: () = msg_send![&*alert, layout];
     }
 
-    let response: isize = unsafe { msg_send![&*alert, runModal] };
-    if response != 1000 {
-        return;
-    }
-
-    let name = field_string(&name_field);
-    let runtime = field_string(&runtime_field);
-    let display = field_string(&display_field);
-    let presentation = if popup_index(&presentation_popup) == 1 {
-        "rootless"
-    } else {
-        "desktop"
-    };
-    let profile = field_string(&profile_field);
-    let image = field_string(&image_field);
-    let command = field_string(&command_field);
-    let mounts = semicolon_list(&field_string(&mounts_field));
-    let env = semicolon_list(&field_string(&env_field));
-    let audio_requested = popup_index(&audio_popup) == 1;
-    if image.is_empty() {
-        show_error_alert("Enter an image reference before creating the session.");
-        return;
-    }
-    if !is_edit && command.is_empty() {
-        show_error_alert(&tr(
-            "Enter the application's launch command before creating it.",
-        ));
-        return;
-    }
-
-    let runtime = if runtime.is_empty() {
-        "container".to_string()
-    } else {
-        runtime
-    };
-    if audio_requested && matches!(runtime.as_str(), "docker" | "orb" | "orbstack") {
-        show_error_alert("Audio forwarding currently requires Apple Container.");
-        return;
-    }
-    let profile = normalize_profile(&profile);
-    let runtime_args = default_gui_runtime_args(&runtime, profile.as_deref());
-    let mut session = ContainerSession {
-        id: ProfileId::UNSAVED,
-        name: if name.is_empty() {
-            default_session_name(&image)
-        } else {
-            name
-        },
-        image,
-        runtime,
-        display: Some(if display.is_empty() {
-            "auto".into()
-        } else {
-            display
-        }),
-        presentation: Some(presentation.into()),
-        profile,
-        app: None,
-        command: if command.is_empty() {
-            None
-        } else {
-            Some(command)
-        },
-        socket: None,
-        container_socket: None,
-        waypipe_path: None,
-        waypipe_compress: None,
-        waypipe_threads: None,
-        audio: audio_requested,
-        runtime_args,
-        mounts,
-        env,
-    };
-
-    let result = if let Some((_index, original)) = edit_target {
-        session.id = original.id;
-        session.app = original.app;
-        session.socket = original.socket;
-        session.container_socket = original.container_socket;
-        session.waypipe_path = original.waypipe_path;
-        session.waypipe_compress = original.waypipe_compress;
-        session.waypipe_threads = original.waypipe_threads;
-        session.runtime_args = original.runtime_args;
-        container_sessions::replace_session(session.id, &session).map(|_| Some(session.id))
-    } else {
-        container_sessions::append_session(&session).map(Some)
-    };
-
-    match result {
-        Ok(selected_index) => {
-            send(CompositorMessage::ReloadMenu);
-            *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = selected_index;
-            if let Some(id) = selected_index {
-                invalidate_profile_validation(id);
-            }
-            push_activity(format!(
-                "{} session: {} ({})",
-                if is_edit { "Updated" } else { "Added" },
-                session.name,
-                session.image
-            ));
-            unsafe {
-                rebuild_window();
-            }
+    // Keep the same controls alive so validation and save errors preserve edits.
+    loop {
+        let response: isize = unsafe { msg_send![&*alert, runModal] };
+        if response != 1000 {
+            return;
         }
-        Err(error) => {
-            let message = format!(
-                "Failed to {} session: {}",
-                if is_edit { "update" } else { "add" },
-                error
-            );
-            push_activity(message.clone());
-            show_error_alert(&message);
+
+        let name = field_string(&name_field);
+        let runtime = field_string(&runtime_field);
+        let display = field_string(&display_field);
+        let presentation = if popup_index(&presentation_popup) == 1 {
+            "rootless"
+        } else {
+            "desktop"
+        };
+        let profile = field_string(&profile_field);
+        let image = field_string(&image_field);
+        let command = field_string(&command_field);
+        let mounts = semicolon_list(&field_string(&mounts_field));
+        let env = semicolon_list(&field_string(&env_field));
+        let audio_requested = popup_index(&audio_popup) == 1;
+        if let Some(error) =
+            session_dialog_error(&image, &command, &runtime, audio_requested, is_edit)
+        {
+            show_error_alert(&tr(error));
+            continue;
+        }
+
+        let runtime = if runtime.is_empty() {
+            "container".to_string()
+        } else {
+            runtime
+        };
+        let profile = normalize_profile(&profile);
+        let runtime_args = default_gui_runtime_args(&runtime, profile.as_deref());
+        let mut session = ContainerSession {
+            id: ProfileId::UNSAVED,
+            name: if name.is_empty() {
+                default_session_name(&image)
+            } else {
+                name
+            },
+            image,
+            runtime,
+            display: Some(if display.is_empty() {
+                "auto".into()
+            } else {
+                display
+            }),
+            presentation: Some(presentation.into()),
+            profile,
+            app: None,
+            command: if command.is_empty() {
+                None
+            } else {
+                Some(command)
+            },
+            socket: None,
+            container_socket: None,
+            waypipe_path: None,
+            waypipe_compress: None,
+            waypipe_threads: None,
+            audio: audio_requested,
+            runtime_args,
+            mounts,
+            env,
+        };
+
+        let result = if let Some((_index, original)) = &edit_target {
+            session.id = original.id;
+            session.app = original.app.clone();
+            session.socket = original.socket.clone();
+            session.container_socket = original.container_socket.clone();
+            session.waypipe_path = original.waypipe_path.clone();
+            session.waypipe_compress = original.waypipe_compress.clone();
+            session.waypipe_threads = original.waypipe_threads;
+            session.runtime_args = original.runtime_args.clone();
+            container_sessions::replace_session(session.id, &session).map(|_| Some(session.id))
+        } else {
+            container_sessions::append_session(&session).map(Some)
+        };
+
+        match result {
+            Ok(selected_index) => {
+                send(CompositorMessage::ReloadMenu);
+                *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
+                *SELECTED_SESSION.lock().unwrap() = selected_index;
+                if let Some(id) = selected_index {
+                    invalidate_profile_validation(id);
+                }
+                push_activity(format!(
+                    "{} session: {} ({})",
+                    if is_edit { "Updated" } else { "Added" },
+                    session.name,
+                    session.image
+                ));
+                unsafe {
+                    rebuild_window();
+                }
+                return;
+            }
+            Err(error) => {
+                let message = format!(
+                    "Failed to {} session: {}",
+                    if is_edit { "update" } else { "add" },
+                    error
+                );
+                push_activity(message.clone());
+                show_error_alert(&message);
+            }
         }
     }
 }
@@ -14469,6 +14483,46 @@ mod tests {
         let mut session = smoke_session();
         session.profile = None;
         assert_eq!(defaults_from_session(&session).profile, "single-app");
+    }
+
+    #[test]
+    fn session_dialog_validation_requires_explicit_new_launch_details() {
+        assert_eq!(
+            session_dialog_error("", "foot", "container", false, false),
+            Some("Enter an image reference before creating the session.")
+        );
+        assert_eq!(
+            session_dialog_error("example/gui:latest", "", "container", false, false),
+            Some("Enter the application's launch command before creating it.")
+        );
+        for command in ["foot", "firefox", "niri", "Hyprland"] {
+            assert_eq!(
+                session_dialog_error("example/gui:latest", command, "container", false, false),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn session_dialog_validation_preserves_existing_app_command_semantics() {
+        assert_eq!(
+            session_dialog_error("example/gui:latest", "", "container", false, true),
+            None
+        );
+        for runtime in ["docker", "orb", "orbstack"] {
+            assert_eq!(
+                session_dialog_error("example/gui:latest", "foot", runtime, true, false),
+                Some("Audio forwarding currently requires Apple Container.")
+            );
+            assert_eq!(
+                session_dialog_error("example/gui:latest", "foot", runtime, false, false),
+                None
+            );
+        }
+        assert_eq!(
+            session_dialog_error("example/gui:latest", "foot", "", true, false),
+            None
+        );
     }
 
     #[test]

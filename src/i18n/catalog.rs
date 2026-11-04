@@ -237,6 +237,8 @@ chinese_catalog! {
     "single-app / shell / optional preset" => "single-app / shell / 可选预设",
     "Launch command" => "启动命令",
     "Enter the application's launch command before creating it." => "创建应用前，请填写它的启动命令。",
+    "Enter an image reference before creating the session." => "创建应用前，请填写容器镜像地址。",
+    "Audio forwarding currently requires Apple Container." => "音频转发目前需要使用 Apple Container。",
     "Create a custom Container Mode application" => "创建自定义容器模式应用",
     "No Running Applications" => "暂无运行中的应用",
     "Launch an application profile to create an instance. Active containers, Waypipe workers, and display attachments will appear here." => "启动应用配置方案以创建实例。运行中的容器、Waypipe 工作进程和显示连接将出现在这里。",
