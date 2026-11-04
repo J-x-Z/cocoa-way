@@ -15,6 +15,15 @@ pub struct RootlessWindow {
     pub last_render_metrics: Option<(u32, u32, u64, i32, i32, i32, i32)>,
 }
 
+impl Drop for RootlessWindow {
+    fn drop(&mut self) {
+        native::detach_window(&self.renderer.window);
+    }
+}
+
+#[path = "rootless_native.rs"]
+mod native;
+
 impl RootlessWindow {
     pub fn surface_id(&self) -> smithay::reexports::wayland_server::backend::ObjectId {
         use smithay::reexports::wayland_server::Resource;
@@ -61,7 +70,7 @@ pub fn fit_rootless_window_to_client(
 
     let window = &rootless.renderer.window;
     let surface = rootless.toplevel.wl_surface();
-    let (geometry, min_size, max_size, buffer_scale) =
+    let (geometry, min_size, max_size, mapping) =
         smithay::wayland::compositor::with_states(surface, |states| {
             let mut xdg = states
                 .cached_state
@@ -74,26 +83,26 @@ pub fn fit_rootless_window_to_client(
                 xdg.geometry,
                 xdg.min_size,
                 xdg.max_size,
-                attributes.current().buffer_scale,
+                crate::metal_renderer::geometry::SurfaceMapping {
+                    buffer_scale: attributes.current().buffer_scale,
+                    transform: attributes.current().buffer_transform,
+                    viewport: *states
+                        .cached_state
+                        .get::<smithay::wayland::viewporter::ViewportCachedState>()
+                        .current(),
+                },
             )
         });
-    let client_size = geometry
-        .map(|geometry| (geometry.size.w, geometry.size.h))
-        .or_else(|| {
-            rootless
-                .renderer
-                .cached_surface_size(&surface.id())
-                .map(|(width, height)| (width / buffer_scale.max(1), height / buffer_scale.max(1)))
-        });
-    let Some((width, height)) = client_size.filter(|(width, height)| *width > 0 && *height > 0)
-    else {
+    let Some((width, height)) = rootless_client_size(
+        geometry.map(|geometry| (geometry.size.w, geometry.size.h)),
+        rootless.renderer.cached_surface_size(&surface.id()),
+        mapping,
+    ) else {
         return;
     };
     let scale = rootless.scale_factor;
     let current = window.inner_size().to_logical::<f64>(scale);
-    if (current.width - f64::from(width)).abs() > 1.0
-        || (current.height - f64::from(height)).abs() > 1.0
-    {
+    if (current.width - width).abs() > 1.0 || (current.height - height).abs() > 1.0 {
         log::info!(
             "Rootless {:?}: adopting client size {}x{} (was {:.0}x{:.0})",
             rootless.surface_id(),
@@ -102,69 +111,35 @@ pub fn fit_rootless_window_to_client(
             current.width,
             current.height
         );
-        let _ = window.request_inner_size(winit::dpi::LogicalSize::new(
-            f64::from(width),
-            f64::from(height),
-        ));
+        let _ = window.request_inner_size(winit::dpi::LogicalSize::new(width, height));
     }
     if is_fixed_size((min_size.w, min_size.h), (max_size.w, max_size.h)) {
         window.set_resizable(false);
     }
-    let Some(parent) = parent else {
-        return;
-    };
-    // The title bar is the difference between the outer and inner heights.
-    let title_bar = window.outer_size().to_logical::<f64>(scale).height
-        - window.inner_size().to_logical::<f64>(scale).height;
-    if let Ok(parent_position) = parent.outer_position() {
-        let parent_scale = parent.scale_factor();
-        let parent_position = parent_position.to_logical::<f64>(parent_scale);
-        let parent_size = parent.outer_size().to_logical::<f64>(parent_scale);
-        let (x, y) = centered_child_origin(
-            (parent_position.x, parent_position.y),
-            (parent_size.width, parent_size.height),
-            (f64::from(width), f64::from(height) + title_bar),
-        );
-        window.set_outer_position(winit::dpi::LogicalPosition::new(x, y));
+    if let Some(parent) = parent {
+        native::attach_child_window(parent, window);
     }
-    attach_child_window(parent, window);
+}
+
+fn rootless_client_size(
+    geometry: Option<(i32, i32)>,
+    buffer: Option<(i32, i32)>,
+    mapping: crate::metal_renderer::geometry::SurfaceMapping,
+) -> Option<(f64, f64)> {
+    let (width, height) = match geometry {
+        Some((width, height)) => (f64::from(width), f64::from(height)),
+        None => {
+            let size = mapping.logical_size(buffer?)?;
+            (size.w, size.h)
+        }
+    };
+    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+        .then_some((width, height))
 }
 
 /// xdg_toplevel min == max (both axes constrained) marks a fixed-size window.
 pub fn is_fixed_size(min_size: (i32, i32), max_size: (i32, i32)) -> bool {
     min_size.0 > 0 && min_size.1 > 0 && min_size == max_size
-}
-
-/// Outer origin, in logical points, that centers a child over its parent,
-/// clamped so the child never starts above or left of the screen origin.
-pub fn centered_child_origin(
-    parent_origin: (f64, f64),
-    parent_size: (f64, f64),
-    child_size: (f64, f64),
-) -> (f64, f64) {
-    let x = parent_origin.0 + (parent_size.0 - child_size.0) / 2.0;
-    let y = parent_origin.1 + (parent_size.1 - child_size.1) / 2.0;
-    (x.max(0.0), y.max(0.0))
-}
-
-/// NSWindow addChildWindow: keeps a dialog above its parent and moves it along.
-fn attach_child_window(parent: &winit::window::Window, child: &winit::window::Window) {
-    use objc2_app_kit::{NSView, NSWindowOrderingMode};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    fn ns_window(
-        window: &winit::window::Window,
-    ) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
-        let RawWindowHandle::AppKit(handle) = window.window_handle().ok()?.as_raw() else {
-            return None;
-        };
-        // winit's AppKit handle is the content view of a live window on the main thread.
-        let view = unsafe { &*(handle.ns_view.as_ptr() as *const NSView) };
-        view.window()
-    }
-    if let (Some(parent), Some(child)) = (ns_window(parent), ns_window(child)) {
-        unsafe { parent.addChildWindow_ordered(&child, NSWindowOrderingMode::NSWindowAbove) };
-    }
 }
 
 pub fn honor_rootless_maximize(presented_once: bool, maximized: bool) -> bool {
@@ -928,7 +903,7 @@ pub(crate) fn surface_logical_size(
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentationMode, centered_child_origin, honor_rootless_maximize, is_fixed_size};
+    use super::{PresentationMode, honor_rootless_maximize, is_fixed_size};
     use crate::metal_renderer::PixelDrawResult;
 
     use smithay::{
@@ -1862,15 +1837,43 @@ mod tests {
     }
 
     #[test]
-    fn child_windows_center_over_their_parent() {
+    fn rootless_dialog_size_uses_logical_geometry_or_the_full_buffer_mapping() {
+        use crate::metal_renderer::geometry::SurfaceMapping;
+        let mut mapping = SurfaceMapping {
+            buffer_scale: 2,
+            transform: Transform::_90,
+            viewport: ViewportCachedState::default(),
+        };
         assert_eq!(
-            centered_child_origin((100.0, 50.0), (1000.0, 800.0), (400.0, 300.0)),
-            (400.0, 300.0)
+            super::rootless_client_size(None, Some((800, 400)), mapping),
+            Some((200.0, 400.0))
         );
-        // A child larger than its parent near the screen origin is clamped.
+        mapping.viewport.dst = Some((424, 358).into());
         assert_eq!(
-            centered_child_origin((10.0, 0.0), (300.0, 200.0), (600.0, 500.0)),
-            (0.0, 0.0)
+            super::rootless_client_size(None, Some((800, 400)), mapping),
+            Some((424.0, 358.0))
+        );
+        assert_eq!(
+            super::rootless_client_size(Some((300, 200)), Some((800, 400)), mapping),
+            Some((300.0, 200.0))
+        );
+        mapping.viewport.dst = None;
+        mapping.viewport.src = Some(smithay::utils::Rectangle::new(
+            (10.0, 20.0).into(),
+            (30.0, 40.0).into(),
+        ));
+        assert_eq!(
+            super::rootless_client_size(None, Some((800, 400)), mapping),
+            Some((30.0, 40.0))
+        );
+        assert_eq!(super::rootless_client_size(None, None, mapping), None);
+        assert_eq!(
+            super::rootless_client_size(Some((0, 200)), None, mapping),
+            None
+        );
+        assert_eq!(
+            super::rootless_client_size(None, Some((0, 400)), mapping),
+            None
         );
     }
 }
