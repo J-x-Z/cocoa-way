@@ -246,7 +246,7 @@ fn sample_resources(
         &container,
         &["stats", "--no-stream", "--format", "json"],
         &child_path,
-        COMMAND_TIMEOUT,
+        crate::apple_runtime::STATS_TIMEOUT,
     ) {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
@@ -415,6 +415,19 @@ mod tests {
         assert_eq!(stats[0].cpu_usage_usec, 55);
         assert_eq!(stats[0].memory_limit_bytes, 4096);
         assert_eq!(stats[0].processes, 3);
+    }
+
+    #[test]
+    fn accepts_container_1_7_additive_cpu_utilization() {
+        let stats = parse_stats(
+            br#"[{"id":"demo","cpuUsageUsec":55,"cpuUtilization":2.5,"memoryUsageBytes":1024,"memoryLimitBytes":4096,"numProcesses":3},{"id":"partial","cpuUtilization":null}]"#,
+        ).unwrap();
+        // Keep the cumulative counter used by existing delta sampling; the new
+        // fraction must not be mistaken for microseconds or a percentage.
+        assert_eq!(stats[0].cpu_usage_usec, 55);
+        assert_eq!(stats[0].memory_usage_bytes, 1024);
+        assert_eq!(stats[1].id, "partial");
+        assert_eq!(stats[1].cpu_usage_usec, 0);
     }
 
     #[test]

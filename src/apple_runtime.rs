@@ -5,6 +5,8 @@ use serde_json::Value;
 
 pub(crate) type Version = (u64, u64, u64);
 pub(crate) const MAX_VERSION_OUTPUT: usize = 4096;
+// Container 1.7 samples twice, two seconds apart, even for --no-stream.
+pub(crate) const STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Probe {

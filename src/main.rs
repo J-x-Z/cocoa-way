@@ -2524,7 +2524,7 @@ fn spawn_runtime_container_details(
             &command_path,
             &child_path,
             &commands.stats,
-            std::time::Duration::from_secs(3),
+            crate::apple_runtime::STATS_TIMEOUT,
             5,
         );
         let errors = [info_error, logs_error, stats_error]
