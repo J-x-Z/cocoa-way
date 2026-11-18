@@ -1,15 +1,49 @@
 #!/usr/bin/env python3
-"""Only cleanup authority/race tests; never contacts a runtime."""
+"""Test integration storage and cleanup guards without contacting a runtime."""
 
 import importlib.util
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location(
     "integration", Path(__file__).with_name("audit-integration.py"))
 integration = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(integration)
+
+
+class AppRootTests(unittest.TestCase):
+    def verify(self, expected, payload):
+        def run(argv):
+            self.assertEqual(argv, ["container", "system", "status", "--format", "json"])
+            return json.dumps(payload)
+
+        return integration.verify_app_root("container", expected, run)
+
+    def test_accepts_the_live_root_with_a_trailing_slash(self):
+        with tempfile.TemporaryDirectory() as root:
+            expected = Path(root).resolve()
+            self.assertEqual(self.verify(expected, {
+                "status": "running", "paths": {"appRoot": f"{root}/"},
+            }), str(expected))
+
+    def test_rejects_a_live_service_using_a_different_root(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as other:
+            with self.assertRaisesRegex(RuntimeError, "expected"):
+                self.verify(Path(root).resolve(), {
+                    "status": "running", "paths": {"appRoot": other},
+                })
+
+    def test_refuses_missing_relative_or_non_running_roots(self):
+        for payload in (
+            [],
+            {"status": "unregistered"},
+            {"status": "running", "paths": {}},
+            {"status": "running", "paths": {"appRoot": "relative"}},
+        ):
+            with self.subTest(payload=payload), self.assertRaisesRegex(RuntimeError, "did not report"):
+                self.verify(Path("/unused"), payload)
 
 
 class CleanupTests(unittest.TestCase):

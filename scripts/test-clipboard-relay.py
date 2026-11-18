@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -165,6 +166,32 @@ cp "$FIXTURE/$WAYLAND_DISPLAY/data" "$FIXTURE/copied"
                 self.transfer([], b"", watched=b"", source=source, destination=destination)
                 self.assertEqual((self.root / destination / "data").read_bytes(), b"existing clipboard")
                 self.assertEqual(self.destinations(), [])
+
+    def test_late_nested_socket_is_still_bridged(self):
+        self.env.update(XDG_RUNTIME_DIR=str(self.root), WAYLAND_DISPLAY="wayland-0",
+                        PYTHON=sys.executable)
+        self.mock("sleep", '''#!/bin/sh
+if [ "$1" = 0.05 ]; then
+    count=0
+    if [ -f "$FIXTURE/socket-polls" ]; then
+        read -r count < "$FIXTURE/socket-polls"
+    fi
+    count=$((count + 1))
+    printf '%s\\n' "$count" > "$FIXTURE/socket-polls"
+    if [ "$count" = 125 ]; then
+        "$PYTHON" -c 'import os, socket; socket.socket(socket.AF_UNIX).bind("wayland-1")'
+    fi
+else
+    exec /bin/sleep "$@"
+fi
+''')
+        self.mock("wl-paste", '#!/bin/sh\nexec /bin/sleep 30\n')
+        result = subprocess.run(
+            ["sh", str(RELAY), "/bin/sleep", "2"], cwd=self.root, env=self.env, check=True,
+            capture_output=True, text=True, timeout=8,
+        )
+        self.assertIn("bridging wayland-0 <-> wayland-1", result.stderr)
+        self.assertNotIn("clipboard bridge is disabled", result.stderr)
 
     def test_failed_copy_does_not_suppress_retry(self):
         self.env["FAIL_COPY"] = "1"

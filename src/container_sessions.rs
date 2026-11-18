@@ -303,6 +303,8 @@ const RELAY_TRANSPORT_ENV: &str = "COCOA_WAY_APPLE_TRANSPORT";
 const RELAY_AUDIO_ENV: &str = "COCOA_WAY_RELAY_AUDIO";
 const RELAY_AUDIO_HOST_ENV: &str = "COCOA_WAY_RELAY_AUDIO_HOST";
 const GUEST_AUDIO_SOCKET_ENV: &str = "COCOA_WAY_AUDIO_SOCKET";
+// The guest publishes readiness only after the VM and its audio relay are up.
+pub(crate) const APPLE_PUBLISH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn should_run_container_relay() -> bool {
     std::env::var_os(RELAY_ENV).is_some()
@@ -588,7 +590,7 @@ fn run_publish_socket_relay(
         PublishRelayError::Startup("container transport control channel unavailable".into())
     })?;
     if let Err(error) =
-        wait_for_publish_relay_ready(child_stdout, &mut child, Duration::from_secs(10))
+        wait_for_publish_relay_ready(child_stdout, &mut child, APPLE_PUBLISH_READY_TIMEOUT)
     {
         let _ = child.kill();
         let _ = child.wait();
@@ -628,6 +630,15 @@ fn run_publish_socket_relay(
         )));
     }
     eprintln!("cocoa-way container relay: using publish-socket transport v2");
+    let _audio_ready = host_audio.as_deref().and_then(|socket| {
+        match crate::audio::PublishedAudioReady::signal(socket) {
+            Ok(ready) => Some(ready),
+            Err(error) => {
+                eprintln!("cocoa-way container relay: could not announce audio readiness: {error}");
+                None
+            }
+        }
+    });
     let mut writer = match transport.try_clone() {
         Ok(writer) => writer,
         Err(error) => {
@@ -2011,6 +2022,9 @@ pub fn launch_checked_session(
     } else {
         None
     };
+    if let Some(socket) = audio_host_socket.as_deref() {
+        let _ = std::fs::remove_file(crate::audio::audio_ready_path(socket));
+    }
 
     let (container_child, waypipe_child) = match runtime_kind {
         ContainerRuntime::Apple => {

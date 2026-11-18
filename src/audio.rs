@@ -1,9 +1,10 @@
-use crate::container_sessions::ProfileId;
+use crate::container_sessions::{APPLE_PUBLISH_READY_TIMEOUT, ProfileId};
 use serde_json::json;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
@@ -135,38 +136,38 @@ impl Drop for AudioWorker {
     }
 }
 
+pub(crate) fn audio_ready_path(socket: &str) -> PathBuf {
+    Path::new(socket).with_extension("ready")
+}
+
+pub(crate) struct PublishedAudioReady(PathBuf);
+
+impl PublishedAudioReady {
+    pub(crate) fn signal(socket: &str) -> std::io::Result<Self> {
+        let path = audio_ready_path(socket);
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for PublishedAudioReady {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn run_audio_worker(
     index: ProfileId,
     session: &str,
     socket: &str,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    // An early connection can occupy Apple Container's single pending socket
-    // slot before the guest listener is ready. Give the guest relay time to
-    // initialize before the first connection attempt.
-    let warmup_deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < warmup_deadline {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let deadline = Instant::now() + Duration::from_secs(18);
-    let stream = loop {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let last_error = match UnixStream::connect(socket) {
-            Ok(stream) => break stream,
-            Err(error) => error.to_string(),
-        };
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out connecting to the audio socket: {}",
-                last_error
-            ));
-        }
-        thread::sleep(Duration::from_millis(500));
+    let deadline = Instant::now() + APPLE_PUBLISH_READY_TIMEOUT + Duration::from_secs(5);
+    let Some(stream) = connect_audio_socket(socket, stop, deadline)? else {
+        return Ok(());
     };
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -179,6 +180,36 @@ fn run_audio_worker(
         0,
     );
     play_pcm_stream(index, session, stream, stop)
+}
+
+fn connect_audio_socket(
+    socket: &str,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> Result<Option<UnixStream>, String> {
+    let ready = audio_ready_path(socket);
+    // Connecting before the guest listener exists can stall the sole pending
+    // connection even when the host-side socket is already accepting.
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let last_error = if ready.is_file() {
+            match UnixStream::connect(socket) {
+                Ok(stream) => return Ok(Some(stream)),
+                Err(error) => error.to_string(),
+            }
+        } else {
+            "guest audio listener not ready".into()
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out connecting to the audio socket: {}",
+                last_error
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn play_pcm_stream(
@@ -485,5 +516,81 @@ mod tests {
             );
         }
         output.enqueue(buffer, BUFFER_BYTES).unwrap();
+    }
+
+    #[test]
+    fn audio_socket_connects_only_after_the_guest_is_ready() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("audio.sock");
+        let socket = path.to_str().unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = AtomicBool::new(false);
+
+        let error = connect_audio_socket(socket, &stop, Instant::now()).unwrap_err();
+        assert!(error.contains("guest audio listener not ready"));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+        let ready = PublishedAudioReady::signal(socket).unwrap();
+        let _connection = connect_audio_socket(socket, &stop, Instant::now())
+            .unwrap()
+            .unwrap();
+        assert!(listener.accept().is_ok());
+        drop(ready);
+        assert!(!audio_ready_path(socket).exists());
+    }
+
+    #[test]
+    #[ignore = "requires a working macOS audio output"]
+    fn native_audio_refills_the_playing_queue_from_a_socket() {
+        use std::io::Write;
+
+        let index = ProfileId::new().unwrap();
+        let stop = AtomicBool::new(false);
+        let (mut source, sink) = UnixStream::pair().unwrap();
+        source
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        sink.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        let (progressed, result) = thread::scope(|scope| {
+            let worker = scope.spawn(|| play_pcm_stream(index, "audio QA", sink, &stop));
+            let writer = scope.spawn(move || {
+                let silence = [0u8; BUFFER_BYTES];
+                for _ in 0..200 {
+                    if source.write_all(&silence).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let primed_bytes = (BUFFER_COUNT * BUFFER_BYTES) as u64;
+            let mut progressed = false;
+            while Instant::now() < deadline && !worker.is_finished() {
+                progressed = statuses()
+                    .lock()
+                    .unwrap()
+                    .get(&index)
+                    .is_some_and(|status| {
+                        status.state == "playing" && status.bytes_played > primed_bytes
+                    });
+                if progressed {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            stop.store(true, Ordering::Relaxed);
+            let result = worker.join();
+            writer.join().unwrap();
+            (progressed, result)
+        });
+
+        clear_status(index);
+        result.unwrap().unwrap();
+        assert!(progressed, "CoreAudio never refilled its initial buffers");
     }
 }

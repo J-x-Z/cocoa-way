@@ -76,7 +76,8 @@ pub struct ClipboardSnapshot {
 #[derive(Clone, Debug, Default)]
 struct RawContainerStats {
     id: String,
-    cpu_usage_usec: u64,
+    cpu_usage_usec: Option<u64>,
+    cpu_utilization: Option<f64>,
     memory_usage_bytes: u64,
     memory_limit_bytes: u64,
     network_rx_bytes: u64,
@@ -84,6 +85,26 @@ struct RawContainerStats {
     block_read_bytes: u64,
     block_write_bytes: u64,
     processes: u64,
+}
+
+impl RawContainerStats {
+    fn cpu_percent(
+        &self,
+        previous_cpu_usec: Option<u64>,
+        elapsed: Option<Duration>,
+    ) -> Option<f64> {
+        // Apple Container 1.7.1 reports the fraction of one core, not a percentage.
+        if let Some(percent) = self
+            .cpu_utilization
+            .map(|fraction| fraction * 100.0)
+            .filter(|percent| percent.is_finite() && *percent >= 0.0)
+        {
+            return Some(percent);
+        }
+        let elapsed = elapsed.filter(|elapsed| !elapsed.is_zero())?;
+        let delta = self.cpu_usage_usec?.checked_sub(previous_cpu_usec?)?;
+        Some(delta as f64 / (elapsed.as_secs_f64() * 1_000_000.0) * 100.0)
+    }
 }
 
 pub fn start_resource_sampler() {
@@ -190,10 +211,10 @@ fn resource_sampler_loop() {
     let mut previous_sample = None;
     loop {
         let sample_started = Instant::now();
-        let snapshot = sample_resources(&previous_cpu, previous_sample, sample_started);
-        if let Some(raw) = LAST_RAW_CPU.lock().unwrap().take() {
-            previous_cpu = raw;
-            previous_sample = Some(sample_started);
+        let snapshot = sample_resources(&mut previous_cpu, &mut previous_sample, sample_started);
+        if !snapshot.available {
+            previous_cpu.clear();
+            previous_sample = None;
         }
         *RESOURCE_SNAPSHOT.lock().unwrap() = snapshot;
         let elapsed = sample_started.elapsed();
@@ -203,12 +224,9 @@ fn resource_sampler_loop() {
     }
 }
 
-static LAST_RAW_CPU: LazyLock<Mutex<Option<HashMap<String, u64>>>> =
-    LazyLock::new(|| Mutex::new(None));
-
 fn sample_resources(
-    previous_cpu: &HashMap<String, u64>,
-    previous_sample: Option<Instant>,
+    previous_cpu: &mut HashMap<String, u64>,
+    previous_sample: &mut Option<Instant>,
     sample_started: Instant,
 ) -> ResourceSnapshot {
     let child_path = build_child_path();
@@ -264,19 +282,16 @@ fn sample_resources(
         Ok(raw) => raw,
         Err(error) => return resource_error(&error, disk_available_bytes),
     };
-    let elapsed_usec = previous_sample
-        .map(|previous| sample_started.duration_since(previous).as_micros() as f64)
-        .filter(|elapsed| *elapsed > 0.0);
+    let elapsed =
+        previous_sample.and_then(|previous| sample_started.checked_duration_since(previous));
     let mut next_cpu = HashMap::new();
     let containers = raw
         .into_iter()
         .map(|stats| {
-            let cpu_percent = elapsed_usec.and_then(|elapsed| {
-                previous_cpu.get(&stats.id).map(|previous| {
-                    stats.cpu_usage_usec.saturating_sub(*previous) as f64 / elapsed * 100.0
-                })
-            });
-            next_cpu.insert(stats.id.clone(), stats.cpu_usage_usec);
+            let cpu_percent = stats.cpu_percent(previous_cpu.get(&stats.id).copied(), elapsed);
+            if let Some(counter) = stats.cpu_usage_usec {
+                next_cpu.insert(stats.id.clone(), counter);
+            }
             ContainerResourceSnapshot {
                 id: stats.id,
                 cpu_percent,
@@ -290,12 +305,10 @@ fn sample_resources(
             }
         })
         .collect::<Vec<_>>();
-    *LAST_RAW_CPU.lock().unwrap() = Some(next_cpu);
-    let total_cpu_percent = containers
-        .iter()
-        .map(|container| container.cpu_percent)
-        .collect::<Option<Vec<_>>>()
-        .map(|values| values.into_iter().sum());
+    *previous_cpu = next_cpu;
+    *previous_sample = Some(sample_started);
+    let total_cpu_percent =
+        sum_cpu_percent(containers.iter().map(|container| container.cpu_percent));
     ResourceSnapshot {
         available: true,
         sampled_at_unix_ms: unix_time_ms(),
@@ -314,6 +327,12 @@ fn sample_resources(
     }
 }
 
+fn sum_cpu_percent(values: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
+    values
+        .into_iter()
+        .try_fold(0.0, |total, value| Some(total + value?))
+}
+
 fn parse_stats(output: &[u8]) -> Result<Vec<RawContainerStats>, String> {
     let value: serde_json::Value = serde_json::from_slice(output)
         .map_err(|error| format!("Invalid container stats JSON: {error}"))?;
@@ -324,7 +343,10 @@ fn parse_stats(output: &[u8]) -> Result<Vec<RawContainerStats>, String> {
         .map(|row| {
             Ok(RawContainerStats {
                 id: string_field(row, "id")?,
-                cpu_usage_usec: u64_field(row, "cpuUsageUsec"),
+                cpu_usage_usec: row.get("cpuUsageUsec").and_then(serde_json::Value::as_u64),
+                cpu_utilization: row
+                    .get("cpuUtilization")
+                    .and_then(serde_json::Value::as_f64),
                 memory_usage_bytes: u64_field(row, "memoryUsageBytes"),
                 memory_limit_bytes: u64_field(row, "memoryLimitBytes"),
                 network_rx_bytes: u64_field(row, "networkRxBytes"),
@@ -395,7 +417,9 @@ fn unix_time_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{bytes_to_gib, parse_stats, resource_error};
+    use std::time::Duration;
+
+    use super::{bytes_to_gib, parse_stats, resource_error, sum_cpu_percent};
 
     #[test]
     fn exported_resource_errors_are_sanitized_without_changing_measurements() {
@@ -412,22 +436,52 @@ mod tests {
         .unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].id, "demo");
-        assert_eq!(stats[0].cpu_usage_usec, 55);
+        assert_eq!(stats[0].cpu_usage_usec, Some(55));
         assert_eq!(stats[0].memory_limit_bytes, 4096);
         assert_eq!(stats[0].processes, 3);
     }
 
     #[test]
-    fn accepts_container_1_7_additive_cpu_utilization() {
+    fn uses_apple_container_1_7_1_cpu_utilization_on_the_first_sample() {
         let stats = parse_stats(
             br#"[{"id":"demo","cpuUsageUsec":55,"cpuUtilization":2.5,"memoryUsageBytes":1024,"memoryLimitBytes":4096,"numProcesses":3},{"id":"partial","cpuUtilization":null}]"#,
         ).unwrap();
-        // Keep the cumulative counter used by existing delta sampling; the new
-        // fraction must not be mistaken for microseconds or a percentage.
-        assert_eq!(stats[0].cpu_usage_usec, 55);
+        assert_eq!(stats[0].cpu_usage_usec, Some(55));
+        assert_eq!(stats[0].cpu_percent(None, None), Some(250.0));
+        assert_eq!(
+            stats[0].cpu_percent(Some(50), Some(Duration::from_secs(1))),
+            Some(250.0)
+        );
         assert_eq!(stats[0].memory_usage_bytes, 1024);
         assert_eq!(stats[1].id, "partial");
-        assert_eq!(stats[1].cpu_usage_usec, 0);
+        assert_eq!(
+            stats[1].cpu_percent(Some(25), Some(Duration::from_secs(1))),
+            None
+        );
+    }
+
+    #[test]
+    fn falls_back_to_comparable_legacy_cpu_counters_without_fabricating_idle() {
+        let stats = parse_stats(br#"[{"id":"legacy","cpuUsageUsec":1750000},{"id":"bad-rate","cpuUsageUsec":1750000,"cpuUtilization":-1},{"id":"idle","cpuUtilization":0}]"#)
+            .unwrap();
+        let interval = Some(Duration::from_secs(2));
+        assert_eq!(stats[0].cpu_percent(None, interval), None);
+        assert_eq!(stats[0].cpu_percent(Some(2_000_000), interval), None);
+        assert_eq!(
+            stats[0].cpu_percent(Some(1_000_000), Some(Duration::ZERO)),
+            None
+        );
+        assert_eq!(stats[0].cpu_percent(Some(1_000_000), interval), Some(37.5));
+        assert_eq!(stats[0].cpu_percent(Some(1_750_000), interval), Some(0.0));
+        assert_eq!(stats[1].cpu_percent(Some(1_000_000), interval), Some(37.5));
+        assert_eq!(stats[2].cpu_percent(None, None), Some(0.0));
+    }
+
+    #[test]
+    fn empty_cpu_total_is_positive_zero_and_missing_rates_remain_unknown() {
+        assert_eq!(sum_cpu_percent([]).unwrap().to_bits(), 0.0f64.to_bits());
+        assert_eq!(sum_cpu_percent([Some(150.0), Some(25.0)]), Some(175.0));
+        assert_eq!(sum_cpu_percent([Some(150.0), None]), None);
     }
 
     #[test]

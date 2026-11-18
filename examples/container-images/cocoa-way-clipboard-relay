@@ -97,7 +97,8 @@ application_pid=$!
 
 inner_display=
 attempts=0
-while [ "$attempts" -lt 100 ] && kill -0 "$application_pid" 2>/dev/null; do
+# Cold guests can spend several seconds initializing graphics before the compositor listens.
+while [ "$attempts" -lt 400 ] && kill -0 "$application_pid" 2>/dev/null; do
     for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
         [ -S "$socket" ] || continue
         candidate=${socket##*/}

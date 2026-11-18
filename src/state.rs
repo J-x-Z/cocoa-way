@@ -1281,19 +1281,14 @@ impl AppState {
                 {
                     return;
                 }
-                use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
-                use objc2_foundation::NSData;
-                unsafe {
-                    let pb = NSPasteboard::generalPasteboard();
-                    pb.clearContents();
-                    if !pb.setData_forType(Some(&NSData::with_bytes(&image)), NSPasteboardTypePNG) {
-                        crate::diagnostics::record_clipboard_failure(
-                            "Failed to install Wayland PNG on macOS",
-                        );
-                        return;
-                    }
-                    self.pasteboard_change_count = pb.changeCount();
-                }
+                let pb = unsafe { objc2_app_kit::NSPasteboard::generalPasteboard() };
+                let Some(change_count) = write_png_to_pasteboard(&pb, &image) else {
+                    crate::diagnostics::record_clipboard_failure(
+                        "Failed to install Wayland PNG on macOS",
+                    );
+                    return;
+                };
+                self.pasteboard_change_count = change_count;
                 self.host_clipboard =
                     HostClipboardContents::from_snapshot(None, Some(image), false);
             }
@@ -3252,6 +3247,34 @@ mod clipboard_tests {
     }
 
     #[test]
+    #[ignore = "requires a macOS desktop session"]
+    fn native_png_round_trips_through_a_private_pasteboard() {
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+        use objc2_foundation::NSString;
+
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let board = NSPasteboard::pasteboardWithUniqueName();
+            board.clearContents();
+            assert!(
+                board.setString_forType(&NSString::from_str("old text"), NSPasteboardTypeString)
+            );
+            let previous = board.changeCount();
+
+            let png = include_bytes!("../assets/icon.png");
+            let installed = super::write_png_to_pasteboard(&board, png).unwrap();
+            let snapshot = super::read_pasteboard_if_changed(&board, previous).unwrap();
+            let unchanged = super::read_pasteboard_if_changed(&board, installed);
+            board.clearContents();
+
+            assert_eq!(snapshot.change_count, installed);
+            assert_eq!(snapshot.image_png.as_deref(), Some(png.as_slice()));
+            assert!(snapshot.text.is_none());
+            assert!(snapshot.image_error.is_none());
+            assert!(unchanged.is_none());
+        });
+    }
+
+    #[test]
     fn chooses_the_exact_mime_offered_by_the_client() {
         let offered = vec![
             "image/png".to_string(),
@@ -3399,10 +3422,26 @@ fn write_to_pasteboard(text: &str) -> isize {
     }
 }
 
-fn pasteboard_snapshot_if_changed(previous_change_count: isize) -> Option<HostPasteboardSnapshot> {
-    use objc2_app_kit::NSPasteboard;
+fn write_png_to_pasteboard(pb: &objc2_app_kit::NSPasteboard, png: &[u8]) -> Option<isize> {
+    use objc2_app_kit::NSPasteboardTypePNG;
+    use objc2_foundation::NSData;
     unsafe {
-        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        pb.setData_forType(Some(&NSData::with_bytes(png)), NSPasteboardTypePNG)
+            .then(|| pb.changeCount())
+    }
+}
+
+fn pasteboard_snapshot_if_changed(previous_change_count: isize) -> Option<HostPasteboardSnapshot> {
+    let pb = unsafe { objc2_app_kit::NSPasteboard::generalPasteboard() };
+    read_pasteboard_if_changed(&pb, previous_change_count)
+}
+
+fn read_pasteboard_if_changed(
+    pb: &objc2_app_kit::NSPasteboard,
+    previous_change_count: isize,
+) -> Option<HostPasteboardSnapshot> {
+    unsafe {
         let change_count = pb.changeCount();
         if change_count == previous_change_count {
             return None;
@@ -3410,7 +3449,7 @@ fn pasteboard_snapshot_if_changed(previous_change_count: isize) -> Option<HostPa
         let text = pb
             .stringForType(objc2_app_kit::NSPasteboardTypeString)
             .map(|text| Arc::<str>::from(text.to_string()));
-        let (image_png, image_tiff, image_error) = match copy_pasteboard_image(&pb) {
+        let (image_png, image_tiff, image_error) = match copy_pasteboard_image(pb) {
             Ok(Some(CopiedPasteboardImage::Png(image))) => (Some(image), None, None),
             Ok(Some(CopiedPasteboardImage::Tiff(image))) => (None, Some(image), None),
             Ok(None) => (None, None, None),

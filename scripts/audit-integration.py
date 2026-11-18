@@ -26,6 +26,23 @@ def execute(args, **kwargs):
     return result.stdout
 
 
+def verify_app_root(container, expected, run=execute):
+    status = json.loads(run([container, "system", "status", "--format", "json"]))
+    paths = status.get("paths") if isinstance(status, dict) else None
+    actual = paths.get("appRoot") if isinstance(paths, dict) else None
+    if (
+        not isinstance(status, dict)
+        or status.get("status") != "running"
+        or not isinstance(actual, str)
+        or not Path(actual).is_absolute()
+    ):
+        raise RuntimeError("running Apple Container service did not report its data root")
+    actual = Path(actual).resolve(strict=True)
+    if actual != expected:
+        raise RuntimeError(f"Apple Container data root is {actual}, expected {expected}")
+    return str(actual)
+
+
 def cleanup_owned_containers(container, label, token, run=execute):
     def inventory():
         rows = json.loads(run([container, "list", "--all", "--format", "json"]))
@@ -69,12 +86,22 @@ def main():
     parser.add_argument("--shutdown-during-launch", action="store_true")
     parser.add_argument("--require-content", action="store_true",
                         help="also require each instance's worker to submit a frame containing client buffers")
+    parser.add_argument("--require-app-root", type=Path,
+                        help="refuse to launch or delete containers unless the active service uses this data root")
     parser.add_argument("--output", type=Path, default=Path("target/audit-20261015/integration.json"))
     options = parser.parse_args()
     if not options.run:
         parser.error("use --run to explicitly start tests")
     if sys.platform != "darwin" or not 1 <= options.seconds <= 300:
         parser.error("requires macOS and --seconds 1..300")
+    expected_root = None
+    if options.require_app_root is not None:
+        try:
+            expected_root = options.require_app_root.resolve(strict=True)
+            if not expected_root.is_dir():
+                parser.error("--require-app-root must be a directory")
+        except (OSError, RuntimeError) as error:
+            parser.error(f"invalid --require-app-root: {error}")
     binary, ctl = options.binary.resolve(), options.ctl.resolve()
     container = "/usr/local/bin/container"
     token = uuid.uuid4().hex
@@ -123,6 +150,14 @@ def main():
         def observe(kind, data):
             report["observations"].append({"kind": kind, "host_monotonic_ns": time.monotonic_ns(), "data": data})
 
+        def check_app_root():
+            if expected_root is not None:
+                return verify_app_root(container, expected_root)
+
+        def launch(name):
+            check_app_root()
+            return request("launch", name)
+
         def active(name):
             profile_id = next(f"{index + 1:032x}" for index, profile in enumerate(profiles) if profile[0] == name)
             rows = request("running")["data"]
@@ -159,13 +194,16 @@ def main():
 
         log_path = options.output.with_suffix(".app.log")
         try:
-            execute([container, "system", "status"])
+            if expected_root is None:
+                execute([container, "system", "status"])
+            else:
+                observe("verified_app_root", check_app_root())
             with log_path.open("w") as app_log:
                 process = subprocess.Popen([str(binary)], env=env, stdout=app_log, stderr=subprocess.STDOUT)
                 wait_for(lambda: socket.exists() and request("status"), "control service startup", 20)
                 observe("startup", request("applications"))
                 for name, _, _ in profiles:
-                    observe("launch_accepted", request("launch", name))
+                    observe("launch_accepted", launch(name))
                     wait_for(lambda: active(name), f"instance {name} did not become active")
                     if options.require_content:
                         evidence = wait_for(lambda: content_submitted(name),
@@ -195,7 +233,7 @@ def main():
                     wait_for(lambda: not active(name), f"instance {name} did not stop", 30)
                 # Relaunch exercises owned-name lease release and stale generations.
                 name = profiles[1][0]
-                observe("relaunch_accepted", request("launch", name))
+                observe("relaunch_accepted", launch(name))
                 wait_for(lambda: active(name), "terminal reconnect", 90)
                 if options.require_content:
                     observe("relaunch_content_submitted", wait_for(lambda: content_submitted(name),
@@ -205,7 +243,7 @@ def main():
                 wait_for(lambda: not active(name), "terminal final stop", 30)
                 if options.shutdown_during_launch:
                     time.sleep(1)
-                    observe("shutdown_launch_accepted", request("launch", name))
+                    observe("shutdown_launch_accepted", launch(name))
                     time.sleep(0.45)
                     observe("shutdown_tasks", request("tasks"))
                     spec = importlib.util.spec_from_file_location("audit_live_host", Path(__file__).with_name("audit-live-host.py"))
@@ -217,7 +255,7 @@ def main():
                     if not accepted or process.returncode != 0:
                         raise RuntimeError("graceful shutdown during launch failed")
                 report["success"] = True
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
             report["error"] = str(error)
         finally:
             if process is not None and process.poll() is None:
@@ -229,12 +267,15 @@ def main():
                     process.wait(timeout=5)
             # Never match names alone; a user could reuse a test name externally.
             try:
+                if process is not None:
+                    check_app_root()
                 if report["success"] and options.shutdown_during_launch:
                     remaining = json.loads(execute([container, "list", "--all", "--format", "json"]))
                     if any(row.get("configuration", {}).get("labels", {}).get(label) == token
                            for row in remaining):
                         report["cleanup_errors"].append("graceful shutdown left an owned audit container; fallback cleanup was required")
-                report["cleanup_races_resolved"] = cleanup_owned_containers(container, label, token)
+                if process is not None:
+                    report["cleanup_races_resolved"] = cleanup_owned_containers(container, label, token)
             except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
                 report["cleanup_errors"].append(str(error))
             options.output.write_text(json.dumps(report, indent=2) + "\n")
